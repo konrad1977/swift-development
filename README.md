@@ -402,7 +402,7 @@ This is a personal Emacs configuration package. Feel free to fork and adapt for 
 
 ## License
 
-(Add your license here)
+MIT
 
 ## Credits
 
