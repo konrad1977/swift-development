@@ -138,6 +138,52 @@ High-performance caching system for expensive operations.
 - `swift-cache-stats` - Display cache statistics
 - `swift-cache-invalidate-project` - Invalidate project-specific cache
 
+### swift-lsp.el
+Language Server Protocol (LSP) integration for Swift with proper iOS simulator support.
+
+**Key functions:**
+- `swift-lsp-eglot-server-contact` - Configure eglot for Swift development with UIKit/SwiftUI support
+- `ios-simulator-target` - Get the current simulator SDK target triple
+- `lsp-arguments` - Generate LSP arguments with proper SDK and target configuration
+
+**Setup with eglot:**
+```elisp
+(require 'swift-lsp)
+(require 'eglot)
+
+;; Configure eglot for Swift
+(add-to-list 'eglot-server-programs
+             '(swift-ts-mode . swift-lsp-eglot-server-contact))
+```
+
+The LSP configuration automatically:
+- Locates `sourcekit-lsp` via `xcrun`
+- Configures the iOS simulator SDK path
+- Sets up the correct target triple (e.g., `arm64-apple-ios17.0-simulator`)
+- Adds necessary compiler flags for UIKit/SwiftUI development
+
+### xcodebuildserver.el
+Automatic Build Server Protocol (BSP) configuration for LSP integration.
+
+**Key functions:**
+- `xcodebuildserver-check-configuration` - Verify and generate BSP configuration
+- `xcodebuildserver-does-configuration-file-exist` - Check for existing `buildServer.json`
+
+**What it does:**
+The package automatically configures the Build Server Protocol for your Xcode project by generating a `buildServer.json` file. This enables advanced LSP features like:
+- Accurate code completion for your project's dependencies
+- Jump to definition across Swift Package dependencies
+- Proper symbol resolution for CocoaPods and Carthage dependencies
+
+**Requirements:**
+Install `xcode-build-server` via Homebrew:
+```bash
+brew install xcode-build-server
+```
+
+**Integration:**
+The package automatically runs `xcode-build-server config` when you open a project, creating the necessary configuration file. After building your project, the build output is parsed and fed to `xcode-build-server parse` to keep the LSP server synchronized with your build state.
+
 ### ios-simulator.el
 iOS Simulator control and log viewing.
 
