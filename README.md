@@ -1,6 +1,14 @@
-# swift-emacs
+# swift-development - emacs
 
 A comprehensive Emacs package for iOS and macOS development with Swift and Xcode.
+
+<picture>
+    <img src="https://github.com/konrad1977/swift-development/blob/main/logo/swift-development-logo.png" alt="Swift-development logo" height="300" width="300">
+</picture>
+
+## Sponsoring
+
+❤️ [Please sponsor me if you like this package](https://github.com/sponsors/konrad1977)
 
 ## Features
 
