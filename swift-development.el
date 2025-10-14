@@ -58,6 +58,8 @@ When nil, use standard compilation-mode."
 (defvar swift-development--last-build-succeeded nil
   "Track if the last build succeeded.
 nil = unknown/never built, t = success, \\='failed = failed.")
+(defvar swift-development--current-build-command nil
+  "Current build command being used.")
 
 (defun swift-development-log-debug (format-string &rest args)
   "Log debug message using FORMAT-STRING and ARGS when debug is enabled."
@@ -333,21 +335,24 @@ Returns a cons cell (PROCESS . LOG-BUFFER) where LOG-BUFFER accumulates the buil
                      (if (= exit-status 0)
                          (progn
                            (setq swift-development--last-build-succeeded t)
-                           (when callback
+                           (when (and callback (functionp callback))
                              (funcall callback "Build succeeded")))
                        ;; Build failed - do NOT call callback to prevent installation
                        (progn
                          (setq swift-development--last-build-succeeded 'failed)
                          ;; Extract actual error from build buffer
-                         (let ((error-msg (with-current-buffer (get-buffer "*Swift Build*")
-                                            (save-excursion
-                                              (goto-char (point-max))
-                                              ;; Look for actual xcodebuild errors
-                                              (if (re-search-backward xcode-build-config-simple-error-pattern nil t)
-                                                  (buffer-substring-no-properties
-                                                   (line-beginning-position)
-                                                   (min (+ (point) 500) (point-max)))
-                                                (format "Build failed with exit status %s" exit-status))))))
+                         (let* ((build-buf (get-buffer "*Swift Build*"))
+                                (error-msg (if (and build-buf (buffer-live-p build-buf))
+                                              (with-current-buffer build-buf
+                                                (save-excursion
+                                                  (goto-char (point-max))
+                                                  ;; Look for actual xcodebuild errors
+                                                  (if (re-search-backward xcode-build-config-simple-error-pattern nil t)
+                                                      (buffer-substring-no-properties
+                                                       (line-beginning-position)
+                                                       (min (+ (point) 500) (point-max)))
+                                                    (format "Build failed with exit status %s" exit-status))))
+                                            (format "Build failed with exit status %s" exit-status))))
                            (swift-development-handle-build-error error-msg))
                          ;; Reset run-once-compiled to prevent installation
                          (setq run-once-compiled nil)))))))))
@@ -395,20 +400,23 @@ Returns a cons cell (PROCESS . LOG-BUFFER) where LOG-BUFFER accumulates the buil
                                               (swift-development-check-if-build-was-successful output))
                                           (progn
                                             (setq swift-development--last-build-succeeded t)
-                                            (with-current-buffer output-buffer
-                                              (let ((inhibit-read-only t))
-                                                (goto-char (point-max))
-                                                (insert "\n✅ BUILD SUCCEEDED\n")))
+                                            (when (buffer-live-p output-buffer)
+                                              (with-current-buffer output-buffer
+                                                (let ((inhibit-read-only t))
+                                                  (goto-char (point-max))
+                                                  (insert "\n✅ BUILD SUCCEEDED\n"))))
                                             ;; Run xcode-build-server parse asynchronously
                                             (swift-development-run-xcode-build-server-parse output)
-                                            (funcall callback output)
+                                            (when (and callback (functionp callback))
+                                              (funcall callback output))
                                             (swift-development-cleanup))
                                         (progn
                                           (setq swift-development--last-build-succeeded 'failed)
-                                          (with-current-buffer output-buffer
-                                            (let ((inhibit-read-only t))
-                                              (goto-char (point-max))
-                                              (insert (format "\n❌ BUILD FAILED (exit status: %d)\n" exit-status))))
+                                          (when (buffer-live-p output-buffer)
+                                            (with-current-buffer output-buffer
+                                              (let ((inhibit-read-only t))
+                                                (goto-char (point-max))
+                                                (insert (format "\n❌ BUILD FAILED (exit status: %d)\n" exit-status)))))
                                           ;; Run xcode-build-server parse for errors too
                                           (swift-development-run-xcode-build-server-parse output)
                                           (swift-development-handle-build-error output)))
@@ -1544,17 +1552,17 @@ This is the fastest way to rebuild after small changes."
                         "None (using scheme's default)")))
       (princ (format "Will include -configuration flag: %s\n" 
                     (if xcode-build-config-default-configuration "Yes" "No")))
-      (princ (format "Build System: %s\n" swift-development-modern-build-system))
+      (princ (format "Build System: %s\n" xcode-build-config-modern-build-system))
       (princ (format "Additional Build Flags: %s\n"
-                    (if swift-development-additional-build-flags
-                        (mapconcat #'identity swift-development-additional-build-flags " ")
+                    (if xcode-build-config-additional-build-flags
+                        (mapconcat #'identity xcode-build-config-additional-build-flags " ")
                       "None")))
 
       ;; Environment
       (princ "\nEnvironment:\n")
       (princ "------------\n")
       (princ (format "x86 Environment: %s\n"
-                    (if swift-development--current-environment-x86 "Yes" "No")))
+                    (if xcode-build-config--current-environment-x86 "Yes" "No")))
       (princ (format "Number of CPU Cores: %s\n" (xcode-build-config-get-optimal-jobs)))
 
       ;; Device/Simulator
