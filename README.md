@@ -295,6 +295,33 @@ M-x hacking-ws/query
 (setq swift-cache-debug t)
 ```
 
+### Rebuild Detection Configuration
+
+Control which files trigger rebuilds when modified:
+
+```elisp
+;; File extensions to watch for changes (default includes source code and UI files)
+(setq swift-development-watched-extensions
+      '("swift" "m" "mm" "h" "c" "cpp" "storyboard" "xib" "xcassets"))
+
+;; Path patterns to ignore when checking for rebuilds
+;; Test files are ignored by default since they don't affect the app bundle
+(setq swift-development-ignore-paths
+      '("*Tests/*" "*/Tests.swift" "*UITests/*"))
+
+;; Example: Also ignore CocoaPods and generated files
+(setq swift-development-ignore-paths
+      '("*Tests/*" "*/Tests.swift" "*UITests/*" "*Pods/*" "*Generated/*"))
+
+;; Example: Only watch Swift files (fastest, but ignores Obj-C and resources)
+(setq swift-development-watched-extensions '("swift"))
+```
+
+The rebuild detection system checks modification times to avoid unnecessary builds. By default:
+- **Watched**: Swift, Obj-C, C/C++, Storyboards, XIBs, and Asset Catalogs
+- **Ignored**: Test files (they don't affect the app bundle)
+- **Also ignored**: Hidden files/folders (`.git`, `.build`) and `DerivedData`
+
 ### Build Configuration
 
 ```elisp

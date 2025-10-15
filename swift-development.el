@@ -48,6 +48,25 @@ When nil, use standard compilation-mode."
                  (const :tag "Disabled (success check only)" disabled))
   :group 'swift-development)
 
+(defcustom swift-development-watched-extensions
+  '("swift" "m" "mm" "h" "c" "cpp" "storyboard" "xib" "xcassets")
+  "List of file extensions to watch for changes that trigger rebuilds.
+Only files with these extensions will be checked for modifications.
+Default includes source code and UI resources that affect the app bundle."
+  :type '(repeat string)
+  :group 'swift-development)
+
+(defcustom swift-development-ignore-paths
+  '("*Tests/*" "*/Tests.swift" "*UITests/*")
+  "List of path patterns to ignore when checking if rebuild is needed.
+Test files are ignored by default since they don't affect the app bundle.
+Patterns can use wildcards (* and ?). Examples:
+- \"*Tests/*\" - ignores files in any Tests directory
+- \"*/Generated/*\" - ignores files in Generated directories
+- \"*Pods/*\" - ignores CocoaPods dependencies"
+  :type '(repeat string)
+  :group 'swift-development)
+
 ;; Internal variables
 (defvar swift-development--build-progress-spinner nil)
 (defvar swift-development--active-build-process nil
@@ -281,19 +300,20 @@ Keeps the end of the output where errors typically appear, and any lines with 'e
         (delete-file compile-lock))
       
       ;; Wait a moment to ensure build processes have finished writing
-      (run-with-timer 1.0 nil
-                      (lambda ()
-                        (let ((temp-file (make-temp-file "xcodebuild-output-" nil ".log")))
-                          ;; Write output to temp file
-                          (with-temp-file temp-file
-                            (insert output))
-                          ;; Run xcode-build-server parse
-                          (start-process-shell-command 
-                           "xcode-build-server-parse"
-                           nil
-                           (format "cd '%s' && cat '%s' | xcode-build-server parse -a && rm -f '%s'" 
-                                   project-root temp-file temp-file))))))))
-
+      ;; Capture project-root now to avoid issues when default-directory changes
+      (let ((captured-root project-root))
+        (run-with-timer 1.0 nil
+                        (lambda ()
+                          (let ((temp-file (make-temp-file "xcodebuild-output-" nil ".log")))
+                            ;; Write output to temp file
+                            (with-temp-file temp-file
+                              (insert output))
+                            ;; Run xcode-build-server parse with captured project root
+                            (start-process-shell-command
+                             "xcode-build-server-parse"
+                             nil
+                             (format "cd '%s' && cat '%s' | xcode-build-server parse -a && rm -f '%s'"
+                                     captured-root temp-file temp-file)))))))))
 (defun swift-development-cleanup ()
   "Cleanup resources and state."
   (when swift-development--build-progress-spinner
@@ -645,23 +665,41 @@ Returns nil if file doesn't exist."
     (float-time (file-attribute-modification-time
                  (file-attributes file)))))
 
+(defun swift-development--build-find-patterns ()
+  "Build find command patterns for watched file extensions."
+  (mapconcat (lambda (ext)
+               (format "-name '*.%s'" ext))
+             swift-development-watched-extensions
+             " -o "))
+
+(defun swift-development--build-find-excludes ()
+  "Build find command exclusion patterns from swift-development-ignore-paths."
+  (mapconcat (lambda (pattern)
+               (format "-not -path '%s'" pattern))
+             (append '("*/.*" "*/DerivedData/*")
+                     swift-development-ignore-paths)
+             " "))
+
 (defun swift-development-find-all-source-files ()
-  "Find all .swift files in project (cached for 60 seconds)."
+  "Find all source files in project (cached for 60 seconds).
+Includes files matching swift-development-watched-extensions.
+Excludes paths matching patterns in swift-development-ignore-paths."
   (let* ((project-root (xcode-project-project-root))
          (cache-key (when (fboundp 'swift-cache-project-key)
-                      (swift-cache-project-key project-root "source-files"))))
+                      (swift-cache-project-key project-root "source-files")))
+         (patterns (swift-development--build-find-patterns))
+         (excludes (swift-development--build-find-excludes))
+         (find-cmd (format "find . \\( %s \\) %s -type f" patterns excludes)))
     (if (and cache-key (fboundp 'swift-cache-with))
         (swift-cache-with cache-key 60  ; Cache for 1 minute
           (let ((default-directory project-root))
             (split-string
-             (shell-command-to-string
-              "find . -name '*.swift' -not -path '*/.*' -not -path '*/DerivedData/*' -type f")
+             (shell-command-to-string find-cmd)
              "\n" t)))
       ;; Fallback without cache
       (let ((default-directory (xcode-project-project-root)))
         (split-string
-         (shell-command-to-string
-          "find . -name '*.swift' -not -path '*/.*' -not -path '*/DerivedData/*' -type f")
+         (shell-command-to-string find-cmd)
          "\n" t)))))
 
 (defun swift-development-find-newest-source-mtime ()
