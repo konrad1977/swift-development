@@ -15,10 +15,13 @@ A comprehensive Emacs package for iOS and macOS development with Swift and Xcode
 ### Core Functionality
 - **Xcode Integration**: Build, run, and debug iOS apps directly from Emacs
 - **Simulator Management**: Control iOS simulators, view logs, and manage devices
+- **Multi-Simulator Support**: Run apps on multiple simulators simultaneously
 - **Smart Caching**: Automatic build cache warming for faster compilation
-- **LSP Support**: Enhanced Swift language server integration
+- **Intelligent Rebuild Detection**: Async file hash comparison to skip unnecessary builds
+- **LSP Support**: Enhanced Swift language server integration (swift-mode & swift-ts-mode)
 - **Project Management**: Automatic scheme detection and project configuration
 - **Error Handling**: Advanced error parsing and navigation
+- **Flexible Notifications**: Choose between mode-line-hud, minibuffer, or custom notifications
 
 ### Developer Tools
 - **Refactoring**: Code refactoring utilities for Swift
@@ -277,7 +280,115 @@ M-x apple-docs/query-thing-at-point
 M-x hacking-ws/query
 ```
 
+## Notification System
+
+The package includes a flexible notification system that can display build progress, errors, and status updates through different backends.
+
+### Notification Backends
+
+```elisp
+;; Choose your preferred notification backend
+(setq xcode-project-notification-backend 'mode-line-hud)  ; Default: show in mode-line
+;; (setq xcode-project-notification-backend 'message)     ; Alternative: use minibuffer messages
+;; (setq xcode-project-notification-backend 'custom)      ; Use custom function
+```
+
+**Available backends:**
+- `mode-line-hud` - Display notifications in the mode-line using mode-line-hud (recommended)
+- `message` - Display notifications in the minibuffer
+- `custom` - Use a custom notification function (set via `xcode-project-notification-function`)
+
+All notifications automatically force a display update before blocking operations, ensuring you always see status messages before long-running tasks.
+
+## Intelligent Rebuild Detection
+
+The package automatically detects when rebuilds are actually needed by comparing file modification times and hashes.
+
+### How It Works
+
+1. **File Monitoring**: Watches Swift, Obj-C, C/C++ source files and UI resources (Storyboards, XIBs, Asset Catalogs)
+2. **Hash Comparison**: Compares file hashes asynchronously to detect actual changes
+3. **Smart Skipping**: Skips rebuild if no watched files have changed since last successful build
+4. **Test File Ignore**: Test files are ignored by default (configurable)
+
+### Configuration
+
+```elisp
+;; Use async rebuild check (recommended, default)
+(setq swift-development-use-async-rebuild-check t)
+
+;; Customize which files trigger rebuilds
+(setq swift-development-watched-extensions
+      '("swift" "m" "mm" "h" "c" "cpp" "storyboard" "xib" "xcassets"))
+
+;; Customize ignored paths (tests don't affect app bundle)
+(setq swift-development-ignore-paths
+      '("*Tests/*" "*/Tests.swift" "*UITests/*"))
+```
+
+### Force Rebuild
+
+Sometimes you need to rebuild regardless of file changes:
+
+```elisp
+;; Force rebuild next time
+M-x swift-development-reset-build-status
+
+;; Clear file hash cache
+M-x swift-development-clear-hash-cache
+```
+
+## Multi-Simulator Support
+
+Run your app on multiple simulators simultaneously for testing across different devices/iOS versions.
+
+### Setup Target Simulators
+
+```elisp
+;; Add simulators to target list
+M-x ios-simulator-add-target-simulator
+
+;; List all target simulators
+M-x ios-simulator-list-target-simulators
+
+;; Remove a simulator from targets
+M-x ios-simulator-remove-target-simulator
+
+;; Clear all targets (back to single simulator mode)
+M-x ios-simulator-clear-target-simulators
+```
+
+### Running on Multiple Simulators
+
+Once configured, `M-x swift-development:run-app` will automatically launch your app on all target simulators.
+
+### Ad-hoc Multi-Simulator Testing
+
+```elisp
+;; Run on an additional simulator without changing targets
+M-x ios-simulator-run-on-additional-simulator
+
+;; List all active simulators with running apps
+M-x ios-simulator-list-active-simulators
+
+;; Terminate app on specific simulator
+M-x ios-simulator-terminate-app-on-simulator
+
+;; Shutdown a specific simulator
+M-x ios-simulator-shutdown-simulator
+```
+
 ## Configuration
+
+### Swift Mode Support
+
+The package fully supports both `swift-mode` and `swift-ts-mode` (tree-sitter). Auto-warming, working directory setup, and all hooks work identically with both modes.
+
+```elisp
+;; Works automatically with:
+;; - swift-mode (traditional mode)
+;; - swift-ts-mode (tree-sitter mode, recommended)
+```
 
 ### Custom Variables
 
@@ -398,11 +509,42 @@ M-x xcode-project:reset
 ;; View cache diagnostics
 M-x xcode-project:cache-diagnostics
 
+;; Diagnose auto-warming issues (run from Swift buffer)
+M-x swift-development-diagnose-auto-warm
+
+;; Test auto-warming manually
+M-x swift-development-test-auto-warm
+
 ;; Clear build folder cache
 M-x xcode-project:clear-build-folder-cache
 
+;; Clear project hash cache (forces rebuild check)
+M-x swift-development-clear-hash-cache
+
 ;; Clear all caches
 M-x swift-cache-clear
+
+;; View cache statistics
+M-x swift-cache-stats
+```
+
+### Build Status and Monitoring
+
+```elisp
+;; Check if rebuild is needed
+M-x swift-development-build-status
+
+;; View detailed build process status
+M-x xcode-project:build-status
+
+;; Show last build errors
+M-x swift-development-show-last-build-errors
+
+;; Show full build output
+M-x swift-development-show-build-output
+
+;; Hide build output buffer
+M-x swift-development-hide-build-output
 ```
 
 ### Interrupt Stuck Builds
@@ -411,11 +553,14 @@ M-x swift-cache-clear
 ;; Interrupt current build
 M-x xcode-project:interrupt-build
 
-;; Check build status
-M-x xcode-project:build-status
-
 ;; Kill all xcodebuild processes
 M-x xcode-project:kill-all-xcodebuild-processes
+
+;; Reset build status (clears "already built" state)
+M-x swift-development-reset-build-status
+
+;; Check for compile.lock errors
+M-x xcode-project:check-compile-lock-error
 ```
 
 ## Performance Tips
