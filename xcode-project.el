@@ -14,15 +14,81 @@
 (defvar mode-line-hud-available-p (require 'mode-line-hud nil t)
   "Whether mode-line-hud is available.")
 
+;; Notification backend configuration
+(defcustom xcode-project-notification-backend 'mode-line-hud
+  "Backend to use for displaying build progress and notifications.
+Options:
+- \\='mode-line-hud: Use mode-line-hud package (visual mode line updates)
+- \\='message: Use Emacs message with colored propertized text
+- \\='custom: Use custom function set in `xcode-project-notification-function'"
+  :type '(choice (const :tag "Mode Line HUD" mode-line-hud)
+                 (const :tag "Minibuffer Messages" message)
+                 (const :tag "Custom Function" custom))
+  :group 'xcode-project-xcodebuild)
+
+(defvar xcode-project-notification-function nil
+  "Custom notification function to use when `xcode-project-notification-backend' is \\='custom.
+Function should accept keyword arguments :message, :delay, :seconds, and :reset.")
+
+(defun xcode-project-notify (&rest args)
+  "Universal notification function that delegates to configured backend.
+Accepts keyword arguments:
+  :message - The message to display
+  :delay - Optional delay before showing (for mode-line-hud)
+  :seconds - How long to show notification
+  :reset - Whether to reset after showing
+  :face - Face to apply to message (for message backend)
+  :no-redisplay - If t, skip the automatic redisplay (default nil)"
+  (let ((message-text (plist-get args :message))
+        (delay (plist-get args :delay))
+        (seconds (plist-get args :seconds))
+        (reset (plist-get args :reset))
+        (face (plist-get args :face))
+        (no-redisplay (plist-get args :no-redisplay)))
+
+    (pcase xcode-project-notification-backend
+      ('mode-line-hud
+       (when mode-line-hud-available-p
+         (cond
+          ;; Notification style (with seconds and reset)
+          ((and seconds reset)
+           (mode-line-hud:notification :message message-text :seconds seconds :reset reset))
+          ;; Update with delay
+          (delay
+           (mode-line-hud:updateWith :message message-text :delay delay))
+          ;; Simple update
+          (t
+           (mode-line-hud:update :message message-text)))))
+
+      ('message
+       ;; Use minibuffer messages with optional color
+       (if face
+           (message "%s" (propertize message-text 'face face))
+         (message "%s" message-text)))
+
+      ('custom
+       ;; Call custom function if configured
+       (when (functionp xcode-project-notification-function)
+         (apply xcode-project-notification-function args)))
+
+      (_
+       ;; Fallback to message if backend unknown
+       (message "%s" message-text)))
+
+    ;; Force display update so notification is visible before any blocking operation
+    ;; This is especially important before shell commands, file I/O, or user input
+    (unless no-redisplay
+      (redisplay t))))
+
 (defun xcode-project-safe-mode-line-update (&rest args)
-  "Safely call mode-line-hud:update if available."
-  (when mode-line-hud-available-p
-    (apply #'mode-line-hud:update args)))
+  "Safely call notification system with update semantics.
+This is a compatibility wrapper - prefer using `xcode-project-notify' directly."
+  (apply #'xcode-project-notify args))
 
 (defun xcode-project-safe-mode-line-notification (&rest args)
-  "Safely call mode-line-hud:notification if available."
-  (when mode-line-hud-available-p
-    (apply #'mode-line-hud:notification args)))
+  "Safely call notification system with notification semantics.
+This is a compatibility wrapper - prefer using `xcode-project-notify' directly."
+  (apply #'xcode-project-notify args))
 
 (defvar xcode-project--current-project-root nil)
 (defvar xcode-project--previous-project-root nil)
@@ -202,9 +268,8 @@ If DIRECTORY is nil, use `default-directory'."
   (let* ((project-root (xcode-project-project-root))
          (cache-key (when (fboundp 'swift-cache-project-key)
                       (swift-cache-project-key project-root "scheme-files"))))
-    ;; Use cache for scheme files if available
-    (if (and cache-key (fboundp 'swift-cache-with))
-        (swift-cache-with cache-key 600  ; Cache for 10 minutes
+    ;; Use cache for scheme files
+    (swift-cache-with cache-key 600  ; Cache for 10 minutes
       (let* ((default-directory (or project-root default-directory))
              (workspace-directory (xcode-project-find-workspace-directory))
              (workspace-name (xcode-project-workspace-name))
@@ -237,27 +302,7 @@ Project path: %s"
                              (xcode-project-list-xcscheme-files project-path)))))
           ;; If file-based detection fails, fall back to xcodebuild -list
           (or schemes
-              (xcode-project-get-schemes-from-xcodebuild))))
-      ;; Fallback when swift-cache not available - use original logic
-      (let* ((default-directory (or project-root default-directory))
-             (workspace-directory (xcode-project-find-workspace-directory))
-             (workspace-name (xcode-project-workspace-name))
-             (project-directory (xcode-project-find-xcode-project-directory))
-             (project-name (xcode-project-project-name))
-             (workspace-path (when workspace-directory
-                              (concat (file-name-as-directory workspace-directory)
-                                    workspace-name
-                                    ".xcworkspace/")))
-             (project-path (when project-directory
-                            (concat (file-name-as-directory project-directory)
-                                  project-name
-                                  ".xcodeproj/"))))
-        (let ((schemes (or (when workspace-path
-                             (xcode-project-list-xcscheme-files workspace-path))
-                           (when project-path
-                             (xcode-project-list-xcscheme-files project-path)))))
-          (or schemes
-              (xcode-project-get-schemes-from-xcodebuild))))))))
+              (xcode-project-get-schemes-from-xcodebuild)))))))
 
 (defun xcode-project-run-command-and-get-json (command)
   "Run a shell COMMAND and return the JSON output."
@@ -334,7 +379,8 @@ Project path: %s"
 
 (defun xcode-project-product-name ()
   "Get product name."
-  (let ((json (xcode-project-get-build-settings-json)))
+  (let* ((config (or xcode-project--current-build-configuration "Debug"))
+         (json (xcode-project-get-build-settings-json :config config)))
     (let-alist (seq-elt json 0)
       .buildSettings.PRODUCT_NAME)))
 
@@ -404,14 +450,28 @@ Returns a list of folder names, excluding hidden folders."
   (unless xcode-project--current-xcode-scheme
     (when xcode-project-debug
       (message "xcode-project-scheme - Starting scheme detection..."))
+    (xcode-project-notify :message "Loading schemes...")
     (let ((schemes (xcode-project-get-scheme-list)))
       (when xcode-project-debug
         (message "xcode-project-scheme - Found %d schemes: %s" (length schemes) schemes))
       (if (= (length schemes) 1)
           ;; If there's only one scheme, use it automatically
-          (setq xcode-project--current-xcode-scheme (car schemes))
+          (progn
+            (setq xcode-project--current-xcode-scheme (car schemes))
+            (xcode-project-notify
+             :message (format "Selected scheme: %s"
+                              (propertize (car schemes) 'face 'success))
+             :seconds 2
+             :reset t))
         ;; Otherwise prompt the user
-        (setq xcode-project--current-xcode-scheme (xcode-project-build-menu :title "Choose scheme: " :list schemes)))))
+        (progn
+          (xcode-project-notify :message "Choose scheme...")
+          (setq xcode-project--current-xcode-scheme (xcode-project-build-menu :title "Choose scheme: " :list schemes))
+          (xcode-project-notify
+           :message (format "Selected scheme: %s"
+                            (propertize xcode-project--current-xcode-scheme 'face 'success))
+           :seconds 2
+           :reset t)))))
   (if (not xcode-project--current-xcode-scheme)
       (error "No scheme selected")
     (shell-quote-argument xcode-project--current-xcode-scheme)))
@@ -421,12 +481,13 @@ Returns a list of folder names, excluding hidden folders."
   (unless xcode-project--current-build-configuration
     ;; Ensure scheme is loaded first
     (xcode-project-scheme)
+    (xcode-project-notify :message "Fetching build configuration...")
     (let* ((scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme "")))
            (project-root (xcode-project-project-root))
            (xcodeproj-dirs (directory-files project-root t "\\.xcodeproj$"))
            (xcodeproj-dir (car xcodeproj-dirs))
            (scheme-file (when xcodeproj-dir
-                         (format "%s/xcshareddata/xcschemes/%s.xcscheme" 
+                         (format "%s/xcshareddata/xcschemes/%s.xcscheme"
                                 xcodeproj-dir scheme-name))))
       (if (and scheme-file (file-exists-p scheme-file))
           (with-temp-buffer
@@ -439,7 +500,12 @@ Returns a list of folder names, excluding hidden folders."
               (if (re-search-forward "<TestAction[^>]*buildConfiguration\\s-*=\\s-*\"\\([^\"]+\\)\"" nil t)
                   (setq xcode-project--current-build-configuration (match-string 1))
                 (setq xcode-project--current-build-configuration "Debug"))))
-        (setq xcode-project--current-build-configuration "Debug"))))
+        (setq xcode-project--current-build-configuration "Debug"))
+      (xcode-project-notify
+       :message (format "Build config: %s"
+                        (propertize xcode-project--current-build-configuration 'face 'font-lock-keyword-face))
+       :seconds 2
+       :reset t)))
   xcode-project--current-build-configuration)
 
 (defun xcode-project-fetch-or-load-app-identifier ()
@@ -447,14 +513,20 @@ Returns a list of folder names, excluding hidden folders."
   (unless xcode-project--current-app-identifier
     ;; Ensure scheme is loaded first
     (xcode-project-scheme)
+    (xcode-project-notify :message "Fetching app identifier...")
     (let ((config (xcode-project-fetch-or-load-build-configuration)))
       (when xcode-project-debug
-        (message "xcode-project-fetch-or-load-app-identifier - scheme: %s, config: %s" 
+        (message "xcode-project-fetch-or-load-app-identifier - scheme: %s, config: %s"
                  xcode-project--current-xcode-scheme config))
       (setq xcode-project--current-app-identifier (xcode-project-get-bundle-identifier config))
       (when xcode-project-debug
-        (message "xcode-project-fetch-or-load-app-identifier - bundle ID: %s" 
-                 xcode-project--current-app-identifier))))
+        (message "xcode-project-fetch-or-load-app-identifier - bundle ID: %s"
+                 xcode-project--current-app-identifier))
+      (xcode-project-notify
+       :message (format "App ID: %s"
+                        (propertize xcode-project--current-app-identifier 'face 'font-lock-string-face))
+       :seconds 2
+       :reset t)))
   xcode-project--current-app-identifier)
 
 (defun xcode-project-get-scheme-list ()
@@ -706,10 +778,27 @@ Returns a list of folder names, excluding hidden folders."
 
     ;; Check cache warming independently of project-changed status
     ;; This handles cases where xcode-project--current-project-root was already set by another function
+    (when xcode-project-debug
+      (message "[DEBUG] Checking cache warming conditions...")
+      (message "[DEBUG]   - swift-development-warm-build-cache defined?: %s" (fboundp 'swift-development-warm-build-cache))
+      (message "[DEBUG]   - swift-development loaded?: %s" (featurep 'swift-development))
+      (message "[DEBUG]   - normalized-project: %s" normalized-project)
+      (message "[DEBUG]   - already in cache?: %s" (gethash normalized-project xcode-project--cache-warmed-projects)))
+
     (when (and (fboundp 'swift-development-warm-build-cache)
                (require 'swift-development nil t)
                (not (gethash normalized-project xcode-project--cache-warmed-projects)))
-      (message "Warming build caches for %s..." (file-name-nondirectory normalized-project))
+      (when xcode-project-debug
+        (message "[DEBUG] All conditions met - warming caches now!"))
+
+      ;; Always log to Messages buffer for visibility
+      (message "Auto-warming build caches for %s..." (file-name-nondirectory normalized-project))
+
+      ;; Show notification via configured backend (mode-line-hud, message, etc)
+      (xcode-project-notify
+       :message (format "Warming build caches for %s..."
+                        (propertize (file-name-nondirectory normalized-project) 'face 'font-lock-constant-face)))
+
       (swift-development-warm-build-cache)
       ;; Mark this project as having warmed caches
       (puthash normalized-project t xcode-project--cache-warmed-projects))
@@ -719,7 +808,12 @@ Returns a list of folder names, excluding hidden folders."
 
 (defun xcode-project-setup-project ()
   "Setup the current project."
-  (xcode-project-setup-current-project (xcode-project-project-root)))
+  (xcode-project-notify :message "Setting up project...")
+  (xcode-project-setup-current-project (xcode-project-project-root))
+  (xcode-project-notify
+   :message (propertize "Project ready" 'face 'success)
+   :seconds 2
+   :reset t))
 
 ;;;###autoload
 (defun xcode-project-show-project-info ()
@@ -1111,7 +1205,8 @@ IGNORE-LIST is a list of folder names to ignore during cleaning."
 (defun xcode-project-derived-data-path ()
   "Get the actual DerivedData path by running xcodebuild -showBuildSettings."
   (let* ((default-directory (or (xcode-project-project-root) default-directory))
-         (json (xcode-project-get-build-settings-json)))
+         (config (or xcode-project--current-build-configuration "Debug"))
+         (json (xcode-project-get-build-settings-json :config config)))
     (when json
       (let-alist (seq-elt json 0)
         (or .buildSettings.BUILD_DIR
@@ -1121,7 +1216,8 @@ IGNORE-LIST is a list of folder names to ignore during cleaning."
 (defun xcode-project-target-build-directory (&optional configuration)
   "Get the build directory from xcodebuild -showBuildSettings output.
 CONFIGURATION is the build configuration (Debug/Release)."
-  (let ((json (xcode-project-get-build-settings-json)))
+  (let* ((config (or configuration xcode-project--current-build-configuration "Debug"))
+         (json (xcode-project-get-build-settings-json :config config)))
     (let-alist (seq-elt json 0)
       .buildSettings.TARGET_BUILD_DIR)))
 

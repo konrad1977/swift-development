@@ -8,6 +8,7 @@
 
 (require 'ios-device)
 (require 'ios-simulator)
+(require 'xcode-project) ;; For notification system
 (require 'compile) ;; For compilation-mode when not using periphery
 (require 'swift-cache nil t) ;; Unified caching system
 (require 'swift-error-handler nil t) ;; Enhanced error handling
@@ -56,6 +57,15 @@ Default includes source code and UI resources that affect the app bundle."
   :type '(repeat string)
   :group 'swift-development)
 
+(defcustom swift-development-cache-ttl 300
+  "Time-to-live for build cache in seconds.
+Cache is automatically invalidated when files are saved in Emacs.
+This TTL provides a safety fallback for external changes (git, Xcode, etc).
+Default is 300 seconds (5 minutes).
+Set to 0 to disable caching (not recommended for large projects)."
+  :type 'integer
+  :group 'swift-development)
+
 (defcustom swift-development-ignore-paths
   '("*Tests/*" "*/Tests.swift" "*UITests/*")
   "List of path patterns to ignore when checking if rebuild is needed.
@@ -90,9 +100,10 @@ nil = unknown/never built, t = success, \\='failed = failed.")
   (if swift-development-debug
       (message "Build error: %s" error-message))
   (swift-development-cleanup)
-  (mode-line-hud:update
-   :message (format "Build failed: %s"
-                    (propertize (truncate-string-to-width error-message 50) 'face 'error)))
+  (when (fboundp 'xcode-project-notify)
+    (xcode-project-notify
+     :message (format "Build failed: %s"
+                      (propertize (truncate-string-to-width error-message 50) 'face 'error))))
   (if swift-development-use-periphery
       (periphery-run-parser error-message)
     (swift-development-show-errors-in-compilation-mode error-message)))
@@ -110,17 +121,20 @@ nil = unknown/never built, t = success, \\='failed = failed.")
       (display-buffer buf))))
 
 (defun swift-development-reset ()
-  "Reset build settings and clear all cached state."
+  "Reset build settings and clear all cached state.
+This also invalidates the build status to force a rebuild on next compile."
   (interactive)
   (xcode-project-reset)
   (xcode-build-config-reset)
   (ios-device-reset)
   (setq swift-development--build-progress-spinner nil
         swift-development--compilation-time nil
-        run-once-compiled nil)
+        run-once-compiled nil
+        swift-development--last-build-succeeded nil)  ; Force rebuild next time
   ;; Also clear the build folder cache
   (setq xcode-project--current-build-folder nil
-        xcode-project--last-device-type nil))
+        xcode-project--last-device-type nil)
+  (message "Build settings reset - next build will run unconditionally"))
 
 
 (defun swift-development--compilation-time ()
@@ -132,9 +146,14 @@ nil = unknown/never built, t = success, \\='failed = failed.")
 
 (defun swift-development-run-app-on-device-after-build ()
   "Run app on device after build."
-  (mode-line-hud:update :message (format "Built %s in %s seconds"
-                                         (propertize (xcode-project-scheme) 'face 'font-lock-builtin-face)
-                                         (propertize (swift-development--compilation-time) 'face 'warning)))
+  (when (fboundp 'xcode-project-notify)
+    (xcode-project-notify
+     :message (format "Built %s in %s seconds"
+                      (propertize (xcode-project-scheme) 'face 'font-lock-builtin-face)
+                      (propertize (swift-development--compilation-time) 'face 'warning))))
+
+  ;; Update project signature after successful build (async - non-blocking)
+  (swift-development--update-all-hashes-async)
 
   (ios-device-install-app
    :buildfolder (xcode-project-build-folder :device-type :device)
@@ -142,19 +161,24 @@ nil = unknown/never built, t = success, \\='failed = failed.")
 
 (defun swift-development-run-app-after-build()
   "Either in simulator or on physical."
-  (mode-line-hud:update :message (format "Built %s in %s seconds"
-                                         (propertize (xcode-project-scheme) 'face 'font-lock-builtin-face)
-                                         (propertize (swift-development--compilation-time) 'face 'warning)))
+  (when (fboundp 'xcode-project-notify)
+    (xcode-project-notify
+     :message (format "Built %s in %s seconds"
+                      (propertize (xcode-project-scheme) 'face 'font-lock-builtin-face)
+                      (propertize (swift-development--compilation-time) 'face 'warning))))
+
+  ;; Update project signature after successful build (async - non-blocking)
+  (swift-development--update-all-hashes-async)
 
   (swift-development-cleanup)
-  
+
   ;; Debug information for project switching issues
   (when swift-development-debug
     (message "Installing app - Project: %s, App ID: %s, Build folder: %s"
              (xcode-project-project-root)
              (xcode-project-fetch-or-load-app-identifier)
              (xcode-project-build-folder :device-type :simulator)))
-  
+
   (ios-simulator-install-and-run-app
    :rootfolder (xcode-project-project-root)
    :build-folder (xcode-project-build-folder :device-type :simulator)
@@ -323,9 +347,13 @@ Keeps the end of the output where errors typically appear, and any lines with 'e
         swift-development-force-package-resolution nil))  ; Reset force flag after build
 
 (defun swift-development-successful-build ()
-  "Show that the build was successful."
-  (mode-line-hud:update :message (format "Successful build %s"
-                                         (propertize (xcode-project-scheme) 'face 'font-lock-builtin-face))))
+  "Show that the build was successful and update project signature."
+  (when (fboundp 'xcode-project-notify)
+    (xcode-project-notify
+     :message (format "Successful build %s"
+                      (propertize (xcode-project-scheme) 'face 'font-lock-builtin-face))))
+  ;; Update project signature after successful build (async - non-blocking)
+  (swift-development--update-all-hashes-async))
 
 (cl-defun swift-development-compile-with-progress (&key command callback update-callback)
   "Run compilation COMMAND with progress indicator and CALLBACK/UPDATE-CALLBACK in background.
@@ -474,33 +502,163 @@ Returns a cons cell (PROCESS . LOG-BUFFER) where LOG-BUFFER accumulates the buil
           (swift-development-log-debug "Running command: %s" command)
           (cons process log-buffer))))))
 
+(defcustom swift-development-use-async-rebuild-check t
+  "Use async (non-blocking) rebuild detection when compiling.
+When t, file scanning won't freeze Emacs (recommended for large projects).
+When nil, uses faster synchronous check (may freeze Emacs briefly)."
+  :type 'boolean
+  :group 'swift-development)
+
 (cl-defun swift-development-compile (&key run force)
   "Build project using xcodebuild (as RUN).
-If FORCE is nil, skip compilation if sources are unchanged."
+If FORCE is nil, skip compilation if sources are unchanged.
+Uses async rebuild check if swift-development-use-async-rebuild-check is t."
   (save-some-buffers t)
 
   (if (xcode-project-is-xcodeproject)
       (progn
-        ;; Check if rebuild is needed (unless forced)
-        (if (and (not force) (not (swift-development-needs-rebuild-p)))
-            (progn
-              (message "Build up-to-date, skipping compilation")
-              ;; If run was requested and app is up-to-date, just run it
-              (when run
-                (swift-development-run)))
-          ;; Proceed with normal build
-          (when swift-development-use-periphery
-            (periphery-kill-buffer))
-          (ios-simulator-kill-buffer)
-          ;; Only ask for device/simulator if not already set
-          (unless xcode-project--device-choice
-            (xcode-addition-ask-for-device-or-simulator))
-          (if (not (xcode-project-run-in-simulator))
-              (swift-development-compile-for-device :run run)
-            (swift-development-compile-for-simulator :run run))))
+        ;; Start simulator early (async, non-blocking) so it's ready when build completes
+        (when run
+          (require 'ios-simulator)
+          (let ((sim-id (ios-simulator-simulator-identifier)))
+            (when sim-id
+              (ios-simulator-setup-simulator-dwim sim-id))))
+
+        ;; Use async or sync check based on configuration
+        (if (and (not force) swift-development-use-async-rebuild-check)
+            ;; Async path - doesn't block Emacs
+            ;; IMPORTANT: Capture ALL project info NOW before going async
+            (let ((captured-root (xcode-project-project-root))
+                  (captured-build-folder (xcode-project-build-folder :device-type :simulator))
+                  (captured-app-id (xcode-project-fetch-or-load-app-identifier)))
+              (when swift-development-debug
+                (message "Captured before async: root=%s, build-folder=%s, app-id=%s"
+                         captured-root captured-build-folder captured-app-id))
+              (when (fboundp 'xcode-project-notify)
+                (xcode-project-notify
+                 :message (propertize "Checking if rebuild needed..." 'face 'font-lock-keyword-face)))
+              (swift-development-needs-rebuild-async-p
+               (lambda (needs-rebuild)
+                 (if needs-rebuild
+                     (swift-development--do-compile :run run)
+                   (progn
+                     (when (fboundp 'xcode-project-notify)
+                       (xcode-project-notify
+                        :message (propertize "Build up-to-date, skipping compilation" 'face 'success)
+                        :seconds 2
+                        :reset t))
+                     ;; When skipping build, need to ensure project is setup
+                     (when run
+                       (condition-case err
+                           (let* ((root captured-root) ;; Use captured values
+                                  (build-folder captured-build-folder)
+                                  (app-id captured-app-id)
+                                  (sim-id (ios-simulator-simulator-identifier))
+                                  (app-name (when (fboundp 'ios-simulator-get-app-name-fast)
+                                             (ios-simulator-get-app-name-fast build-folder)))
+                                  (sim-name (when (fboundp 'ios-simulator-simulator-name-from)
+                                             (ios-simulator-simulator-name-from :id sim-id))))
+                             (when swift-development-debug
+                               (message "Debug - root: %s, build-folder: %s, sim-id: %s, app-id: %s, app-name: %s, sim-name: %s"
+                                       root build-folder sim-id app-id app-name sim-name))
+                             ;; Check for nil values before running
+                             (if (or (not root) (not build-folder) (not sim-id) (not app-id) (not app-name))
+                                 (progn
+                                   (message "Error: Missing required values to run app")
+                                   (message "  Project root: %s" (or root "NIL"))
+                                   (message "  Build folder: %s" (or build-folder "NIL"))
+                                   (message "  Simulator ID: %s" (or sim-id "NIL"))
+                                   (message "  App ID: %s" (or app-id "NIL"))
+                                   (message "  App name: %s" (or app-name "NIL"))
+                                   (message "  Simulator name: %s" (or sim-name "NIL"))
+                                   (message "Try running with prefix arg to force rebuild: C-u C-c C-c"))
+                               ;; All values present - setup and run DIRECTLY
+                               ;; IMPORTANT: Don't call swift-development-run which does new lookups!
+                               ;; Call ios-simulator-install-and-run-app directly with captured values
+                               (progn
+                                 (when swift-development-debug
+                                   (message "Running app directly with captured values (no new lookups)"))
+                                 (when swift-development-use-periphery
+                                   (when (fboundp 'periphery-kill-buffer)
+                                     (periphery-kill-buffer)))
+                                 (when (fboundp 'ios-simulator-kill-buffer)
+                                   (ios-simulator-kill-buffer))
+
+                                 ;; Call install-and-run DIRECTLY with captured data
+                                 (require 'ios-simulator)
+                                 (ios-simulator-install-and-run-app
+                                  :rootfolder root
+                                  :build-folder build-folder
+                                  :appIdentifier app-id
+                                  :simulatorId sim-id))))
+                         (error
+                          (message "Error running app: %s" (error-message-string err))
+                          (message "Try running with prefix arg to force rebuild: C-u C-c C-c"))))))))
+              ;; Return t to prevent fall-through to sync path
+              t)
+          ;; Sync path or forced build
+          (if (and (not force) (not (swift-development-needs-rebuild-p)))
+              (progn
+                (when (fboundp 'xcode-project-notify)
+                  (xcode-project-notify
+                   :message (propertize "Build up-to-date, skipping compilation" 'face 'success)
+                   :seconds 2
+                   :reset t))
+                ;; When skipping build, ensure project is setup (sync path too)
+                (when run
+                  (condition-case err
+                      (let* ((root (xcode-project-project-root))
+                             (build-folder (xcode-project-build-folder :device-type :simulator))
+                             (sim-id (ios-simulator-simulator-identifier))
+                             (app-id (xcode-project-fetch-or-load-app-identifier))
+                             (app-name (when (fboundp 'ios-simulator-get-app-name-fast)
+                                        (ios-simulator-get-app-name-fast build-folder)))
+                             (sim-name (when (fboundp 'ios-simulator-simulator-name-from)
+                                        (ios-simulator-simulator-name-from :id sim-id))))
+                        (when swift-development-debug
+                          (message "Debug (sync) - root: %s, build-folder: %s, sim-id: %s, app-id: %s, app-name: %s, sim-name: %s"
+                                  root build-folder sim-id app-id app-name sim-name))
+                        ;; Check for nil values before running
+                        (if (or (not root) (not build-folder) (not sim-id) (not app-id) (not app-name))
+                            (progn
+                              (message "Error: Missing required values to run app")
+                              (message "  Project root: %s" (or root "NIL"))
+                              (message "  Build folder: %s" (or build-folder "NIL"))
+                              (message "  Simulator ID: %s" (or sim-id "NIL"))
+                              (message "  App ID: %s" (or app-id "NIL"))
+                              (message "  App name: %s" (or app-name "NIL"))
+                              (message "  Simulator name: %s" (or sim-name "NIL"))
+                              (message "Try running with prefix arg to force rebuild: C-u C-c C-c"))
+                          ;; All values present - setup and run
+                          (progn
+                            (xcode-project-setup-project)
+                            (xcode-project-setup-xcodebuildserver)
+                            ;; Force simulator to use these values
+                            (setq current-simulator-id sim-id
+                                  xcode-project--current-app-identifier app-id
+                                  current-root-folder-simulator root
+                                  current-app-name app-name)
+                            (swift-development-run))))
+                    (error
+                     (message "Error running app: %s" (error-message-string err))
+                     (message "Try running with prefix arg to force rebuild: C-u C-c C-c")))))
+            (swift-development--do-compile :run run))))
     (if (swift-development-is-a-swift-package-base-project)
         (swift-development-build-swift-package)
       (message "Not xcodeproject nor swift package"))))
+
+(cl-defun swift-development--do-compile (&key run)
+  "Internal function to perform the actual compilation.
+RUN specifies whether to run after building."
+  (when swift-development-use-periphery
+    (periphery-kill-buffer))
+  (ios-simulator-kill-buffer)
+  ;; Only ask for device/simulator if not already set
+  (unless xcode-project--device-choice
+    (xcode-addition-ask-for-device-or-simulator))
+  (if (not (xcode-project-run-in-simulator))
+      (swift-development-compile-for-device :run run)
+    (swift-development-compile-for-simulator :run run)))
 
 (defun swift-development-warm-build-cache ()
   "Warm up build caches and precompile common modules."
@@ -513,6 +671,11 @@ If FORCE is nil, skip compilation if sources are unchanged."
       ;; Check if already warmed for this project
       (when (and cache-key (fboundp 'swift-cache-get))
         (when (swift-cache-get cache-key)
+          (when (fboundp 'xcode-project-notify)
+            (xcode-project-notify
+             :message (propertize "Build caches already warmed (cached)" 'face 'success)
+             :seconds 2
+             :reset t))
           (cl-return-from swift-development-warm-build-cache)))
     
     (let ((default-directory project-root)
@@ -527,25 +690,31 @@ If FORCE is nil, skip compilation if sources are unchanged."
           (make-directory dir t)))
       
       ;; Precompile common system frameworks asynchronously
-      (message "Warming build caches...")
+      (when (fboundp 'xcode-project-notify)
+        (xcode-project-notify
+         :message (propertize "Warming build caches..." 'face 'font-lock-builtin-face)))
       (dolist (framework '("Foundation" "UIKit" "SwiftUI" "Combine" "CoreData" "CoreGraphics"))
-        (start-process-shell-command 
-         (format "cache-%s" framework) 
+        (start-process-shell-command
+         (format "cache-%s" framework)
          nil
          (format "xcrun swiftc -emit-module -module-name %s -sdk $(xcrun --sdk iphonesimulator --show-sdk-path) -target arm64-apple-ios15.0-simulator -O -whole-module-optimization /dev/null 2>/dev/null || true" framework)))
-      
+
       ;; Precompile bridging headers if they exist
       (when-let ((bridging-header (car (directory-files-recursively default-directory ".*-Bridging-Header\\.h$" t))))
-        (start-process-shell-command 
-         "cache-bridging" 
+        (start-process-shell-command
+         "cache-bridging"
          nil
          (format "xcrun clang -x objective-c-header -arch arm64 -isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -c %s -o /tmp/bridging.pch 2>/dev/null || true" bridging-header)))
-      
+
       ;; Mark as warmed in cache
       (when (and cache-key (fboundp 'swift-cache-set))
         (swift-cache-set cache-key t 7200))  ; Cache for 2 hours
-      
-      (message "Build cache warming initiated in background")))))
+
+      (when (fboundp 'xcode-project-notify)
+        (xcode-project-notify
+         :message (propertize "Build cache warming initiated in background" 'face 'success)
+         :seconds 2
+         :reset t))))))
 
 (defun swift-development-precompile-common-headers ()
   "Precompile common headers to speed up subsequent builds."
@@ -584,12 +753,13 @@ If FORCE is nil, skip compilation if sources are unchanged."
                         :sim-id (ios-simulator-simulator-identifier)))
         (default-directory (xcode-project-project-root)))
 
-    (mode-line-hud:update
-     :message (format "Building: %s|%s"
-                      (propertize (swift-development-format-scheme-name (xcode-project-scheme)) 
-                                 'face 'font-lock-builtin-face)
-                      (propertize (swift-development-format-simulator-name (ios-simulator-simulator-name)) 
-                                 'face 'font-lock-negation-char-face)))
+    (when (fboundp 'xcode-project-notify)
+      (xcode-project-notify
+       :message (format "Building: %s|%s"
+                        (propertize (swift-development-format-scheme-name (xcode-project-scheme))
+                                   'face 'font-lock-builtin-face)
+                        (propertize (swift-development-format-simulator-name (ios-simulator-simulator-name))
+                                   'face 'font-lock-negation-char-face))))
 
     (xcode-project-setup-xcodebuildserver)
 
@@ -628,10 +798,11 @@ If FORCE is nil, skip compilation if sources are unchanged."
     (swift-development-log-debug "Build-folder: %s" (xcode-project-derived-data-path))
 
     (xcode-project-setup-xcodebuildserver)
-    (mode-line-hud:update
-     :message (format "Compiling %s|%s"
-                               (propertize (xcode-project-scheme) 'face 'font-lock-builtin-face)
-                               (propertize "Physical Device" 'face 'font-lock-negation-char-face)))
+    (when (fboundp 'xcode-project-notify)
+      (xcode-project-notify
+       :message (format "Compiling %s|%s"
+                        (propertize (xcode-project-scheme) 'face 'font-lock-builtin-face)
+                        (propertize "Physical Device" 'face 'font-lock-negation-char-face))))
 
     (if swift-development-use-periphery
         (swift-development-compile-with-progress
@@ -658,12 +829,216 @@ If FORCE is nil, skip compilation if sources are unchanged."
 ;; Smart Build Detection - Skip compilation if sources unchanged
 ;; ============================================================================
 
+;; ============================================================================
+;; Project Signature System - Fast checksum-based change detection
+;; ============================================================================
+
+(defvar swift-development--project-signature nil
+  "Current project signature (hash of all source file hashes).
+Used for fast change detection without scanning all files.")
+
+(defvar swift-development--file-hashes (make-hash-table :test 'equal)
+  "Hash table of individual file hashes.
+Stores (FILE-PATH . MD5-HASH) entries for incremental updates.")
+
+(defvar swift-development--signature-file nil
+  "Path to .swift-development signature file.
+Set automatically based on project root.")
+
+(defun swift-development--hash-table-to-alist (hash-table)
+  "Convert HASH-TABLE to an alist.
+Compatibility function for Emacs versions without hash-table-to-alist."
+  (let ((result nil))
+    (maphash (lambda (k v) (push (cons k v) result)) hash-table)
+    result))
+
 (defun swift-development-file-mtime (file)
   "Get modification time as float for FILE.
 Returns nil if file doesn't exist."
   (when (file-exists-p file)
     (float-time (file-attribute-modification-time
                  (file-attributes file)))))
+
+(defun swift-development--get-signature-file ()
+  "Get path to .swift-development signature file for current project."
+  (unless swift-development--signature-file
+    (setq swift-development--signature-file
+          (expand-file-name ".swift-development"
+                           (xcode-project-project-root))))
+  swift-development--signature-file)
+
+(defun swift-development--load-signature ()
+  "Load project signature and file hashes from .swift-development file."
+  (let ((sig-file (swift-development--get-signature-file)))
+    (when (file-exists-p sig-file)
+      (condition-case err
+          (with-temp-buffer
+            (insert-file-contents sig-file)
+            (let ((data (read (current-buffer))))
+              (setq swift-development--project-signature (plist-get data :signature))
+              (setq swift-development--file-hashes (make-hash-table :test 'equal))
+              (dolist (entry (plist-get data :file-hashes))
+                (puthash (car entry) (cdr entry) swift-development--file-hashes))
+              (when swift-development-debug
+                (message "Loaded project signature with %d file hashes"
+                         (hash-table-count swift-development--file-hashes)))))
+        (error
+         (message "Warning: Failed to load .swift-development: %s" (error-message-string err))
+         (setq swift-development--project-signature nil)
+         (setq swift-development--file-hashes (make-hash-table :test 'equal)))))))
+
+(defun swift-development--save-signature ()
+  "Save project signature and file hashes to .swift-development file."
+  (let ((sig-file (swift-development--get-signature-file)))
+    (condition-case err
+        (with-temp-file sig-file
+          (prin1 (list :signature swift-development--project-signature
+                      :file-hashes (swift-development--hash-table-to-alist swift-development--file-hashes)
+                      :timestamp (current-time-string))
+                 (current-buffer)))
+      (error
+       (message "Warning: Failed to save .swift-development: %s" (error-message-string err))))))
+
+(defun swift-development--file-hash (file)
+  "Calculate MD5 hash of FILE synchronously.
+Returns hash string or nil if file doesn't exist."
+  (when (file-exists-p file)
+    (with-temp-buffer
+      (insert-file-contents file)
+      (md5 (current-buffer)))))
+
+(defun swift-development--calculate-project-signature ()
+  "Calculate project signature from all file hashes.
+Returns hash of all file hashes concatenated and sorted."
+  (let ((hashes nil))
+    ;; Collect all hash values
+    (maphash (lambda (_key value) (push value hashes)) swift-development--file-hashes)
+    ;; Sort and create signature
+    (when hashes
+      (setq hashes (sort hashes #'string<))
+      (md5 (mapconcat #'identity hashes "")))))
+
+(defun swift-development--update-file-hash (file)
+  "Update hash for FILE in the file-hashes table.
+Returns t if hash changed, nil if unchanged."
+  (let* ((old-hash (gethash file swift-development--file-hashes))
+         (new-hash (swift-development--file-hash file)))
+    (if new-hash
+        (progn
+          (puthash file new-hash swift-development--file-hashes)
+          (not (equal old-hash new-hash)))
+      ;; File doesn't exist anymore, remove from hash table
+      (when old-hash
+        (remhash file swift-development--file-hashes)
+        t))))
+
+(defun swift-development--update-all-hashes ()
+  "Update hashes for all source files and calculate new project signature.
+This is called after a successful build."
+  (let* ((project-root (xcode-project-project-root))
+         (source-files (swift-development-find-all-source-files))
+         (count 0))
+    ;; Clear old hashes
+    (setq swift-development--file-hashes (make-hash-table :test 'equal))
+    ;; Calculate new hashes
+    (dolist (file source-files)
+      (let ((full-path (expand-file-name file project-root)))
+        (when (swift-development--file-hash full-path)
+          (puthash full-path (swift-development--file-hash full-path)
+                   swift-development--file-hashes)
+          (setq count (1+ count)))))
+    ;; Calculate project signature
+    (setq swift-development--project-signature
+          (swift-development--calculate-project-signature))
+    ;; Save to disk
+    (swift-development--save-signature)
+    (when swift-development-debug
+      (message "Updated project signature with %d file hashes" count))))
+
+(defcustom swift-development-max-concurrent-hashes 30
+  "Maximum number of concurrent md5 processes when hashing files.
+Lower values use less file descriptors but are slower.
+Higher values are faster but may hit 'too many open files' limit."
+  :type 'integer
+  :group 'swift-development)
+
+(defun swift-development--update-all-hashes-async (&optional callback)
+  "Update hashes for all source files asynchronously.
+Does not block Emacs. Calls CALLBACK when complete if provided.
+This is called after a successful build.
+Uses a queue to limit concurrent processes and avoid 'too many open files' error."
+  (let ((project-root (xcode-project-project-root)))
+    (when swift-development-debug
+      (message "Starting async hash update..."))
+
+    ;; Find all source files asynchronously
+    (swift-development-find-all-source-files-async
+     (lambda (source-files)
+       (if (null source-files)
+           (progn
+             (when swift-development-debug
+               (message "No source files found"))
+             (when callback (funcall callback)))
+         ;; Clear old hashes
+         (setq swift-development--file-hashes (make-hash-table :test 'equal))
+
+         (let* ((total-files (length source-files))
+                (completed 0)
+                (failed 0)
+                (active-processes 0)
+                (file-queue (append source-files nil))) ;; Copy to mutable list
+
+           (when swift-development-debug
+             (message "Hashing %d files asynchronously (max %d concurrent)..."
+                      total-files swift-development-max-concurrent-hashes))
+
+           ;; Function to process next file from queue
+           (cl-labels ((process-next-file ()
+                         (when (and file-queue
+                                   (< active-processes swift-development-max-concurrent-hashes))
+                           (let* ((file (pop file-queue))
+                                  (full-path (expand-file-name file project-root)))
+                             (if (file-exists-p full-path)
+                                 (progn
+                                   (setq active-processes (1+ active-processes))
+                                   (swift-development-file-hash-async
+                                    full-path
+                                    (lambda (hash)
+                                      (setq completed (1+ completed))
+                                      (setq active-processes (1- active-processes))
+                                      (when hash
+                                        (puthash full-path hash swift-development--file-hashes))
+
+                                      ;; Check if all files are processed
+                                      (if (= completed total-files)
+                                          (progn
+                                            ;; Calculate project signature
+                                            (setq swift-development--project-signature
+                                                  (swift-development--calculate-project-signature))
+                                            ;; Save to disk
+                                            (swift-development--save-signature)
+                                            (when swift-development-debug
+                                              (message "Updated project signature with %d file hashes (async)"
+                                                       (hash-table-count swift-development--file-hashes)))
+                                            ;; Call callback if provided
+                                            (when callback (funcall callback)))
+                                        ;; Process next file
+                                        (process-next-file)))))
+                               ;; File doesn't exist, count as completed
+                               (setq completed (1+ completed))
+                               (setq failed (1+ failed))
+                               (if (= completed total-files)
+                                   (progn
+                                     (when swift-development-debug
+                                       (message "Hash update complete (%d failed)" failed))
+                                     (when callback (funcall callback)))
+                                 ;; Process next file
+                                 (process-next-file)))))))
+
+             ;; Start initial batch of processes
+             (dotimes (_ (min swift-development-max-concurrent-hashes total-files))
+               (process-next-file)))
+           ))))))
 
 (defun swift-development--build-find-patterns ()
   "Build find command patterns for watched file extensions."
@@ -680,6 +1055,78 @@ Returns nil if file doesn't exist."
                      swift-development-ignore-paths)
              " "))
 
+;; ============================================================================
+;; Async Hash-Based Change Detection
+;; ============================================================================
+
+(defun swift-development--get-hash-cache-file ()
+  "Get path to hash cache file for current project."
+  (unless swift-development--hash-cache-file
+    (setq swift-development--hash-cache-file
+          (expand-file-name ".swift-file-hashes.el"
+                           (xcode-project-project-root))))
+  swift-development--hash-cache-file)
+
+(defun swift-development-load-hash-cache ()
+  "Load hash cache from disk for current project."
+  (let ((cache-file (swift-development--get-hash-cache-file)))
+    (when (file-exists-p cache-file)
+      (setq swift-development--file-hash-cache (make-hash-table :test 'equal))
+      (condition-case err
+          (with-temp-buffer
+            (insert-file-contents cache-file)
+            (let ((data (read (current-buffer))))
+              (dolist (entry data)
+                (puthash (car entry) (cdr entry) swift-development--file-hash-cache))))
+        (error
+         (message "Warning: Failed to load hash cache: %s" (error-message-string err))
+         (setq swift-development--file-hash-cache (make-hash-table :test 'equal)))))))
+
+(defun swift-development-save-hash-cache ()
+  "Persist hash cache to disk for current project."
+  (let ((cache-file (swift-development--get-hash-cache-file)))
+    (condition-case err
+        (with-temp-file cache-file
+          (prin1 (swift-development--hash-table-to-alist swift-development--file-hash-cache)
+                 (current-buffer)))
+      (error
+       (message "Warning: Failed to save hash cache: %s" (error-message-string err))))))
+
+(defun swift-development-file-hash-async (file callback)
+  "Compute MD5 hash of FILE asynchronously, call CALLBACK with hash.
+Uses macOS `md5` command for speed. Does not block Emacs."
+  (let ((proc (make-process
+               :name (format "md5-%s" (file-name-nondirectory file))
+               :command (list "md5" "-q" file)
+               :noquery t
+               :buffer (generate-new-buffer " *md5-temp*")
+               :sentinel
+               (lambda (p _event)
+                 (when (eq (process-status p) 'exit)
+                   (when (buffer-live-p (process-buffer p))
+                     (with-current-buffer (process-buffer p)
+                       (let ((hash (string-trim (buffer-string))))
+                         (funcall callback hash)))
+                     (kill-buffer (process-buffer p))))))))
+    proc))
+
+(defun swift-development-file-hash-entry-async (file callback)
+  "Get hash entry for FILE asynchronously, calling CALLBACK with (HASH . MODTIME).
+Uses cached value if modtime hasn't changed, otherwise computes new hash."
+  (let* ((attrs (file-attributes file))
+         (modtime (nth 5 attrs))
+         (cached (gethash file swift-development--file-hash-cache)))
+    (if (and cached (equal modtime (cdr cached)))
+        ;; Use cached hash
+        (funcall callback (cons file cached))
+      ;; Compute new hash
+      (swift-development-file-hash-async
+       file
+       (lambda (hash)
+         (let ((entry (cons hash modtime)))
+           (puthash file entry swift-development--file-hash-cache)
+           (funcall callback (cons file entry))))))))
+
 (defun swift-development-find-all-source-files ()
   "Find all source files in project (cached for 60 seconds).
 Includes files matching swift-development-watched-extensions.
@@ -691,7 +1138,7 @@ Excludes paths matching patterns in swift-development-ignore-paths."
          (excludes (swift-development--build-find-excludes))
          (find-cmd (format "find . \\( %s \\) %s -type f" patterns excludes)))
     (if (and cache-key (fboundp 'swift-cache-with))
-        (swift-cache-with cache-key 60  ; Cache for 1 minute
+        (swift-cache-with cache-key swift-development-cache-ttl
           (let ((default-directory project-root))
             (split-string
              (shell-command-to-string find-cmd)
@@ -702,34 +1149,55 @@ Excludes paths matching patterns in swift-development-ignore-paths."
          (shell-command-to-string find-cmd)
          "\n" t)))))
 
-(defun swift-development-find-newest-source-mtime ()
-  "Find the newest modification time among all Swift source files."
-  (let* ((source-files (swift-development-find-all-source-files))
-         (project-root (xcode-project-project-root))
-         (mtimes (mapcar (lambda (file)
-                          (swift-development-file-mtime
-                           (expand-file-name file project-root)))
-                        source-files)))
-    (when mtimes
-      (apply #'max (delq nil mtimes)))))
-
-(defun swift-development-get-important-files-mtime ()
-  "Get the newest mtime of important project files (project.pbxproj, Podfile.lock, etc)."
+(defun swift-development-find-all-source-files-async (callback)
+  "Find all source files in project asynchronously.
+Calls CALLBACK with list of files when complete. Does not block Emacs.
+Includes files matching swift-development-watched-extensions.
+Excludes paths matching patterns in swift-development-ignore-paths."
   (let* ((project-root (xcode-project-project-root))
-         (important-files (list
-                          ;; Find project.pbxproj
-                          (car (directory-files-recursively
-                                project-root "project\\.pbxproj$" nil
-                                (lambda (dir) (not (string-match-p "/\\." dir)))
-                                1))
-                          ;; CocoaPods
-                          (expand-file-name "Podfile.lock" project-root)
-                          ;; Swift Package Manager
-                          (expand-file-name "Package.resolved" project-root)))
-         (mtimes (mapcar #'swift-development-file-mtime
-                        (delq nil important-files))))
-    (when mtimes
-      (apply #'max (delq nil mtimes)))))
+         (cache-key (when (fboundp 'swift-cache-project-key)
+                      (swift-cache-project-key project-root "source-files")))
+         (patterns (swift-development--build-find-patterns))
+         (excludes (swift-development--build-find-excludes))
+         (find-cmd (format "find . \\( %s \\) %s -type f" patterns excludes)))
+
+    ;; Check cache first
+    (if (and cache-key (fboundp 'swift-cache-get))
+        (let ((cached (swift-cache-get cache-key)))
+          (if cached
+              (progn
+                (when swift-development-debug
+                  (message "Using cached source file list (%d files)" (length cached)))
+                (funcall callback cached))
+            ;; Cache miss - fetch async
+            (swift-development--find-files-async project-root find-cmd cache-key callback)))
+      ;; No cache available - fetch async
+      (swift-development--find-files-async project-root find-cmd nil callback))))
+
+(defun swift-development--find-files-async (project-root find-cmd cache-key callback)
+  "Run find command asynchronously and call CALLBACK with results.
+PROJECT-ROOT is the root directory, FIND-CMD is the find command.
+CACHE-KEY if non-nil will be used to cache results."
+  (let ((default-directory project-root)
+        (output-buffer (generate-new-buffer " *swift-find-temp*")))
+    (make-process
+     :name "swift-find-files"
+     :command (list "sh" "-c" find-cmd)
+     :noquery t
+     :buffer output-buffer
+     :sentinel
+     (lambda (proc _event)
+       (when (eq (process-status proc) 'exit)
+         (when (buffer-live-p (process-buffer proc))
+           (with-current-buffer (process-buffer proc)
+             (let ((files (split-string (buffer-string) "\n" t)))
+               (when (and cache-key (fboundp 'swift-cache-set))
+                 (swift-cache-set cache-key files 60))
+               (when swift-development-debug
+                 (message "Found %d source files asynchronously" (length files)))
+               (funcall callback files)))
+           (kill-buffer (process-buffer proc))))))))
+
 
 (defun swift-development-get-built-app-path ()
   "Get path to the built .app bundle."
@@ -745,37 +1213,114 @@ Excludes paths matching patterns in swift-development-ignore-paths."
 
 (defun swift-development-needs-rebuild-p ()
   "Return t if rebuild is needed, nil if app is up-to-date.
-Compares modification times of:
-- All .swift source files
-- Project configuration files (project.pbxproj, Podfile.lock, etc)
-Against the built .app bundle."
+Uses fast checksum-based detection - compares project signature instead of file mtimes.
+Much faster than scanning all files."
   (let* ((app-path (swift-development-get-built-app-path))
-         (app-mtime (when app-path
-                     (swift-development-file-mtime app-path)))
-         (newest-source-mtime (swift-development-find-newest-source-mtime))
-         (newest-project-mtime (swift-development-get-important-files-mtime)))
+         (needs-rebuild nil))
 
-    (when swift-development-debug
-      (message "Build check - App: %s (mtime: %s), Newest source: %s, Newest project file: %s, Last build: %s"
-               app-path
-               (when app-mtime (format-time-string "%Y-%m-%d %H:%M:%S" app-mtime))
-               (when newest-source-mtime (format-time-string "%Y-%m-%d %H:%M:%S" newest-source-mtime))
-               (when newest-project-mtime (format-time-string "%Y-%m-%d %H:%M:%S" newest-project-mtime))
-               (cond ((eq swift-development--last-build-succeeded t) "succeeded")
-                     ((eq swift-development--last-build-succeeded 'failed) "FAILED")
-                     (t "unknown"))))
+    ;; Load saved signature if not already loaded
+    (unless swift-development--project-signature
+      (swift-development--load-signature))
 
-    (or (not app-path)                           ; No app exists
-        (not app-mtime)                          ; Can't read app mtime
-        (eq swift-development--last-build-succeeded 'failed)  ; Last build failed
-        (and newest-source-mtime
-             (> newest-source-mtime app-mtime))  ; Source newer than app
-        (and newest-project-mtime
-             (> newest-project-mtime app-mtime)))))  ; Project files newer than app
+    ;; Quick checks first
+    (cond
+     ((not app-path)
+      (setq needs-rebuild t)
+      (when swift-development-debug
+        (message "Build check: No .app exists - rebuild needed")))
+
+     ((eq swift-development--last-build-succeeded 'failed)
+      (setq needs-rebuild t)
+      (when swift-development-debug
+        (message "Build check: Last build failed - rebuild needed")))
+
+     ((not swift-development--project-signature)
+      (setq needs-rebuild t)
+      (when swift-development-debug
+        (message "Build check: No saved signature - rebuild needed")))
+
+     (t
+      ;; Calculate current signature and compare
+      (let ((current-sig (swift-development--calculate-project-signature))
+            (saved-sig swift-development--project-signature))
+        (setq needs-rebuild (not (equal current-sig saved-sig)))
+        (when swift-development-debug
+          (message "Build check: Current sig=%s, Saved sig=%s - %s"
+                   (substring current-sig 0 8)
+                   (substring saved-sig 0 8)
+                   (if needs-rebuild "REBUILD" "SKIP"))))))
+
+    needs-rebuild))
+
+(defun swift-development-needs-rebuild-async-p (callback)
+  "Check if rebuild is needed and call CALLBACK with result asynchronously.
+Uses git-first approach for instant checks (<0.1s), falling back to heuristics."
+  (let* ((app-path (swift-development-get-built-app-path)))
+
+    ;; Quick checks first (these are fast)
+    (cond
+     ((not app-path)
+      (when swift-development-debug
+        (message "Build check (async): No .app exists - rebuild needed"))
+      (funcall callback t))
+
+     ((eq swift-development--last-build-succeeded 'failed)
+      (when swift-development-debug
+        (message "Build check (async): Last build failed - rebuild needed"))
+      (funcall callback t))
+
+     ;; Try git-first approach (20x faster than find!)
+     (t
+      (let ((project-root (xcode-project-project-root)))
+        (if (file-exists-p (expand-file-name ".git" project-root))
+            ;; Git repo - use git status for instant check (~0.1s)
+            (let ((default-directory project-root))
+              (when swift-development-debug
+                (message "Build check (async): Using git status..."))
+              (make-process
+               :name "git-status-check"
+               :command (list "git" "status" "--porcelain" "--" "*.swift" "*.m" "*.mm" "*.h" "*.c" "*.cpp")
+               :noquery t
+               :buffer " *git-status-temp*"
+               :sentinel (lambda (proc event)
+                           (when (string= event "finished\n")
+                             (let ((buf (process-buffer proc)))
+                               (when (buffer-live-p buf)
+                                 (with-current-buffer buf
+                                   (let ((has-changes (> (buffer-size) 0)))
+                                     (kill-buffer)
+                                     (when swift-development-debug
+                                       (message "Build check (async): Git says %s"
+                                                (if has-changes "REBUILD" "UP-TO-DATE")))
+                                     (funcall callback has-changes)))))))))
+
+          ;; Not a git repo - use simple heuristic fallback
+          (when swift-development-debug
+            (message "Build check (async): No git, using heuristic..."))
+          (let* ((app-mtime (time-to-seconds (file-attribute-modification-time
+                                              (file-attributes app-path))))
+                 (buffer-file (buffer-file-name))
+                 (needs-rebuild nil))
+
+            ;; Check if current Swift file is newer than app
+            (when (and buffer-file (string-match-p "\\.swift$" buffer-file))
+              (let ((file-mtime (time-to-seconds (file-attribute-modification-time
+                                                  (file-attributes buffer-file)))))
+                (when (> file-mtime app-mtime)
+                  (setq needs-rebuild t)
+                  (when swift-development-debug
+                    (message "Build check (async): Current file newer than app - rebuild needed")))))
+
+            (unless needs-rebuild
+              (when swift-development-debug
+                (message "Build check (async): Heuristic says up-to-date")))
+
+            (funcall callback needs-rebuild))))))))
 
 (defun swift-development-ensure-built (&optional force)
   "Ensure app is built.  Build only if needed unless FORCE is non-nil.
-Returns t if build was performed, nil if skipped."
+Returns t if build was performed, nil if skipped.
+BLOCKING: May freeze Emacs on large projects. Consider using -async version."
   (interactive "P")
   (if (or force (swift-development-needs-rebuild-p))
       (progn
@@ -786,8 +1331,39 @@ Returns t if build was performed, nil if skipped."
         (swift-development-compile-and-run)
         t)
     (progn
-      (message "Build up-to-date, skipping compilation")
+      (when (fboundp 'xcode-project-notify)
+        (xcode-project-notify
+         :message (propertize "Build up-to-date, skipping compilation" 'face 'success)
+         :seconds 2
+         :reset t))
       nil)))
+
+;;;###autoload
+(defun swift-development-ensure-built-async (&optional force)
+  "Ensure app is built asynchronously. Build only if needed unless FORCE is non-nil.
+Non-blocking version suitable for large projects.
+Shows message while checking, builds if needed."
+  (interactive "P")
+  (if force
+      (progn
+        (message "Forcing rebuild...")
+        (swift-development-compile-and-run))
+    (progn
+      (when (fboundp 'xcode-project-notify)
+        (xcode-project-notify
+         :message (propertize "Checking if rebuild needed..." 'face 'font-lock-keyword-face)))
+      (swift-development-needs-rebuild-async-p
+       (lambda (needs-rebuild)
+         (if needs-rebuild
+             (progn
+               (when swift-development-debug
+                 (message "Changes detected, building..."))
+               (swift-development-compile-and-run))
+           (when (fboundp 'xcode-project-notify)
+             (xcode-project-notify
+              :message (propertize "Build up-to-date, skipping compilation" 'face 'success)
+              :seconds 2
+              :reset t))))))))
 
 ;;;###autoload
 (defun swift-development-reset-build-status ()
@@ -798,15 +1374,30 @@ This forces the next build to run regardless of file timestamps."
   (message "Build status reset - next build will run unconditionally"))
 
 ;;;###autoload
+(defun swift-development-clear-hash-cache ()
+  "Clear the file hash cache for the current project.
+Forces a full re-hash on next check when using content hashing."
+  (interactive)
+  (setq swift-development--file-hash-cache (make-hash-table :test 'equal))
+  (let ((cache-file (swift-development--get-hash-cache-file)))
+    (when (file-exists-p cache-file)
+      (delete-file cache-file)))
+  (message "Hash cache cleared for current project"))
+
+;;;###autoload
 (defun swift-development-build-status ()
   "Show current build status and whether rebuild is needed."
   (interactive)
   (let* ((app-path (swift-development-get-built-app-path))
          (app-mtime (when app-path
                      (swift-development-file-mtime app-path)))
-         (newest-source-mtime (swift-development-find-newest-source-mtime))
-         (newest-project-mtime (swift-development-get-important-files-mtime))
-         (needs-rebuild (swift-development-needs-rebuild-p)))
+         (needs-rebuild (swift-development-needs-rebuild-p))
+         (sig-file (swift-development--get-signature-file))
+         (sig-exists (file-exists-p sig-file)))
+
+    ;; Load signature if not loaded
+    (unless swift-development--project-signature
+      (swift-development--load-signature))
 
     (with-current-buffer (get-buffer-create "*Swift Build Status*")
       (erase-buffer)
@@ -827,13 +1418,12 @@ This forces the next build to run regardless of file timestamps."
                              "Unknown"))))
         (insert "Built App: Not found\n\n"))
 
-      (when newest-source-mtime
-        (insert (format "Newest Source File: %s\n"
-                       (format-time-string "%Y-%m-%d %H:%M:%S" newest-source-mtime))))
-
-      (when newest-project-mtime
-        (insert (format "Newest Project File: %s\n\n"
-                       (format-time-string "%Y-%m-%d %H:%M:%S" newest-project-mtime))))
+      (insert (format "Signature File: %s\n" (if sig-exists "Found" "Not found")))
+      (when swift-development--project-signature
+        (insert (format "Project Signature: %s...\n"
+                       (substring swift-development--project-signature 0 16))))
+      (insert (format "Tracked Files: %d\n\n"
+                     (hash-table-count swift-development--file-hashes)))
 
       (insert (format "Last Build Result: %s\n"
                      (cond ((eq swift-development--last-build-succeeded t)
@@ -1670,10 +2260,17 @@ This is the fastest way to rebuild after small changes."
 ;;;###autoload
 (defun swift-development-auto-warm-cache-on-file-open ()
   "Automatically warm build cache when opening a Swift file in an Xcode project."
-  (when (and (derived-mode-p 'swift-mode)
+  (when swift-development-debug
+    (message "[DEBUG] Auto-warm hook triggered"))
+  (when (and (or (derived-mode-p 'swift-mode)
+                 (derived-mode-p 'swift-ts-mode))
              (xcode-project-is-xcodeproject))
+    (when swift-development-debug
+      (message "[DEBUG] Conditions met - calling xcode-project-setup-current-project"))
     (let ((project-root (xcode-project-project-root)))
       (when project-root
+        (when swift-development-debug
+          (message "[DEBUG] Project root found: %s" project-root))
         (xcode-project-setup-current-project project-root)))))
 
 ;;;###autoload
@@ -1686,6 +2283,59 @@ This is the fastest way to rebuild after small changes."
           (message "Testing cache warming for project: %s" project-root)
           (xcode-project-setup-current-project project-root))
       (message "No Xcode project found in current directory"))))
+
+;;;###autoload
+(defun swift-development-diagnose-auto-warm ()
+  "Diagnose why auto-warming might not be triggering."
+  (interactive)
+  (with-current-buffer (get-buffer-create "*Auto-Warm Diagnostics*")
+    (erase-buffer)
+    (insert "=== Auto-Warm Cache Diagnostics ===\n\n")
+
+    ;; Check major mode
+    (insert (format "Current major mode: %s\n" major-mode))
+    (insert (format "Is swift-mode?: %s\n" (derived-mode-p 'swift-mode)))
+    (insert (format "Is swift-ts-mode?: %s\n\n" (derived-mode-p 'swift-ts-mode)))
+
+    ;; Check hooks
+    (insert "=== Hook Status ===\n")
+    (insert (format "swift-mode-hook members: %s\n"
+                    (if (member 'swift-development-auto-warm-cache-on-file-open swift-mode-hook)
+                        "✓ REGISTERED"
+                      "✗ NOT REGISTERED")))
+    (insert (format "swift-ts-mode-hook members: %s\n\n"
+                    (if (member 'swift-development-auto-warm-cache-on-file-open swift-ts-mode-hook)
+                        "✓ REGISTERED"
+                      "✗ NOT REGISTERED")))
+
+    ;; Check project
+    (insert "=== Project Status ===\n")
+    (let ((project-root (xcode-project-project-root)))
+      (insert (format "Project root: %s\n" (or project-root "nil")))
+      (insert (format "Is Xcode project?: %s\n" (xcode-project-is-xcodeproject)))
+
+      (when project-root
+        (let* ((normalized-root (file-truename (expand-file-name project-root)))
+               (is-warmed (gethash normalized-root xcode-project--cache-warmed-projects)))
+          (insert (format "Normalized root: %s\n" normalized-root))
+          (insert (format "Already warmed this session?: %s\n\n" (if is-warmed "YES" "NO"))))))
+
+    ;; Check cache
+    (insert "=== Cache Status ===\n")
+    (when (fboundp 'swift-cache-project-key)
+      (let* ((project-root (xcode-project-project-root))
+             (cache-key (swift-cache-project-key project-root "build-cache-warmed")))
+        (insert (format "Cache key: %s\n" cache-key))
+        (when (fboundp 'swift-cache-get)
+          (insert (format "Persistent cache warmed?: %s\n"
+                         (if (swift-cache-get cache-key) "YES" "NO"))))))
+
+    (insert "\n=== Recommendation ===\n")
+    (unless (or (member 'swift-development-auto-warm-cache-on-file-open swift-mode-hook)
+                (member 'swift-development-auto-warm-cache-on-file-open swift-ts-mode-hook))
+      (insert "⚠ Hook not registered! Try reloading swift-development.el\n"))
+
+    (display-buffer (current-buffer))))
 
 ;; Swift Package Status and Management Functions
 
@@ -1724,37 +2374,38 @@ This is the fastest way to rebuild after small changes."
       (when (get-buffer "*Swift Build Output*")
         (with-current-buffer "*Swift Build Output*"
           (goto-char (point-max))
-          (cond
-           ;; Check for package operations and update mode-line HUD
-           ((re-search-backward "Fetching \\(.*\\)" nil t)
-            (let ((pkg-name (swift-development-extract-package-name (match-string 1))))
-              (mode-line-hud:update :message (format "⬇️ Fetching %s" 
-                                                     (propertize pkg-name 'face 'font-lock-function-name-face)))))
-           ((re-search-backward "Cloning \\(.*\\)" nil t)
-            (let ((pkg-name (swift-development-extract-package-name (match-string 1))))
-              (mode-line-hud:update :message (format "📥 Cloning %s" 
-                                                     (propertize pkg-name 'face 'font-lock-function-name-face)))))
-           ((re-search-backward "Computing version for \\(.*\\)" nil t)
-            (let ((pkg-name (swift-development-extract-package-name (match-string 1))))
-              (mode-line-hud:update :message (format "🔍 Computing %s" 
-                                                     (propertize pkg-name 'face 'font-lock-variable-name-face)))))
-           ((re-search-backward "Resolving \\(.*\\)" nil t)
-            (let ((pkg-name (swift-development-extract-package-name (match-string 1))))
-              (mode-line-hud:update :message (format "🔄 Resolving %s" 
-                                                     (propertize pkg-name 'face 'font-lock-keyword-face)))))
-           ((re-search-backward "Creating working copy for \\(.*\\)" nil t)
-            (let ((pkg-name (swift-development-extract-package-name (match-string 1))))
-              (mode-line-hud:update :message (format "📝 Creating %s" 
-                                                     (propertize pkg-name 'face 'font-lock-type-face)))))
-           ;; Check for compilation of packages
-           ((re-search-backward "Building \\(.*\\)\\.o" nil t)
-            (let ((module-name (file-name-nondirectory (match-string 1))))
-              (mode-line-hud:update :message (format "🔨 Building %s" 
-                                                     (propertize module-name 'face 'font-lock-builtin-face)))))
-           ((re-search-backward "Compiling \\(.*\\)\\.swift" nil t)
-            (let ((file-name (file-name-nondirectory (match-string 1))))
-              (mode-line-hud:update :message (format "⚡ Compiling %s" 
-                                                     (propertize file-name 'face 'warning)))))))))))
+          (when (fboundp 'xcode-project-notify)
+            (cond
+             ;; Check for package operations and update notification system
+             ((re-search-backward "Fetching \\(.*\\)" nil t)
+              (let ((pkg-name (swift-development-extract-package-name (match-string 1))))
+                (xcode-project-notify :message (format "Fetching %s"
+                                                       (propertize pkg-name 'face 'font-lock-function-name-face)))))
+             ((re-search-backward "Cloning \\(.*\\)" nil t)
+              (let ((pkg-name (swift-development-extract-package-name (match-string 1))))
+                (xcode-project-notify :message (format "Cloning %s"
+                                                       (propertize pkg-name 'face 'font-lock-function-name-face)))))
+             ((re-search-backward "Computing version for \\(.*\\)" nil t)
+              (let ((pkg-name (swift-development-extract-package-name (match-string 1))))
+                (xcode-project-notify :message (format "Computing %s"
+                                                       (propertize pkg-name 'face 'font-lock-variable-name-face)))))
+             ((re-search-backward "Resolving \\(.*\\)" nil t)
+              (let ((pkg-name (swift-development-extract-package-name (match-string 1))))
+                (xcode-project-notify :message (format "Resolving %s"
+                                                       (propertize pkg-name 'face 'font-lock-keyword-face)))))
+             ((re-search-backward "Creating working copy for \\(.*\\)" nil t)
+              (let ((pkg-name (swift-development-extract-package-name (match-string 1))))
+                (xcode-project-notify :message (format "Creating %s"
+                                                       (propertize pkg-name 'face 'font-lock-type-face)))))
+             ;; Check for compilation of packages
+             ((re-search-backward "Building \\(.*\\)\\.o" nil t)
+              (let ((module-name (file-name-nondirectory (match-string 1))))
+                (xcode-project-notify :message (format "Building %s"
+                                                       (propertize module-name 'face 'font-lock-builtin-face)))))
+             ((re-search-backward "Compiling \\(.*\\)\\.swift" nil t)
+              (let ((file-name (file-name-nondirectory (match-string 1))))
+                (xcode-project-notify :message (format "Compiling %s"
+                                                       (propertize file-name 'face 'warning))))))))))))
 
 (defun swift-development-extract-package-name (url-or-path)
   "Extract package name from URL-OR-PATH.
@@ -1879,22 +2530,32 @@ Respects the periphery setting - use toggle-periphery-mode to control error disp
     (unless (file-exists-p build-dir)
       (message ".build directory doesn't exist"))))
 
-;; Add hooks to automatically warm cache when opening Swift files
+;; Add hook to automatically setup project when opening Swift files
 ;;;###autoload
 (add-hook 'swift-mode-hook 'swift-development-auto-warm-cache-on-file-open)
-
-;; Also add to find-file-hook for broader coverage
 ;;;###autoload
-(add-hook 'find-file-hook 
+(add-hook 'swift-ts-mode-hook 'swift-development-auto-warm-cache-on-file-open)
+
+;; Update project signature when source files are saved (incremental)
+;;;###autoload
+(add-hook 'after-save-hook
           (lambda ()
             (when (and buffer-file-name
-                       (string-match-p "\\.swift$" buffer-file-name)
                        (fboundp 'xcode-project-project-root))
-              (let ((project-root (xcode-project-project-root)))
-                (when (and project-root
-                           (fboundp 'xcode-project-is-xcodeproject)
-                           (xcode-project-is-xcodeproject))
-                  (xcode-project-setup-current-project project-root))))))
+              (let* ((project-root (xcode-project-project-root))
+                     (file-name (file-name-nondirectory buffer-file-name))
+                     (ext-regex (concat "\\." (regexp-opt swift-development-watched-extensions) "$")))
+                (when project-root
+                  ;; Update signature if watched source file or important project file was saved
+                  (when (or (string-match-p ext-regex buffer-file-name)
+                            (string-match-p "project\\.pbxproj\\|Podfile\\.lock\\|Package\\.resolved" file-name))
+                    ;; Load signature if not loaded
+                    (unless swift-development--project-signature
+                      (swift-development--load-signature))
+                    ;; Update this file's hash in memory only (don't save to disk yet)
+                    (when (swift-development--update-file-hash buffer-file-name)
+                      (when swift-development-debug
+                        (message "Updated file hash for %s (will trigger rebuild)" file-name)))))))))
 
 ;; Performance and Analysis Mode Controls
 
@@ -1932,6 +2593,32 @@ Modes: fast -> minimal -> disabled -> full -> fast"
   (interactive)
   (require 'ios-simulator)
   (ios-simulator-run-on-additional-simulator))
+
+;;;###autoload
+(defun swift-development-toggle-debug ()
+  "Toggle debug mode for all swift-development packages.
+Toggles: swift-development-debug, ios-simulator-debug, xcode-project-debug,
+swift-project-debug, swift-cache-debug, and ios-device-debug."
+  (interactive)
+  (let* ((current-state (or swift-development-debug
+                            ios-simulator-debug
+                            xcode-project-debug))
+         (new-state (not current-state)))
+    ;; Toggle all debug variables
+    (setq swift-development-debug new-state
+          ios-simulator-debug new-state
+          xcode-project-debug new-state
+          swift-project-debug new-state
+          swift-cache-debug new-state)
+    ;; ios-device-debug if available
+    (when (boundp 'ios-device-debug)
+      (setq ios-device-debug new-state))
+    ;; Report status
+    (message "Swift Development debug mode: %s"
+             (if new-state
+                 (propertize "ENABLED" 'face 'success)
+               (propertize "DISABLED" 'face 'font-lock-comment-face)))
+    new-state))
 
 ;; Load the minor mode for unified keybindings
 (require 'swift-development-mode nil t)

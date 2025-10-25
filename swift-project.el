@@ -81,6 +81,8 @@ This prevents .compile and buildServer.json from being created in wrong location
 ;; Automatically setup working directory when opening Swift files
 ;;;###autoload
 (add-hook 'swift-mode-hook #'swift-project-setup-working-directory)
+;;;###autoload
+(add-hook 'swift-ts-mode-hook #'swift-project-setup-working-directory)
 
 (defun swift-project--should-ignore-folder-p (dir)
   "Return t if DIR should be ignored when searching for project root."

@@ -10,14 +10,9 @@
 (with-eval-after-load 'periphery-helper
  (require 'periphery-helper))
 
-(with-eval-after-load 'mode-line-hud
-  (require 'mode-line-hud))
-
-(with-eval-after-load 'xcode-project
-  (require 'xcode-project))
-
-(with-eval-after-load 'swift-project
-  (require 'swift-project))
+(require 'mode-line-hud nil t)
+(require 'xcode-project nil t)
+(require 'swift-project nil t)
 
 (with-eval-after-load 'json
   (require 'json))
@@ -121,8 +116,10 @@
   (when ios-simulator--installation-process
     (delete-process ios-simulator--installation-process)))
 
-(defun ios-simulator-reset ()
-  "Reset current settings."
+(defun ios-simulator-reset (&optional choose-new-simulator)
+  "Reset current settings.
+With prefix argument CHOOSE-NEW-SIMULATOR, also select a new simulator."
+  (interactive "P")
   (setq ios-simulator--current-simulator-name nil
         current-simulator-id nil
         xcode-project--current-app-identifier nil
@@ -131,7 +128,11 @@
         current-root-folder-simulator nil)
   (ios-simulator-kill-buffer)
   ;; (ios-simulator-shut-down-all)
-  )
+  (when (or choose-new-simulator
+            (when (called-interactively-p 'any)
+              (y-or-n-p "Choose a new simulator? ")))
+    (ios-simulator-choose-simulator))
+  (message "Simulator settings reset"))
 
 (defun ios-simulator-current-sdk-version ()
   "Get the current simulator sdk-version."
@@ -205,8 +206,9 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
                          :buffer buffer)
                    ios-simulator--active-simulators))
 
-        ;; Setup and boot simulator
-        (ios-simulator-setup-simulator-dwim simulator-id)
+        ;; Setup and boot simulator (only for additional simulators, primary is already booted)
+        (unless (string= simulator-id primary-simulator-id)
+          (ios-simulator-setup-simulator-dwim simulator-id))
 
         ;; Create closures that capture the current values
         (let ((current-sim-id simulator-id)
@@ -242,7 +244,7 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
                                            :simulatorName current-sim-name
                                            :simulatorID current-sim-id
                                            :buffer launch-buffer
-                                           :terminate-running current-terminate-first))))))
+                                           :terminate-running current-terminate-first)))))))
             ;; Install directly without terminating
             (ios-simulator-install-app
              :simulatorID current-sim-id
@@ -261,7 +263,7 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
                             :simulatorName current-sim-name
                             :simulatorID current-sim-id
                             :buffer launch-buffer
-                            :terminate-running current-terminate-first))))))))))
+                            :terminate-running current-terminate-first)))))))))
 
 (cl-defun ios-simulator-install-app (&key simulatorID &key build-folder &key appname &key callback)
   "Install app (as SIMULATORID and BUILD-FOLDER APPNAME) and call CALLBACK when done."
@@ -275,7 +277,11 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
     (when ios-simulator-debug
       (message "Installing app: %s" app-path)
       (message "App path exists: %s" (file-exists-p app-path)))
-    
+
+    (when (fboundp 'xcode-project-notify)
+      (xcode-project-notify
+       :message (format "Installing %s..." (propertize appname 'face 'font-lock-constant-face))))
+
     ;; Direct process creation without buffer
     (setq ios-simulator--installation-process
           (make-process
@@ -283,13 +289,31 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
            :command command
            :noquery t
            :sentinel (lambda (process event)
-                       (when ios-simulator-debug
-                         (message "Installation process event: %s" event))
-                       (when (string= event "finished\n")
-                         (if (= 0 (process-exit-status process))
-                             (when callback (funcall callback))
-                           (message "App installation failed with exit code: %d" 
-                                    (process-exit-status process)))))))))
+                       (condition-case install-err
+                           (progn
+                             (when ios-simulator-debug
+                               (message "Installation process event: %s" event))
+                             (when (string= event "finished\n")
+                               (if (= 0 (process-exit-status process))
+                                   (progn
+                                     (when (fboundp 'xcode-project-notify)
+                                       (xcode-project-notify
+                                        :message (format "%s installed"
+                                                         (propertize appname 'face 'success))
+                                        :seconds 2
+                                        :reset t))
+                                     (when callback (funcall callback)))
+                                 (progn
+                                   (when (fboundp 'xcode-project-notify)
+                                     (xcode-project-notify
+                                      :message (format "Installation failed: %s"
+                                                       (propertize appname 'face 'error))
+                                      :seconds 3
+                                      :reset t))
+                                   (message "App installation failed with exit code: %d"
+                                            (process-exit-status process))))))
+                         (error
+                          (message "Error in installation sentinel: %s" (error-message-string install-err)))))))))
 
 
 (defun ios-simulator-get-app-name-fast (build-folder)
@@ -308,12 +332,42 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
     (kill-buffer ios-simulator-buffer-name)))
 
 (defun ios-simulator-setup-simulator-dwim (id)
-  "Setup simulator dwim (as ID)."
+  "Setup simulator dwim (as ID). Non-blocking asynchronous boot."
   (when ios-simulator-debug
     (message "Setting up simulator with id %s" id))
-  (if (not (ios-simulator-is-simulator-app-running))
-      (ios-simulator-start-simulator-with-id id)
-    (ios-simulator-boot-simulator-with-id id)))
+  ;; Try to boot directly - if Simulator.app is not running, boot will fail
+  ;; and we'll start the app as fallback. This avoids blocking ps command.
+  (when (fboundp 'xcode-project-notify)
+    (xcode-project-notify :message "Preparing simulator..."))
+  (let ((proc (make-process
+               :name "boot-simulator-dwim"
+               :command (list "xcrun" "simctl" "boot" id)
+               :noquery t
+               :stderr (get-buffer-create " *simctl-boot-stderr*")
+               :sentinel (lambda (proc event)
+                           (when (string= event "finished\n")
+                             (let ((exit-code (process-exit-status proc)))
+                               (cond
+                                ;; Success or already booted (exit code 149)
+                                ((or (= exit-code 0) (= exit-code 149))
+                                 (when ios-simulator-debug
+                                   (message "Simulator %s ready (exit: %d)" id exit-code))
+                                 ;; Activate Simulator.app
+                                 (make-process
+                                  :name "activate-simulator"
+                                  :command (list "osascript" "-e" "tell application \"Simulator\" to activate")
+                                  :noquery t)
+                                 (when (fboundp 'xcode-project-notify)
+                                   (xcode-project-notify
+                                    :message (propertize "Simulator ready" 'face 'success)
+                                    :seconds 2
+                                    :reset t)))
+                                ;; Simulator.app not running, start it
+                                (t
+                                 (when ios-simulator-debug
+                                   (message "Simulator.app not running, starting it for %s" id))
+                                 (ios-simulator-start-simulator-with-id id)))))))))
+    (set-process-query-on-exit-flag proc nil)))
 
 (cl-defun ios-simulator-simulator-name (&key callback)
   "Fetches simulator name. If CALLBACK provided, run asynchronously."
@@ -340,10 +394,23 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
   "Simulator app is running.  Boot simulator (as ID)."
   (when ios-simulator-debug
     (message "Booting simulator with id %s" id))
+  (when (fboundp 'xcode-project-notify)
+    (xcode-project-notify :message "Booting simulator..."))
   (make-process
    :name "boot-simulator"
    :command (list "sh" "-c" (ios-simulator-boot-command :id id))
-   :sentinel nil))
+   :sentinel (lambda (proc event)
+               (when (string= event "finished\n")
+                 ;; Activate Simulator.app after booting
+                 (make-process
+                  :name "activate-simulator"
+                  :command (list "osascript" "-e" "tell application \"Simulator\" to activate")
+                  :noquery t)
+                 (when (fboundp 'xcode-project-notify)
+                   (xcode-project-notify
+                    :message (propertize "Simulator ready" 'face 'success)
+                    :seconds 2
+                    :reset t))))))
 
 (defun ios-simulator-start-simulator-with-id (id)
   "Launch a specific simulator with (as ID)."
@@ -351,8 +418,16 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
     (message "Starting simulator with id: %s" id))
   (make-process
    :name "start-simulator"
-   :command (list "sh" "-c" (format "open --background -a simulator --args -CurrentDeviceUDID %s" id))
-   :sentinel nil))
+   :command (list "sh" "-c" (format "open -a simulator --args -CurrentDeviceUDID %s" id))
+   :sentinel (lambda (proc event)
+               (when (string= event "finished\n")
+                 ;; Wait a bit for Simulator.app to start, then activate it
+                 (run-with-timer 0.5 nil
+                                 (lambda ()
+                                   (make-process
+                                    :name "activate-simulator"
+                                    :command (list "osascript" "-e" "tell application \"Simulator\" to activate")
+                                    :noquery t)))))))
 
 (cl-defun ios-simulator-boot-command (&key id)
   "Boot simulator (as ID)."
@@ -368,10 +443,12 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
        :buffer " *check-simulator-temp*"
        :sentinel (lambda (proc event)
                    (when (string= event "finished\n")
-                     (with-current-buffer (process-buffer proc)
-                       (let ((output (buffer-string)))
-                         (kill-buffer)
-                         (funcall callback (not (string= "" output))))))))
+                     (let ((buf (process-buffer proc)))
+                       (when (buffer-live-p buf)
+                         (with-current-buffer buf
+                           (let ((output (buffer-string)))
+                             (kill-buffer)
+                             (funcall callback (not (string= "" output))))))))))
     ;; Synchronous fallback
     (let ((output (shell-command-to-string "ps ax | grep -v grep | grep Simulator.app")))
       (not (string= "" output)))))
@@ -386,10 +463,12 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
        :buffer " *simulator-name-temp*"
        :sentinel (lambda (proc event)
                    (when (string= event "finished\n")
-                     (with-current-buffer (process-buffer proc)
-                       (let ((result (string-trim (buffer-string))))
-                         (kill-buffer)
-                         (funcall callback result))))))
+                     (let ((buf (process-buffer proc)))
+                       (when (buffer-live-p buf)
+                         (with-current-buffer buf
+                           (let ((result (string-trim (buffer-string))))
+                             (kill-buffer)
+                             (funcall callback result))))))))
     ;; Synchronous fallback
     (string-trim
      (shell-command-to-string (format "xcrun simctl list devices | grep %s | awk -F \"(\" '{ print $1 }'" id)))))
@@ -418,9 +497,7 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
 
 (defun ios-simulator-available-ios-versions ()
   "Get list of available iOS versions."
-  (let* ((json (if (fboundp 'call-process-to-json)
-                   (call-process-to-json list-simulators-command)
-                 (ios-simulator-run-command-and-get-json list-simulators-command)))
+  (let* ((json (ios-simulator-run-command-and-get-json-simple list-simulators-command))
          (devices (cdr (assoc 'devices json)))
          (versions '()))
     (dolist (runtime-entry devices)
@@ -431,22 +508,47 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
                                runtime-key))
              (ios-version (when (and runtime-string
                                      (string-match "iOS-\\([0-9]+\\)-\\([0-9]+\\)" runtime-string))
-                           (format "%s.%s" 
+                           (format "%s.%s"
                                    (match-string 1 runtime-string)
                                    (match-string 2 runtime-string)))))
         ;; Only add version if there are available devices
         (when (and ios-version
-                   (seq-some (lambda (device) (cdr (assoc 'isAvailable device))) 
+                   (seq-some (lambda (device) (cdr (assoc 'isAvailable device)))
                             runtime-devices))
           (unless (member ios-version versions)
             (push ios-version versions)))))
     (sort versions 'version<)))
 
+(defun ios-simulator-available-ios-versions-async (callback)
+  "Get list of available iOS versions asynchronously. Calls CALLBACK with version list."
+  (ios-simulator-run-command-and-get-json-async
+   list-simulators-command
+   (lambda (json)
+     (when json
+       (let* ((devices (cdr (assoc 'devices json)))
+              (versions '()))
+         (dolist (runtime-entry devices)
+           (let* ((runtime-key (car runtime-entry))
+                  (runtime-devices (cdr runtime-entry))
+                  (runtime-string (if (symbolp runtime-key)
+                                      (symbol-name runtime-key)
+                                    runtime-key))
+                  (ios-version (when (and runtime-string
+                                          (string-match "iOS-\\([0-9]+\\)-\\([0-9]+\\)" runtime-string))
+                                (format "%s.%s"
+                                        (match-string 1 runtime-string)
+                                        (match-string 2 runtime-string)))))
+             ;; Only add version if there are available devices
+             (when (and ios-version
+                        (seq-some (lambda (device) (cdr (assoc 'isAvailable device)))
+                                 runtime-devices))
+               (unless (member ios-version versions)
+                 (push ios-version versions)))))
+         (funcall callback (sort versions 'version<)))))))
+
 (defun ios-simulator-devices-for-ios-version (ios-version)
   "Get available devices for a specific iOS version."
-  (let* ((json (if (fboundp 'call-process-to-json)
-                   (call-process-to-json list-simulators-command)
-                 (ios-simulator-run-command-and-get-json list-simulators-command)))
+  (let* ((json (ios-simulator-run-command-and-get-json-simple list-simulators-command))
          (devices (cdr (assoc 'devices json)))
          (matching-devices '()))
     (dolist (runtime-entry devices)
@@ -516,39 +618,46 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
   (if callback
       ;; Asynchronous version
       (if current-simulator-id
-          (progn
-            (ios-simulator-setup-simulator-dwim current-simulator-id)
-            (funcall callback current-simulator-id))
+          (funcall callback current-simulator-id)
         (let ((device-id (ios-simulator-get-or-choose-simulator)))
           (when ios-simulator-debug
             (message "Selected simulator ID: %s" device-id))
           (funcall callback device-id)))
     ;; Synchronous version (fallback)
     (if current-simulator-id
-        (progn
-          (ios-simulator-setup-simulator-dwim current-simulator-id)
-          current-simulator-id)
-      (progn
-        (let ((device-id (ios-simulator-get-or-choose-simulator)))
-          (when ios-simulator-debug
-            (message "Selected simulator ID: %s" device-id))
-          device-id)))))
+        current-simulator-id
+      (let ((device-id (ios-simulator-get-or-choose-simulator)))
+        (when ios-simulator-debug
+          (message "Selected simulator ID: %s" device-id))
+        device-id))))
 
 (defun ios-simulator-get-or-choose-simulator ()
   "Get booted simulator or let user choose one.
 If target simulators are configured, ensures primary is set correctly.
 If exactly one simulator is booted, use it automatically.
 If multiple simulators are booted, let user choose which is the main one."
-  (if current-simulator-id
-      (progn
-        (ios-simulator-setup-language)
-        (ios-simulator-setup-simulator-dwim current-simulator-id)
-        ;; If we have target simulators configured, make sure current is in the list
-        (when (and ios-simulator--target-simulators
-                   (not (member current-simulator-id ios-simulator--target-simulators)))
-          (push current-simulator-id ios-simulator--target-simulators))
-        current-simulator-id)
-    (let ((booted-simulators (ios-simulator-get-all-booted-simulators)))
+  ;; Pre-load cache in background if not already loaded (non-blocking)
+  (when (and (not ios-simulator--cached-devices)
+             (not (and (fboundp 'swift-cache-get)
+                       (swift-cache-get "ios-simulator-available-devices"))))
+    (ios-simulator-preload-cache))
+
+  (let ((booted-simulators (ios-simulator-get-all-booted-simulators)))
+    (if (and current-simulator-id
+             ;; Only use cached ID if a simulator is actually booted
+             (or booted-simulators
+                 ;; Or if this is a fresh start, boot it
+                 (progn
+                   (ios-simulator-setup-simulator-dwim current-simulator-id)
+                   t)))
+        (progn
+          (ios-simulator-setup-language)
+          ;; If we have target simulators configured, make sure current is in the list
+          (when (and ios-simulator--target-simulators
+                     (not (member current-simulator-id ios-simulator--target-simulators)))
+            (push current-simulator-id ios-simulator--target-simulators))
+          current-simulator-id)
+      ;; No current ID or no booted simulators - choose one
       (cond
        ;; No simulators booted - let user choose and boot one
        ((null booted-simulators)
@@ -562,8 +671,13 @@ If multiple simulators are booted, let user choose which is the main one."
             (message "Auto-selecting booted simulator: %s" booted-name))
           (setq current-simulator-id booted-id)
           (ios-simulator-setup-language)
-          (ios-simulator-setup-simulator-dwim booted-id)
-          (message "Using booted simulator: %s" booted-name)
+          ;; Already booted, no need to setup/boot again
+          (when (fboundp 'xcode-project-notify)
+            (xcode-project-notify
+             :message (format "Using booted simulator: %s"
+                              (propertize booted-name 'face 'font-lock-function-name-face))
+             :seconds 2
+             :reset t))
           booted-id))
 
        ;; Multiple simulators booted - let user choose the main one
@@ -577,44 +691,104 @@ If multiple simulators are booted, let user choose which is the main one."
             (message "User selected main simulator: %s (ID: %s)" choice chosen-id))
           (setq current-simulator-id chosen-id)
           (ios-simulator-setup-language)
-          (ios-simulator-setup-simulator-dwim chosen-id)
-          (message "Using simulator: %s" choice)
+          ;; Already booted, no need to setup/boot again
+          (when (fboundp 'xcode-project-notify)
+            (xcode-project-notify
+             :message (format "Using simulator: %s"
+                              (propertize choice 'face 'font-lock-function-name-face))
+             :seconds 2
+             :reset t))
           chosen-id))))))
 
 (defun ios-simulator-choose-simulator ()
-  "Choose a simulator using two-step process: iOS version first, then device."
-  (let* ((ios-versions (ios-simulator-available-ios-versions))
-         (chosen-ios-version (completing-read "Choose iOS version: " ios-versions nil t))
-         (devices-for-version (ios-simulator-devices-for-ios-version chosen-ios-version))
-         (device-choice (if (= (length devices-for-version) 1)
-                           ;; If only one device, use it automatically
-                           (car devices-for-version)
-                         ;; If multiple devices, let user choose
-                         (let* ((choices devices-for-version)
-                                (choice (completing-read 
-                                        (format "Choose device for iOS %s: " chosen-ios-version) 
-                                        choices nil t)))
-                           (assoc choice choices))))
-         (device-id (cdr device-choice)))
-    (when ios-simulator-debug
-      (message "Selected iOS %s with device: %s (ID: %s)" 
-               chosen-ios-version (car device-choice) device-id))
-    (setq current-simulator-id device-id)
-    (ios-simulator-setup-language)
-    (ios-simulator-setup-simulator-dwim device-id)
-    device-id))
+  "Choose a simulator using two-step process: iOS version first, then device.
+Uses cached simulator data when available to improve performance."
+  ;; Show message immediately so user knows something is happening
+  (message "Loading simulators...")
+  (when (fboundp 'xcode-project-notify)
+    (xcode-project-notify :message "Loading available simulators..."))
+  (redisplay t) ; Force display update
+
+  ;; Use cached data from ios-simulator-fetch-available-simulators
+  ;; This function uses swift-cache which will block on first call but is fast when cached
+  (let* ((all-devices (ios-simulator-fetch-available-simulators))
+         (ios-versions '())
+         (devices-by-version (make-hash-table :test 'equal)))
+
+    ;; Build version list and devices-by-version map from cached data
+    (dolist (device all-devices)
+      (let ((ios-version (cdr (assoc 'iosVersion device)))
+            (device-name (cdr (assoc 'name device)))
+            (device-udid (cdr (assoc 'udid device))))
+        (when ios-version
+          (unless (member ios-version ios-versions)
+            (push ios-version ios-versions))
+          ;; Store device for this version
+          (let ((current-devices (gethash ios-version devices-by-version '())))
+            (push (cons device-name device-udid) current-devices)
+            (puthash ios-version current-devices devices-by-version)))))
+
+    ;; Reverse the device lists to maintain order
+    (maphash (lambda (version devices)
+               (puthash version (nreverse devices) devices-by-version))
+             devices-by-version)
+
+    (setq ios-versions (sort ios-versions 'version<))
+
+    ;; Show prompts
+    (let* ((chosen-ios-version (completing-read "Choose iOS version: " ios-versions nil t))
+           (devices-for-version (gethash chosen-ios-version devices-by-version))
+           (device-choice (if (= (length devices-for-version) 1)
+                              ;; If only one device, use it automatically
+                              (car devices-for-version)
+                            ;; If multiple devices, let user choose
+                            (let* ((choices devices-for-version)
+                                   (choice (completing-read
+                                           (format "Choose device for iOS %s: " chosen-ios-version)
+                                           choices nil t)))
+                              (assoc choice choices))))
+           (device-id (cdr device-choice)))
+
+      (when ios-simulator-debug
+        (message "Selected iOS %s with device: %s (ID: %s)"
+                 chosen-ios-version (car device-choice) device-id))
+      (when (fboundp 'xcode-project-notify)
+        (xcode-project-notify
+         :message (format "Selected: %s"
+                          (propertize (car device-choice) 'face 'success))
+         :seconds 2
+         :reset t))
+      (setq current-simulator-id device-id)
+      (ios-simulator-setup-language)
+      (ios-simulator-setup-simulator-dwim device-id)
+      device-id)))
 
 (defun ios-simulator-get-all-booted-simulators ()
   "Get list of all currently booted simulators.
 Returns list of (name . id) pairs."
-  (let* ((output (shell-command-to-string "xcrun simctl list devices | grep '(Booted)'"))
-         (lines (split-string output "\n" t))
+  (when ios-simulator-debug
+    (message "Checking for booted simulators..."))
+  (let* ((json-data (ios-simulator-run-command-and-get-json-simple
+                     "xcrun simctl list devices available -j"))
+         (devices-dict (when json-data (cdr (assoc 'devices json-data))))
          (simulators '()))
-    (dolist (line lines)
-      (when (string-match "\\s-*\\(.+?\\)\\s-*(\\([A-F0-9-]+\\))\\s-*(Booted)" line)
-        (let ((name (string-trim (match-string 1 line)))
-              (id (match-string 2 line)))
-          (push (cons name id) simulators))))
+    (when devices-dict
+      ;; Iterate through all runtimes
+      (dolist (runtime-entry devices-dict)
+        (let ((devices-list (cdr runtime-entry)))
+          (when (vectorp devices-list)
+            ;; Convert vector to list and check each device
+            (mapc (lambda (device)
+                    (let ((state (cdr (assoc 'state device)))
+                          (name (cdr (assoc 'name device)))
+                          (udid (cdr (assoc 'udid device))))
+                      (when (and state (string= state "Booted"))
+                        (when ios-simulator-debug
+                          (message "Found booted simulator: %s (%s)" name udid))
+                        (push (cons name udid) simulators))))
+                  (append devices-list nil))))))
+    (when ios-simulator-debug
+      (message "Total booted simulators found: %d" (length simulators)))
     (nreverse simulators)))
 
 (cl-defun ios-simulator-booted-simulator (&key callback)
@@ -627,10 +801,12 @@ Returns list of (name . id) pairs."
        :buffer " *booted-simulator-temp*"
        :sentinel (lambda (proc event)
                    (when (string= event "finished\n")
-                     (with-current-buffer (process-buffer proc)
-                       (let ((device-id (string-trim (buffer-string))))
-                         (kill-buffer)
-                         (funcall callback (if (string= "" device-id) nil device-id)))))))
+                     (let ((buf (process-buffer proc)))
+                       (when (buffer-live-p buf)
+                         (with-current-buffer buf
+                           (let ((device-id (string-trim (buffer-string))))
+                             (kill-buffer)
+                             (funcall callback (if (string= "" device-id) nil device-id)))))))))
     ;; Synchronous fallback
     (let ((device-id (shell-command-to-string ios-simulator-get-booted-simulator-command)))
       (if (not (string= "" device-id))
@@ -651,18 +827,22 @@ Returns list of (name . id) pairs."
 (defun ios-simulator-setup-language ()
   "Setup language if it isnt set."
   (unless current-language-selection
-    (setq current-language-selection (ios-simulator-build-language-menu :title "Choose simulator language"))))
+    ;; Use default language instead of showing a blocking prompt
+    (setq current-language-selection ios-simulator-default-language)))
 
 (cl-defun ios-simulator-launch-app (&key appIdentifier &key applicationName &key simulatorName &key simulatorID &key buffer &key terminate-running)
   "Launch app (as APPIDENTIFIER APPLICATIONNAME SIMULATORNAME SIMULATORID) and display output in BUFFER.
 If TERMINATE-RUNNING is non-nil, terminate any running instance before launching."
   ;; Run immediately without idle timer
   (ios-simulator-setup-language)
-  (mode-line-hud:updateWith
-   :message (format "%s|%s"
-                    (propertize applicationName 'face 'font-lock-constant-face)
-                    (propertize simulatorName 'face 'font-lock-function-name-face))
-   :delay 2.0)
+  ;; Show notification for app launch
+  (when (and (fboundp 'xcode-project-notify) applicationName)
+    (let ((safe-sim-name (or simulatorName "Simulator")))
+      (xcode-project-notify
+       :message (format "%s|%s"
+                        (propertize applicationName 'face 'font-lock-constant-face)
+                        (propertize safe-sim-name 'face 'font-lock-function-name-face))
+       :delay 2.0)))
 
   (let ((command (append (list "xcrun" "simctl" "launch" "--console-pty"
                                (or simulatorID "booted")
@@ -720,6 +900,37 @@ If TERMINATE-RUNNING is non-nil, terminate any running instance before launching
          (json-data (json-read-from-string json-output)))
     json-data))
 
+(defun ios-simulator-run-command-and-get-json-async (command callback)
+  "Run a shell COMMAND asynchronously and call CALLBACK with parsed JSON data."
+  (make-process
+   :name "simctl-json"
+   :command (list "sh" "-c" command)
+   :noquery t
+   :buffer " *simctl-json-temp*"
+   :sentinel (lambda (proc event)
+               (when (string= event "finished\n")
+                 (let ((buf (process-buffer proc)))
+                   (when (buffer-live-p buf)
+                     (with-current-buffer buf
+                       (let ((json-data (condition-case err
+                                            (json-read-from-string (buffer-string))
+                                          (error
+                                           (message "Failed to parse JSON: %s" err)
+                                           nil))))
+                         (kill-buffer)
+                         (when callback
+                           (funcall callback json-data))))))))))
+
+(defun ios-simulator-run-command-and-get-json-simple (command)
+  "Run a shell COMMAND and return JSON. Simple synchronous version.
+The command is fast (<0.3s) so we just run it directly with better user feedback."
+  (let ((json-output (shell-command-to-string command)))
+    (condition-case err
+        (json-read-from-string json-output)
+      (error
+       (message "Failed to parse JSON: %s" err)
+       nil))))
+
 (cl-defun ios-simulator-terminate-app-with (&key appIdentifier)
   "Terminate runnings apps (as APPIDENTIFIER)."
   (setq xcode-project--current-app-identifier appIdentifier)
@@ -774,9 +985,7 @@ If TERMINATE-RUNNING is non-nil, terminate any running instance before launching
       (swift-cache-with "ios-simulator-available-devices" 300  ; 5 minute cache
         (when ios-simulator-debug
           (message "Refreshing simulator device cache..."))
-        (let* ((json (if (fboundp 'call-process-to-json)
-                         (call-process-to-json list-simulators-command)
-                       (ios-simulator-run-command-and-get-json list-simulators-command)))
+        (let* ((json (ios-simulator-run-command-and-get-json-simple list-simulators-command))
                (devices (cdr (assoc 'devices json)))
                (flattened-devices '()))
           ;; Process each runtime and its devices
@@ -812,9 +1021,7 @@ If TERMINATE-RUNNING is non-nil, terminate any running instance before launching
                 (> (- now ios-simulator--cache-timestamp) ios-simulator--cache-ttl))
         (when ios-simulator-debug
           (message "Refreshing simulator device cache..."))
-        (let* ((json (if (fboundp 'call-process-to-json)
-                         (call-process-to-json list-simulators-command)
-                       (ios-simulator-run-command-and-get-json list-simulators-command)))
+        (let* ((json (ios-simulator-run-command-and-get-json-simple list-simulators-command))
                (devices (cdr (assoc 'devices json)))
                (flattened-devices '()))
           ;; Process each runtime and its devices
@@ -857,6 +1064,82 @@ If TERMINATE-RUNNING is non-nil, terminate any running instance before launching
     (setq ios-simulator--cached-devices nil
           ios-simulator--cache-timestamp nil))
   (message "Simulator cache invalidated"))
+
+(defvar ios-simulator--preload-timer nil
+  "Timer for delayed cache preloading.")
+
+(defun ios-simulator-preload-cache ()
+  "Pre-load simulator device cache in the background to improve responsiveness.
+This is called automatically when needed but can also be called manually."
+  (interactive)
+  ;; Cancel any existing timer
+  (when ios-simulator--preload-timer
+    (cancel-timer ios-simulator--preload-timer)
+    (setq ios-simulator--preload-timer nil))
+
+  ;; Check if cache is already valid
+  (let ((cache-valid (or (and ios-simulator--cached-devices
+                              ios-simulator--cache-timestamp
+                              (< (- (float-time) ios-simulator--cache-timestamp)
+                                 ios-simulator--cache-ttl))
+                         (and (fboundp 'swift-cache-get)
+                              (swift-cache-get "ios-simulator-available-devices")))))
+    (if cache-valid
+        (when ios-simulator-debug
+          (message "[Auto-warming] Cache already valid, skipping preload"))
+      (when ios-simulator-debug
+        (message "[Auto-warming] Starting async cache preload..."))
+      (ios-simulator-run-command-and-get-json-async
+       list-simulators-command
+       (lambda (json)
+         (when json
+           (let* ((devices (cdr (assoc 'devices json)))
+                  (flattened-devices '()))
+             ;; Process devices
+             (dolist (runtime-entry devices)
+               (let* ((runtime-key (car runtime-entry))
+                      (runtime-devices (cdr runtime-entry))
+                      (runtime-string (if (symbolp runtime-key)
+                                          (symbol-name runtime-key)
+                                        runtime-key))
+                      (ios-version (when (and runtime-string
+                                              (string-match "iOS-\\([0-9]+\\)-\\([0-9]+\\)" runtime-string))
+                                    (format "%s.%s"
+                                            (match-string 1 runtime-string)
+                                            (match-string 2 runtime-string)))))
+                 (dolist (device (append runtime-devices nil))
+                   (when (and device
+                              (listp device)
+                              (cdr (assoc 'isAvailable device)))
+                     (let ((device-with-version (copy-alist device)))
+                       (when ios-version
+                         (setcdr device-with-version
+                                 (cons (cons 'iosVersion ios-version)
+                                       (cdr device-with-version))))
+                       (push device-with-version flattened-devices))))))
+             ;; Store in cache
+             (if (fboundp 'swift-cache-set)
+                 (swift-cache-set "ios-simulator-available-devices" (nreverse flattened-devices) 300)
+               ;; Fallback to legacy cache
+               (setq ios-simulator--cached-devices (nreverse flattened-devices)
+                     ios-simulator--cache-timestamp (float-time)))
+             (when ios-simulator-debug
+               (message "[Auto-warming] ✅ Cache pre-loaded with %d devices in background" (length flattened-devices))))))))))
+
+(defun ios-simulator-maybe-preload-cache ()
+  "Schedule cache preloading if in a Swift/iOS project.
+Uses a timer to avoid blocking during file opening."
+  (when ios-simulator-debug
+    (message "[Auto-warming] Checking if cache preload needed for buffer: %s" (buffer-name)))
+  ;; Only preload if we're likely in an iOS project
+  (when (and (buffer-file-name)
+             (or (string-match-p "\\.swift$" (buffer-file-name))
+                 (string-match-p "\\.xcodeproj" (or default-directory ""))))
+    (when ios-simulator-debug
+      (message "[Auto-warming] ✓ Swift file detected, scheduling cache preload in 0.5s..."))
+    ;; Schedule preload after 0.5 seconds to not interfere with file opening
+    (setq ios-simulator--preload-timer
+          (run-with-idle-timer 0.5 nil #'ios-simulator-preload-cache))))
 
 (defun ios-simulator-toggle-buffer ()
   "Toggle visibility of the iOS Simulator buffer window."
@@ -1105,6 +1388,18 @@ TERMINATE-FIRST: Whether to terminate existing app instance"
     (let ((devices (ios-simulator-devices-for-ios-version "17.2")))
       (dolist (device devices)
         (message "  - %s" (car device))))))
+
+;;;###autoload
+(defun ios-simulator-setup-hooks ()
+  "Setup hooks for iOS simulator functionality."
+  ;; Support both swift-mode and swift-ts-mode
+  (add-hook 'swift-mode-hook #'ios-simulator-maybe-preload-cache)
+  (add-hook 'swift-ts-mode-hook #'ios-simulator-maybe-preload-cache)
+  (when ios-simulator-debug
+    (message "iOS Simulator hooks installed for swift-mode and swift-ts-mode")))
+
+;; Auto-setup hooks when this file is loaded
+(ios-simulator-setup-hooks)
 
 (provide 'ios-simulator)
 
