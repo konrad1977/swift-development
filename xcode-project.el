@@ -6,6 +6,7 @@
 (require 'xcodebuildserver)
 (require 'swift-project)
 (require 'xcode-build-config)
+(require 'swift-project-settings)  ; Persistent project settings
 (require 'periphery nil t)
 (require 'periphery-helper nil t)
 (require 'swift-cache nil t)  ; Optional - graceful fallback if not available
@@ -106,6 +107,9 @@ This is a compatibility wrapper - prefer using `xcode-project-notify' directly."
   "Stores the user's choice of device (simulator or physical device).")
 (defvar xcode-project--cache-warmed-projects (make-hash-table :test 'equal)
   "Hash table tracking which projects have had their caches warmed.")
+
+(defvar xcode-project--settings-restored-projects (make-hash-table :test 'equal)
+  "Hash table tracking which projects have had their settings restored.")
 
 (defconst xcodebuild-list-config-command "xcrun xcodebuild -list -json")
 
@@ -471,7 +475,12 @@ Returns a list of folder names, excluding hidden folders."
            :message (format "Selected scheme: %s"
                             (propertize xcode-project--current-xcode-scheme 'face 'success))
            :seconds 2
-           :reset t)))))
+           :reset t)))
+
+      ;; Save all current settings to .swift-development file
+      (when (fboundp 'swift-project-settings-capture-from-variables)
+        (swift-project-settings-capture-from-variables
+         (xcode-project-project-root)))))
   (if (not xcode-project--current-xcode-scheme)
       (error "No scheme selected")
     (shell-quote-argument xcode-project--current-xcode-scheme)))
@@ -501,6 +510,14 @@ Returns a list of folder names, excluding hidden folders."
                   (setq xcode-project--current-build-configuration (match-string 1))
                 (setq xcode-project--current-build-configuration "Debug"))))
         (setq xcode-project--current-build-configuration "Debug"))
+
+      ;; Save build-configuration to settings after fetching
+      (when (and (fboundp 'swift-project-settings-capture-from-variables)
+                 (fboundp 'xcode-project-project-root))
+        (let ((project-root (xcode-project-project-root)))
+          (when project-root
+            (swift-project-settings-capture-from-variables project-root))))
+
       (xcode-project-notify
        :message (format "Build config: %s"
                         (propertize xcode-project--current-build-configuration 'face 'font-lock-keyword-face))
@@ -522,6 +539,14 @@ Returns a list of folder names, excluding hidden folders."
       (when xcode-project-debug
         (message "xcode-project-fetch-or-load-app-identifier - bundle ID: %s"
                  xcode-project--current-app-identifier))
+
+      ;; Save app-identifier to settings after fetching
+      (when (and (fboundp 'swift-project-settings-capture-from-variables)
+                 (fboundp 'xcode-project-project-root))
+        (let ((project-root (xcode-project-project-root)))
+          (when project-root
+            (swift-project-settings-capture-from-variables project-root))))
+
       (xcode-project-notify
        :message (format "App ID: %s"
                         (propertize xcode-project--current-app-identifier 'face 'font-lock-string-face))
@@ -572,9 +597,17 @@ Returns a list of folder names, excluding hidden folders."
             (swift-cache-set cache-key xcode-project--current-build-folder 1800))))  ; Cache for 30 minutes
 
       (setq xcode-project--last-device-type device-type)
-      
+
+      ;; Save build-folder to settings after determining it
+      (when (and xcode-project--current-build-folder
+                 (fboundp 'swift-project-settings-capture-from-variables)
+                 (fboundp 'xcode-project-project-root))
+        (let ((project-root (xcode-project-project-root)))
+          (when project-root
+            (swift-project-settings-capture-from-variables project-root))))
+
       (when xcode-project-debug
-        (message "xcode-project-build-folder: scheme=%s config=%s device=%s folder=%s" 
+        (message "xcode-project-build-folder: scheme=%s config=%s device=%s folder=%s"
                  scheme config device-type xcode-project--current-build-folder))))
   xcode-project--current-build-folder)
 
@@ -767,14 +800,45 @@ Returns a list of folder names, excluding hidden folders."
          (project-changed (not (and current-root
                                    (string= current-root normalized-project)))))
 
+    (when xcode-project-debug
+      (message "[DEBUG] Project restoration check:")
+      (message "[DEBUG]   - current-root: %s" current-root)
+      (message "[DEBUG]   - normalized-project: %s" normalized-project)
+      (message "[DEBUG]   - xcode-project--current-project-root: %s" xcode-project--current-project-root)
+      (message "[DEBUG]   - project-changed: %s" project-changed))
+
     (when (or (not xcode-project--current-project-root) project-changed)
       (when xcode-project-debug
-        (message "Project changed from '%s' to '%s'" current-root normalized-project))
+        (message "[DEBUG] Project changed from '%s' to '%s'" current-root normalized-project))
 
       ;; Reset all cached values when project changes
       (xcode-project-reset)
       (setq default-directory project)
       (setq xcode-project--current-project-root normalized-project))
+
+    ;; Always try to restore settings when project is setup (not just when it changes)
+    ;; This handles cases where xcode-project--current-project-root was set by other code
+    (when (and (fboundp 'swift-project-settings-restore-to-variables)
+               (not (gethash normalized-project xcode-project--settings-restored-projects)))
+      (when xcode-project-debug
+        (message "[DEBUG] Attempting to restore project settings..."))
+      (let ((settings (swift-project-settings-restore-to-variables normalized-project)))
+        (when settings
+          ;; Mark this project as restored so we don't restore again
+          (puthash normalized-project t xcode-project--settings-restored-projects)
+          (when xcode-project-debug
+            (message "[Settings] Restored settings for project: %s"
+                     (file-name-nondirectory normalized-project)))
+
+          ;; Auto-launch simulator if enabled and we have device settings
+          (when (and (boundp 'swift-development-auto-launch-simulator)
+                     swift-development-auto-launch-simulator
+                     (plist-get settings :device-id)
+                     (fboundp 'ios-simulator-setup-simulator-dwim))
+            (when xcode-project-debug
+              (message "[Settings] Auto-launching simulator: %s"
+                       (plist-get settings :device-name)))
+            (ios-simulator-setup-simulator-dwim (plist-get settings :device-id))))))
 
     ;; Check cache warming independently of project-changed status
     ;; This handles cases where xcode-project--current-project-root was already set by another function
@@ -855,12 +919,19 @@ Returns a list of folder names, excluding hidden folders."
 
 ;;;###autoload
 (defun xcode-project-reset ()
-  "Reset the current project root and device choice."
+  "Reset the current project root and device choice.
+Also clears all persistent cache files (.swift-development/)."
   (interactive)
   (when (fboundp 'ios-simulator-reset)
     (ios-simulator-reset))
   (when (fboundp 'periphery-kill-buffer)
     (periphery-kill-buffer))
+
+  ;; Clear persistent cache files before resetting variables
+  (when (and xcode-project--current-project-root
+             (fboundp 'swift-project-settings-clear-all-cache))
+    (swift-project-settings-clear-all-cache xcode-project--current-project-root))
+
   (setq current-run-on-device nil
         xcode-project--current-local-device-id nil
         xcode-project--current-is-xcode-project nil
@@ -874,6 +945,10 @@ Returns a list of folder names, excluding hidden folders."
         xcode-project--current-errors-or-warnings nil
         xcode-project--device-choice nil
         xcode-project--last-device-type nil)  ; Reset device choice
+
+  ;; Clear the restored projects hash to allow restoration after reset
+  (clrhash xcode-project--settings-restored-projects)
+
   ;; NOTE: We intentionally DO NOT reset swift-development--last-build-succeeded here
   ;; to allow each project to maintain its own build status across project switches.
   ;; Use swift-development-reset-build-status to manually reset if needed.

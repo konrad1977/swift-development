@@ -37,7 +37,7 @@ Both approaches are now **non-blocking** and won't freeze Emacs during file scan
 ### 3. Smart Caching
 - **Modification time cached** - only recomputes hash if file touched
 - **File list cached** - 60 second cache for source file discovery
-- **Persistent hash cache** - saved to `.swift-file-hashes.el` in project root
+- **Persistent hash cache** - saved to `.swift-development/file-cache` in project root
 
 ### 4. Async MD5 Computation
 - Uses macOS `md5` command in background process
@@ -170,8 +170,8 @@ swift-development--file-hash-cache
   => Hash table: FILE -> (HASH . MODTIME)
 
 ;; On disk (project root)
-.swift-file-hashes.el
-  => Alist: ((FILE . (HASH . MODTIME)) ...)
+.swift-development/file-cache
+  => Plist: (:signature ... :file-hashes ... :timestamp ...)
 ```
 
 ## Performance Comparison
@@ -273,8 +273,8 @@ Hash-based rebuild check (async).
 ;; Clear it manually
 M-x swift-development-clear-hash-cache
 
-;; Or delete the file
-rm /path/to/project/.swift-file-hashes.el
+;; Or delete the directory
+rm -rf /path/to/project/.swift-development
 ```
 
 ### False positives with mtime detection
