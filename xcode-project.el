@@ -243,22 +243,41 @@ If DIRECTORY is nil, use `default-directory'."
     (xcode-project-filename-by-extension xcodeproject-extension dir)))
 
 (defun xcode-project-list-xcscheme-files (folder)
-  "List the names of '.xcscheme' files in the xcshareddata/xcshemes subfolder of FOLDER."
+  "List the names of '.xcscheme' files in the xcshareddata/xcshemes subfolder of FOLDER.
+Falls back to xcuserdata schemes if no shared schemes are found."
   (let ((xcscheme-names '()))
     (setq folder (file-name-as-directory (expand-file-name folder)))
     ;; Set the schemes folder path
     (setq xcschemes-folder (concat folder "xcshareddata/xcschemes/"))
 
     (when xcode-project-debug
-      (message "Searching for schemes in folder: %s" xcschemes-folder))
+      (message "Searching for shared schemes in folder: %s" xcschemes-folder))
 
+    ;; First try shared schemes
     (when (file-directory-p xcschemes-folder)
       (dolist (item (directory-files xcschemes-folder t "\\.xcscheme$"))
         (when (file-regular-p item)
           (let ((scheme-name (file-name-sans-extension (file-name-nondirectory item))))
             (when xcode-project-debug
-              (message "Found scheme: %s" scheme-name))
+              (message "Found shared scheme: %s" scheme-name))
             (push scheme-name xcscheme-names)))))
+
+    ;; Fallback: If no shared schemes found, look in xcuserdata
+    (when (and (null xcscheme-names) (file-directory-p folder))
+      (when xcode-project-debug
+        (message "No shared schemes found, searching xcuserdata..."))
+      (let ((xcuserdata-folder (concat folder "xcuserdata/")))
+        (when (file-directory-p xcuserdata-folder)
+          ;; Find all user-specific scheme directories
+          (dolist (user-dir (directory-files xcuserdata-folder t "^[^.].*\\.xcuserdatad$"))
+            (let ((user-schemes-folder (concat user-dir "/xcschemes/")))
+              (when (file-directory-p user-schemes-folder)
+                (dolist (item (directory-files user-schemes-folder t "\\.xcscheme$"))
+                  (when (file-regular-p item)
+                    (let ((scheme-name (file-name-sans-extension (file-name-nondirectory item))))
+                      (when xcode-project-debug
+                        (message "Found user scheme: %s" scheme-name))
+                      (push scheme-name xcscheme-names))))))))))
 
     (setq xcscheme-names (nreverse xcscheme-names))
 
@@ -304,9 +323,14 @@ Project path: %s"
                              (xcode-project-list-xcscheme-files workspace-path))
                            (when project-path
                              (xcode-project-list-xcscheme-files project-path)))))
-          ;; If file-based detection fails, fall back to xcodebuild -list
+          ;; Return schemes or empty list if none found
+          ;; NOTE: xcodebuild -list fallback removed to avoid blocking Emacs
+          ;; If schemes are not found via file detection, user should check project setup
           (or schemes
-              (xcode-project-get-schemes-from-xcodebuild)))))))
+              (progn
+                (when xcode-project-debug
+                  (message "Warning: No scheme files found. Check xcshareddata/xcschemes/ exists."))
+                nil)))))))
 
 (defun xcode-project-run-command-and-get-json (command)
   "Run a shell COMMAND and return the JSON output."
@@ -458,29 +482,46 @@ Returns a list of folder names, excluding hidden folders."
     (let ((schemes (xcode-project-get-scheme-list)))
       (when xcode-project-debug
         (message "xcode-project-scheme - Found %d schemes: %s" (length schemes) schemes))
-      (if (= (length schemes) 1)
-          ;; If there's only one scheme, use it automatically
-          (progn
-            (setq xcode-project--current-xcode-scheme (car schemes))
+      (cond
+       ;; No schemes found at all
+       ((or (null schemes) (= (length schemes) 0))
+        (xcode-project-notify
+         :message (propertize "No shared schemes found! Please share schemes in Xcode." 'face 'error)
+         :seconds 5
+         :reset t)
+        (error "No schemes found. In Xcode: Product > Scheme > Manage Schemes, check 'Shared' for your scheme"))
+
+       ;; Exactly one scheme - use it automatically
+       ((= (length schemes) 1)
+        (let ((scheme (car schemes)))
+          (when scheme  ; Double-check it's not nil
+            (setq xcode-project--current-xcode-scheme scheme)
             (xcode-project-notify
              :message (format "Selected scheme: %s"
-                              (propertize (car schemes) 'face 'success))
+                              (propertize scheme 'face 'success))
              :seconds 2
-             :reset t))
-        ;; Otherwise prompt the user
-        (progn
-          (xcode-project-notify :message "Choose scheme...")
-          (setq xcode-project--current-xcode-scheme (xcode-project-build-menu :title "Choose scheme: " :list schemes))
+             :reset t))))
+
+       ;; Multiple schemes - prompt user
+       (t
+        (xcode-project-notify :message "Choose scheme...")
+        (setq xcode-project--current-xcode-scheme
+              (xcode-project-build-menu :title "Choose scheme: " :list schemes))
+        ;; Only show notification if a scheme was actually selected
+        (when xcode-project--current-xcode-scheme
           (xcode-project-notify
            :message (format "Selected scheme: %s"
                             (propertize xcode-project--current-xcode-scheme 'face 'success))
            :seconds 2
-           :reset t)))
+           :reset t))))
 
-      ;; Save all current settings to .swift-development file
-      (when (fboundp 'swift-project-settings-capture-from-variables)
-        (swift-project-settings-capture-from-variables
-         (xcode-project-project-root)))))
+      ;; Save settings asynchronously to avoid blocking during scheme selection
+      (when (and xcode-project--current-xcode-scheme
+                 (fboundp 'swift-project-settings-capture-from-variables))
+        (run-with-idle-timer 0.1 nil
+                             (lambda (root)
+                               (swift-project-settings-capture-from-variables root))
+                             (xcode-project-project-root)))))
   (if (not xcode-project--current-xcode-scheme)
       (error "No scheme selected")
     (shell-quote-argument xcode-project--current-xcode-scheme)))
@@ -511,12 +552,15 @@ Returns a list of folder names, excluding hidden folders."
                 (setq xcode-project--current-build-configuration "Debug"))))
         (setq xcode-project--current-build-configuration "Debug"))
 
-      ;; Save build-configuration to settings after fetching
+      ;; Save build-configuration to settings asynchronously
       (when (and (fboundp 'swift-project-settings-capture-from-variables)
                  (fboundp 'xcode-project-project-root))
         (let ((project-root (xcode-project-project-root)))
           (when project-root
-            (swift-project-settings-capture-from-variables project-root))))
+            (run-with-idle-timer 0.1 nil
+                                 (lambda (root)
+                                   (swift-project-settings-capture-from-variables root))
+                                 project-root))))
 
       (xcode-project-notify
        :message (format "Build config: %s"
@@ -540,12 +584,15 @@ Returns a list of folder names, excluding hidden folders."
         (message "xcode-project-fetch-or-load-app-identifier - bundle ID: %s"
                  xcode-project--current-app-identifier))
 
-      ;; Save app-identifier to settings after fetching
+      ;; Save app-identifier to settings asynchronously
       (when (and (fboundp 'swift-project-settings-capture-from-variables)
                  (fboundp 'xcode-project-project-root))
         (let ((project-root (xcode-project-project-root)))
           (when project-root
-            (swift-project-settings-capture-from-variables project-root))))
+            (run-with-idle-timer 0.1 nil
+                                 (lambda (root)
+                                   (swift-project-settings-capture-from-variables root))
+                                 project-root))))
 
       (xcode-project-notify
        :message (format "App ID: %s"
@@ -555,8 +602,13 @@ Returns a list of folder names, excluding hidden folders."
   xcode-project--current-app-identifier)
 
 (defun xcode-project-get-scheme-list ()
-  "Get list of project schemes from xcscheme files."
-  (xcode-project-list-scheme-files))
+  "Get list of project schemes from xcscheme files or xcodebuild -list as fallback."
+  (or (xcode-project-list-scheme-files)
+      ;; Fallback to xcodebuild -list if no scheme files found
+      (progn
+        (when xcode-project-debug
+          (message "No scheme files found, trying xcodebuild -list..."))
+        (xcode-project-get-schemes-from-xcodebuild))))
 
 (cl-defun xcode-project-build-folder (&key (device-type :device))
   "Get build folder. Auto-detect based on scheme, configuration, and device type."
@@ -598,13 +650,16 @@ Returns a list of folder names, excluding hidden folders."
 
       (setq xcode-project--last-device-type device-type)
 
-      ;; Save build-folder to settings after determining it
+      ;; Save build-folder to settings asynchronously
       (when (and xcode-project--current-build-folder
                  (fboundp 'swift-project-settings-capture-from-variables)
                  (fboundp 'xcode-project-project-root))
         (let ((project-root (xcode-project-project-root)))
           (when project-root
-            (swift-project-settings-capture-from-variables project-root))))
+            (run-with-idle-timer 0.1 nil
+                                 (lambda (root)
+                                   (swift-project-settings-capture-from-variables root))
+                                 project-root))))
 
       (when xcode-project-debug
         (message "xcode-project-build-folder: scheme=%s config=%s device=%s folder=%s"

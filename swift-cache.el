@@ -18,7 +18,8 @@
   :group 'swift-cache)
 
 (defcustom swift-cache-debug nil
-  "Enable debug logging for cache operations."
+  "Enable debug logging for cache operations.
+WARNING: Enabling this may cause Emacs to freeze with long cache keys."
   :type 'boolean
   :group 'swift-cache)
 
@@ -40,20 +41,26 @@
   (let* ((entry (gethash key swift-cache--storage))
          (timestamp (and entry (swift-cache-entry-timestamp entry)))
          (ttl (and entry (swift-cache-entry-ttl entry)))
-         (now (float-time)))
+         (now (float-time))
+         (inhibit-message (not swift-cache-debug)))  ; Suppress minibuffer display
     (if (and entry
              timestamp
              (or (null ttl)
                  (< (- now timestamp) ttl)))
         (progn
           (when swift-cache-debug
-            (message "[Cache HIT] Key: %s, Age: %.1fs" key (- now timestamp)))
+            (message "[Cache HIT] Key: %s, Age: %.1fs"
+                     (truncate-string-to-width (format "%s" key) 50 nil nil "...")
+                     (- now timestamp)))
           (swift-cache-entry-data entry))
       (progn
         (when swift-cache-debug
           (if entry
-              (message "[Cache EXPIRED] Key: %s, Age: %.1fs" key (- now timestamp))
-            (message "[Cache MISS] Key: %s" key)))
+              (message "[Cache EXPIRED] Key: %s, Age: %.1fs"
+                       (truncate-string-to-width (format "%s" key) 50 nil nil "...")
+                       (- now timestamp))
+            (message "[Cache MISS] Key: %s"
+                     (truncate-string-to-width (format "%s" key) 50 nil nil "..."))))
         (when entry
           (remhash key swift-cache--storage))
         default))))
@@ -63,10 +70,14 @@
   (let ((entry (make-swift-cache-entry
                 :data value
                 :timestamp (float-time)
-                :ttl (or ttl swift-cache-ttl))))
+                :ttl (or ttl swift-cache-ttl)))
+        (inhibit-message (not swift-cache-debug)))  ; Suppress minibuffer display
     (puthash key entry swift-cache--storage)
+    ;; Only log when explicitly enabled, and truncate key for readability
     (when swift-cache-debug
-      (message "[Cache SET] Key: %s, TTL: %s" key (or ttl swift-cache-ttl)))
+      (message "[Cache SET] Key: %s, TTL: %s"
+               (truncate-string-to-width (format "%s" key) 50 nil nil "...")
+               (or ttl swift-cache-ttl)))
     value))
 
 (defun swift-cache-invalidate (key)

@@ -764,12 +764,15 @@ Uses cached simulator data when available to improve performance."
       (setq current-simulator-id device-id
             ios-simulator--current-simulator-name (car device-choice))
 
-      ;; Save the new selection to settings
+      ;; Save the new selection to settings asynchronously
       (when (and (fboundp 'xcode-project-project-root)
                  (fboundp 'swift-project-settings-capture-from-variables))
         (let ((project-root (xcode-project-project-root)))
           (when project-root
-            (swift-project-settings-capture-from-variables project-root))))
+            (run-with-idle-timer 0.1 nil
+                                 (lambda (root)
+                                   (swift-project-settings-capture-from-variables root))
+                                 project-root))))
 
       (ios-simulator-setup-language)
       (ios-simulator-setup-simulator-dwim device-id)
@@ -934,14 +937,38 @@ If TERMINATE-RUNNING is non-nil, terminate any running instance before launching
                            (funcall callback json-data))))))))))
 
 (defun ios-simulator-run-command-and-get-json-simple (command)
-  "Run a shell COMMAND and return JSON. Simple synchronous version.
-The command is fast (<0.3s) so we just run it directly with better user feedback."
-  (let ((json-output (shell-command-to-string command)))
-    (condition-case err
-        (json-read-from-string json-output)
-      (error
-       (message "Failed to parse JSON: %s" err)
-       nil))))
+  "Run a shell COMMAND and return JSON. Simple synchronous version with timeout.
+The command should be fast (<0.3s) but we add a 5s timeout as safety measure."
+  (let* ((timeout-secs 5)
+         (start-time (current-time))
+         (json-output nil)
+         (timed-out nil))
+    (with-temp-buffer
+      (let ((proc (start-process-shell-command
+                   "simctl-json-sync" (current-buffer) command)))
+        ;; Wait for process to finish or timeout
+        (while (and (process-live-p proc)
+                    (< (float-time (time-subtract (current-time) start-time)) timeout-secs))
+          (accept-process-output proc 0.1))
+
+        (if (process-live-p proc)
+            (progn
+              ;; Timeout - kill the process
+              (delete-process proc)
+              (setq timed-out t)
+              (when ios-simulator-debug
+                (message "Command timed out after %ds: %s" timeout-secs command)))
+          ;; Process finished - get output
+          (setq json-output (buffer-string)))))
+
+    (if (and json-output (not timed-out) (> (length json-output) 0))
+        (condition-case err
+            (json-read-from-string json-output)
+          (error
+           (when ios-simulator-debug
+             (message "Failed to parse JSON: %s" err))
+           nil))
+      nil)))
 
 (cl-defun ios-simulator-terminate-app-with (&key appIdentifier)
   "Terminate runnings apps (as APPIDENTIFIER)."

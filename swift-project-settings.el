@@ -48,7 +48,8 @@
   :prefix "swift-project-settings-")
 
 (defvar swift-project-settings-debug nil
-  "Enable debug logging for project settings.")
+  "Enable debug logging for project settings.
+WARNING: Enabling this may cause Emacs to freeze during file operations.")
 
 ;;; Directory and File Access
 
@@ -247,43 +248,52 @@ Returns device list or nil if cache is invalid."
   "Restore settings from .swift-development to Emacs variables for PROJECT-ROOT.
 This is called when opening a project to restore previous selections."
   (let ((settings (swift-project-settings-load project-root)))
-    (message "[Settings] Attempting to restore settings from: %s"
-             (swift-project-settings--settings-file project-root))
+    (when swift-project-settings-debug
+      (message "[Settings] Attempting to restore settings from: %s"
+               (swift-project-settings--settings-file project-root)))
     (if settings
         (progn
-          (message "[Settings] Found settings: %S" settings)
+          (when swift-project-settings-debug
+            (message "[Settings] Found settings: %S" settings))
 
           ;; Restore to xcode-project variables
           (when-let ((scheme (plist-get settings :scheme)))
             (setq xcode-project--current-xcode-scheme scheme)
-            (message "[Settings] Restored scheme: %s" scheme))
+            (when swift-project-settings-debug
+              (message "[Settings] Restored scheme: %s" scheme)))
 
           (when-let ((build-config (plist-get settings :build-config)))
             (setq xcode-project--current-build-configuration build-config)
-            (message "[Settings] Restored build-config: %s" build-config))
+            (when swift-project-settings-debug
+              (message "[Settings] Restored build-config: %s" build-config)))
 
           (when-let ((app-id (plist-get settings :app-identifier)))
             (setq xcode-project--current-app-identifier app-id)
-            (message "[Settings] Restored app-identifier: %s" app-id))
+            (when swift-project-settings-debug
+              (message "[Settings] Restored app-identifier: %s" app-id)))
 
           (when-let ((build-folder (plist-get settings :build-folder)))
             (setq xcode-project--current-build-folder build-folder)
-            (message "[Settings] Restored build-folder: %s" build-folder))
+            (when swift-project-settings-debug
+              (message "[Settings] Restored build-folder: %s" build-folder)))
 
           ;; Restore simulator selection (if variables exist)
           (when (boundp 'ios-simulator--current-simulator-name)
             (when-let ((device-name (plist-get settings :device-name)))
               (setq ios-simulator--current-simulator-name device-name)
-              (message "[Settings] Restored device-name: %s" device-name)))
+              (when swift-project-settings-debug
+                (message "[Settings] Restored device-name: %s" device-name))))
 
           (when (boundp 'current-simulator-id)
             (when-let ((device-id (plist-get settings :device-id)))
               (setq current-simulator-id device-id)
-              (message "[Settings] Restored device-id: %s" device-id)))
+              (when swift-project-settings-debug
+                (message "[Settings] Restored device-id: %s" device-id))))
 
           ;; Return settings for further use
           settings)
-      (message "[Settings] No settings found to restore")
+      (when swift-project-settings-debug
+        (message "[Settings] No settings found to restore"))
       nil)))
 
 (defun swift-project-settings-capture-from-variables (project-root)
@@ -323,7 +333,8 @@ Only updates fields that have non-nil values, preserving existing saved values."
       (when project-file
         (setq settings (plist-put settings :project-file project-file))))
 
-    (message "[Settings] Capturing settings: %S" settings)
+    (when swift-project-settings-debug
+      (message "[Settings] Capturing settings: %S" settings))
     (swift-project-settings-save project-root settings)))
 
 ;;; Diagnostics

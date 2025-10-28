@@ -46,6 +46,12 @@
   :type '(repeat string)
   :group 'xcode-build-config)
 
+(defcustom xcode-build-config-other-ld-flags '()
+  "Additional flags to pass to the linker (OTHER_LDFLAGS).
+For hot reload with Inject/InjectionIII, set to '(\"-Xlinker\" \"-interposable\")."
+  :type '(repeat string)
+  :group 'xcode-build-config)
+
 (defcustom xcode-build-config-enable-timing-summary t
   "Enable build timing summary to identify bottlenecks."
   :type 'boolean
@@ -286,7 +292,10 @@ Checks both local .build and Xcode's DerivedData locations."
             (> (length (directory-files xcode-repos nil "^[^.]" t)) 0)))
      ;; Check build intermediates for package compilation
      (and (file-exists-p build-intermediates)
-          (> (length (directory-files build-intermediates nil "\\.build$" t)) 0)))))
+          (file-directory-p build-intermediates)
+          (condition-case nil
+              (> (length (directory-files build-intermediates nil "\\.build$" t)) 0)
+            (error nil))))))
 
 (defun xcode-build-config-should-resolve-packages-for-build ()
   "Determine if package resolution should be performed for .build-based builds.
@@ -583,6 +592,11 @@ SIM-ID is the simulator identifier, DERIVED-PATH is the derived data path."
                           (format "OTHER_SWIFT_FLAGS=\"%s\""
                                   (mapconcat (lambda (flag) (concat "-Xfrontend " flag))
                                             xcode-build-config-other-swift-flags " ")))
+                        ;; Linker flags (for hot reload support)
+                        (when (and xcode-build-config-other-ld-flags
+                                  (> (length xcode-build-config-other-ld-flags) 0))
+                          (format "OTHER_LDFLAGS=\"%s\""
+                                  (mapconcat 'identity xcode-build-config-other-ld-flags " ")))
                         "SWIFT_BUILD_CACHE_ENABLED=YES"
                         (format "SWIFT_PARALLEL_MODULE_JOBS=%d" (num-processors))
                         "SWIFT_USE_PARALLEL_SOURCEJOB_TASKS=YES"

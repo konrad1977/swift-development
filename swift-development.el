@@ -12,6 +12,7 @@
 (require 'swift-cache nil t) ;; Unified caching system
 (require 'swift-error-handler nil t) ;; Enhanced error handling
 (require 'swift-project-settings nil t) ;; Persistent project settings
+(require 'swiftui-preview nil t) ;; SwiftUI preview support
 (require 'xcode-build-config nil t) ;; Build configuration and command construction
 (require 'xcode-project nil t) ;; For notification system
 
@@ -68,13 +69,15 @@ Set to 0 to disable caching (not recommended for large projects)."
   :group 'swift-development)
 
 (defcustom swift-development-ignore-paths
-  '("*Tests/*" "*/Tests.swift" "*UITests/*")
+  '("*Tests/*" "*/Tests.swift" "*UITests/*" "*/.build/*" "*/DerivedData/*" "*/.git/*")
   "List of path patterns to ignore when checking if rebuild is needed.
-Test files are ignored by default since they don't affect the app bundle.
+Test files and build artifacts are ignored by default.
 Patterns can use wildcards (* and ?). Examples:
 - \"*Tests/*\" - ignores files in any Tests directory
 - \"*/Generated/*\" - ignores files in Generated directories
-- \"*Pods/*\" - ignores CocoaPods dependencies"
+- \"*Pods/*\" - ignores CocoaPods dependencies
+- \"*/.build/*\" - ignores Xcode build artifacts
+- \"*/DerivedData/*\" - ignores DerivedData"
   :type '(repeat string)
   :group 'swift-development)
 
@@ -2184,8 +2187,11 @@ Examples:
                              (length (directory-files local-source-packages nil "^[^.]" t)) 0))
          (xcode-pkg-count (if (and xcode-source-packages (file-exists-p xcode-source-packages))
                              (length (directory-files xcode-source-packages nil "^[^.]" t)) 0))
-         (compiled-packages (when (file-exists-p build-intermediates)
-                             (length (directory-files build-intermediates nil "\\.build$" t)))))
+         (compiled-packages (when (and (file-exists-p build-intermediates)
+                                      (file-directory-p build-intermediates))
+                             (condition-case nil
+                                 (length (directory-files build-intermediates nil "\\.build$" t))
+                               (error 0)))))
     (message "Swift Package Status:
 📦 Packages available: %s
 🏗️  Compiled in build: %s packages

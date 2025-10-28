@@ -1,0 +1,5 @@
+# SwiftUI Preview Images
+# These are generated preview images from swiftui-preview.el
+# You may want to add this to your project's .gitignore if you don't want to commit previews
+
+.swift-development/swiftuipreview/

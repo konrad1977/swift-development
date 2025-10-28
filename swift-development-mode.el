@@ -27,6 +27,12 @@
     (define-key map (kbd "C-c C-x") #'swift-development-reset)
     (define-key map (kbd "C-c b s") #'swift-development-build-status)
 
+    ;; SwiftUI Preview Commands
+    (define-key map (kbd "C-c C-p") #'swiftui-preview-generate)
+    (define-key map (kbd "C-c p h") #'swiftui-preview-generate-with-hot-reload)
+    (define-key map (kbd "C-c p s") #'swiftui-preview-stop-hot-reload)
+    (define-key map (kbd "C-c p r") #'swiftui-preview-refresh)
+
     ;; Test Commands
     (define-key map (kbd "C-c t m") #'swift-development-test-module-silent)
     (define-key map (kbd "C-c t p") #'swift-development-test-swift-package-from-file)
