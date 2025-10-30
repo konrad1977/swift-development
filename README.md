@@ -27,10 +27,15 @@ A comprehensive Emacs package for iOS and macOS development with Swift and Xcode
 
 ### Developer Tools
 - **SwiftUI Preview**: Generate and display SwiftUI view previews in Emacs
+- **Build Optimization**: Turbo mode, balanced mode, and comprehensive build system optimization
+- **Simulator Testing**: Push notifications, language switching, and localization testing
+- **Xcode Tools**: Accessibility Inspector, Instruments profiling, and developer utilities
+- **Error Handling**: Comprehensive diagnostics, error logging, and environment validation
 - **Refactoring**: Code refactoring utilities for Swift
 - **Documentation**: Query Apple Developer Documentation and Hacking with Swift
 - **Localization**: Major mode for editing `.strings` files
 - **Device Management**: Deploy and debug on physical iOS devices
+- **Advanced Features**: Memory leak detection, code coverage, dependency analysis
 
 ## Screenshots
 
@@ -680,6 +685,430 @@ Quick documentation lookup from Emacs.
 - `apple-docs/query` - Search Apple Developer Documentation
 - `hacking-ws/query` - Search Hacking with Swift tutorials
 
+## Build Performance & Optimization
+
+The package includes several commands to optimize build performance for different scenarios.
+
+### Turbo Mode
+
+**`swift-development-enable-turbo-mode`** - Enable maximum build speed optimizations
+
+Turbo mode configures the build system for fastest possible incremental builds by:
+
+**What it does:**
+- **Disables Whole Module Optimization** (`-no-whole-module-optimization`)
+  - Compiles each file independently instead of analyzing the entire module
+  - Dramatically faster incremental builds when changing a single file
+  - Trade-off: Slightly larger binary size and potentially slower runtime
+
+- **Disables Thin LTO** (Link Time Optimization)
+  - LTO can slow down incremental builds due to cross-module analysis
+  - Better for development where build speed > binary optimization
+
+- **Enables Build Timing Summary**
+  - Shows detailed timing for each compilation phase
+  - Helps identify bottlenecks in your build
+
+- **Resets Build Cache**
+  - Clears cached build commands to ensure new settings take effect
+
+**When to use:**
+- During active development with frequent code changes
+- When incremental build time is critical
+- When you don't need runtime performance optimization
+
+```elisp
+M-x swift-development-enable-turbo-mode
+```
+
+### Balanced Mode
+
+**`swift-development-enable-balanced-mode`** - Balanced build speed with debugging capability
+
+Similar to Turbo Mode but maintains better debugging experience. Currently uses the same optimizations as Turbo Mode.
+
+```elisp
+M-x swift-development-enable-balanced-mode
+```
+
+### Build System Optimization
+
+**`swift-development-optimize-build-system`** - Comprehensive build system optimization
+
+Performs multiple optimizations to speed up the build system:
+
+**What it does:**
+1. **Clears Module Cache**
+   - Removes `~/Library/Developer/Xcode/DerivedData/ModuleCache`
+   - Forces fresh compilation of system frameworks
+
+2. **Stops SPM Daemons**
+   - Kills any stuck `swift-package` processes
+   - Prevents conflicts with package resolution
+
+3. **RAM Disk Detection**
+   - Automatically uses `/Volumes/RAMDisk` for DerivedData if available
+   - Dramatically faster I/O operations
+
+4. **Generates Optimized xcconfig**
+   - Creates `/tmp/fast-build.xcconfig` with optimized settings:
+     - **Optimization:** `-Osize` for Swift, incremental compilation mode
+     - **Caching:** Enables Swift dependency cache, compile job cache, precompiled headers
+     - **Parallelization:** Uses all CPU cores for parallel module/compile jobs
+     - **Architecture:** arm64 only, excludes i386/x86_64 for faster builds
+     - **Disabled features:** Index store, bitcode, sanitizers, testability, previews
+     - **Warnings:** Suppressed to reduce noise and compiler overhead
+
+5. **Cleans SPM Cache**
+   - Removes `~/.swiftpm/cache` for fresh package state
+
+```elisp
+M-x swift-development-optimize-build-system
+```
+
+### Incremental Build Optimization
+
+**`swift-development-optimize-for-incremental-builds`** - Configure for fastest incremental builds
+
+Optimizes specifically for incremental compilation scenarios:
+
+**What it does:**
+- Smart package resolution (auto mode)
+- Fast analysis mode
+- No Thin LTO
+- Removes extra Swift compiler flags for maximum compatibility
+
+```elisp
+M-x swift-development-optimize-for-incremental-builds
+```
+
+### Build Benchmarking
+
+**`swift-development-benchmark-build`** - Measure build performance
+
+Runs a build with detailed timing information to identify performance bottlenecks.
+
+```elisp
+M-x swift-development-benchmark-build
+```
+
+### Dependency Management
+
+**`swift-development-fix-dependency-issues`** - Fix CocoaPods and SPM issues
+
+Automatically detects and fixes common dependency problems in hybrid projects:
+
+**For CocoaPods:**
+- Cleans CocoaPods cache (`pod cache clean --all`)
+- Removes and reinstalls Pods directory
+- Updates pod dependencies (`pod install --repo-update`)
+
+**For Swift Package Manager:**
+- Removes `Package.resolved` to force re-resolution
+- Cleans `~/.swiftpm/cache`
+- Cleans `.build` directory
+- Runs `xcodebuild -resolvePackageDependencies`
+
+**Always:**
+- Cleans DerivedData for the current project
+- Generates optimized xcconfig file
+
+```elisp
+M-x swift-development-fix-dependency-issues
+```
+
+### Running Without Rebuilding
+
+**`swift-development-run`** - Run already-built app without recompiling
+
+Much faster than `swift-development-run-app` when you know the app is already built.
+
+```elisp
+M-x swift-development-run
+```
+
+### Deep Cleaning
+
+**`xcode-project-deep-clean`** - Nuclear option for build issues
+
+Performs the most thorough cleanup:
+- Removes `.build` folder
+- Cleans ALL Swift package caches
+- Deletes entire `~/Library/Developer/Xcode/DerivedData` directory
+
+Use when you have stubborn build errors that won't resolve.
+
+```elisp
+M-x xcode-project-deep-clean
+```
+
+**`swift-development-clear-derived-data`** - Clear DerivedData only
+
+Lighter alternative that only clears Xcode's DerivedData folder.
+
+```elisp
+M-x swift-development-clear-derived-data
+```
+
+## Simulator Testing Features
+
+### Push Notifications
+
+**`ios-simulator-send-notification`** - Send push notifications to simulator
+
+Test your app's notification handling without a real device or APNs server.
+
+**What it does:**
+- Prompts for notification text
+- Creates APS-formatted JSON payload: `{"aps":{"alert":"text","sound":"default"}}`
+- Uses `xcrun simctl push` to deliver notification to running app
+- Automatically cleans up temporary JSON file
+
+**Requirements:**
+- Simulator must be booted
+- App must be running
+- App identifier must be configured
+
+```elisp
+M-x ios-simulator-send-notification
+```
+
+### Localization Testing
+
+**`ios-simulator-change-language`** - Change simulator language
+
+Quickly test your app's localization by changing the simulator's language setting.
+
+**What it does:**
+- Shows interactive menu of available languages
+- Reconfigures simulator language
+- Relaunches app with new language setting
+
+**Use for:**
+- Testing RTL (Right-to-Left) languages
+- Verifying string translations
+- Testing date/number formatting
+- Checking layout with different text lengths
+
+```elisp
+M-x ios-simulator-change-language
+```
+
+### Simulator Utilities
+
+**`ios-simulator-toggle-buffer`** - Show/hide simulator output buffer
+
+Toggle visibility of the buffer showing simulator console output.
+
+```elisp
+M-x ios-simulator-toggle-buffer
+```
+
+**`ios-simulator-appcontainer`** - Open app's container directory
+
+Opens Finder to your app's data container in the simulator. Useful for:
+- Inspecting saved files
+- Viewing Core Data sqlite files
+- Checking UserDefaults
+- Debugging file system issues
+
+```elisp
+M-x ios-simulator-appcontainer
+```
+
+## Error Handling & Diagnostics
+
+The package includes comprehensive error handling and diagnostic tools.
+
+### Error Log Management
+
+**`swift-error-handler-show-log`** - Display the error log buffer
+
+Shows all captured build errors and warnings in a dedicated buffer.
+
+```elisp
+M-x swift-error-handler-show-log
+```
+
+**`swift-error-handler-clear-log`** - Clear the error log
+
+Clears all accumulated error messages.
+
+```elisp
+M-x swift-error-handler-clear-log
+```
+
+**`swift-error-handler-validate-environment`** - Validate Swift development environment
+
+Checks your environment for common issues:
+- Xcode installation
+- Command line tools
+- Swift toolchain
+- Required dependencies
+
+```elisp
+M-x swift-error-handler-validate-environment
+```
+
+### Build Diagnostics
+
+**`swift-development-show-last-build-errors`** - Show recent build errors
+
+Displays the last 50 lines of build output, filtered for errors and warnings.
+
+```elisp
+M-x swift-development-show-last-build-errors
+```
+
+**`swift-development-diagnose`** - Show comprehensive diagnostics
+
+Displays detailed information about:
+- Current project configuration
+- Build settings
+- Cache status
+- Simulator state
+- Package dependencies
+
+```elisp
+M-x swift-development-diagnose
+```
+
+**`swift-development-diagnose-auto-warm`** - Debug cache warming
+
+Diagnoses why automatic cache warming might not be working.
+
+```elisp
+M-x swift-development-diagnose-auto-warm
+```
+
+### Error Display Mode
+
+**`swift-development-toggle-periphery-mode`** - Toggle error display format
+
+Switches between periphery mode and standard compilation mode for error display.
+
+```elisp
+M-x swift-development-toggle-periphery-mode
+```
+
+## Xcode Developer Tools Integration
+
+### Accessibility Inspector
+
+**`xcode-project-accessibility-inspector`** - Launch Accessibility Inspector
+
+Opens Apple's Accessibility Inspector for testing:
+- VoiceOver compatibility
+- Dynamic Type support
+- Color contrast
+- Touch target sizes
+- Accessibility labels and hints
+
+```elisp
+M-x xcode-project-accessibility-inspector
+```
+
+### Performance Profiling
+
+**`xcode-project-instruments`** - Launch Instruments
+
+Opens Instruments for profiling your app:
+- Time Profiler
+- Allocations
+- Leaks
+- Network
+- Energy diagnostics
+
+```elisp
+M-x xcode-project-instruments
+```
+
+## Advanced Features (swift-features.el)
+
+Additional advanced features for power users.
+
+### SwiftUI Preview (Alternative)
+
+**`swift-features-swiftui-preview-start`** - Start SwiftUI preview (alternative implementation)
+
+Alternative SwiftUI preview system (see main swiftui-preview.el for primary implementation).
+
+```elisp
+M-x swift-features-swiftui-preview-start
+M-x swift-features-swiftui-preview-stop
+```
+
+### Testing with Coverage
+
+**`swift-features-run-tests-with-coverage`** - Run tests with code coverage
+
+Runs your test suite and generates code coverage reports.
+
+```elisp
+M-x swift-features-run-tests-with-coverage
+```
+
+### Build Profiling
+
+**`swift-features-profile-build`** - Profile build performance
+
+Identifies build bottlenecks and slow compilation units.
+
+```elisp
+M-x swift-features-profile-build
+```
+
+### Multi-Simulator Testing
+
+**`swift-features-launch-multiple-simulators`** - Launch on multiple simulators
+
+Launch your app on multiple simulators simultaneously.
+
+```elisp
+M-x swift-features-launch-multiple-simulators
+M-x swift-features-terminate-all-simulators
+```
+
+### Memory Leak Detection
+
+**`swift-features-check-memory-leaks`** - Run memory leak detection
+
+Analyzes your running app for memory leaks.
+
+```elisp
+M-x swift-features-check-memory-leaks
+```
+
+### Documentation Generation
+
+**`swift-features-generate-documentation`** - Generate project documentation
+
+Generates documentation for your Swift project using DocC or similar tools.
+
+```elisp
+M-x swift-features-generate-documentation
+```
+
+### Dependency Analysis
+
+**`swift-features-analyze-dependencies`** - Analyze and visualize dependencies
+
+Analyzes your project's dependency graph and shows potential issues.
+
+```elisp
+M-x swift-features-analyze-dependencies
+```
+
+### Quick Actions
+
+**`swift-features-quick-actions`** - Show quick actions menu
+
+Interactive menu of common Swift development actions.
+
+```elisp
+M-x swift-features-quick-actions
+```
+
 ## Usage Examples
 
 ### Building and Running
@@ -962,11 +1391,30 @@ The rebuild detection system checks modification times to avoid unnecessary buil
 
 ```elisp
 (with-eval-after-load 'swift-mode
+  ;; Build & Run
   (define-key swift-mode-map (kbd "C-c C-c") 'swift-development:compile-app)
   (define-key swift-mode-map (kbd "C-c C-r") 'swift-development:run-app)
+  (define-key swift-mode-map (kbd "C-c r") 'swift-development-run)  ; Run without rebuild
   (define-key swift-mode-map (kbd "C-c C-d") 'xcode-project:start-debugging)
+
+  ;; Build Optimization
+  (define-key swift-mode-map (kbd "C-c t") 'swift-development-enable-turbo-mode)
+  (define-key swift-mode-map (kbd "C-c o") 'swift-development-optimize-build-system)
+
+  ;; Simulator Testing
+  (define-key swift-mode-map (kbd "C-c n") 'ios-simulator-send-notification)
+  (define-key swift-mode-map (kbd "C-c L") 'ios-simulator-change-language)
+  (define-key swift-mode-map (kbd "C-c C-l") 'ios-simulator:view-logs)
+
+  ;; Diagnostics & Cleaning
   (define-key swift-mode-map (kbd "C-c C-k") 'xcode-project:reset)
-  (define-key swift-mode-map (kbd "C-c C-l") 'ios-simulator:view-logs))
+  (define-key swift-mode-map (kbd "C-c K") 'xcode-project-deep-clean)
+  (define-key swift-mode-map (kbd "C-c e") 'swift-error-handler-show-log)
+  (define-key swift-mode-map (kbd "C-c d") 'swift-development-diagnose)
+
+  ;; Xcode Tools
+  (define-key swift-mode-map (kbd "C-c a") 'xcode-project-accessibility-inspector)
+  (define-key swift-mode-map (kbd "C-c i") 'xcode-project-instruments))
 ```
 
 ## Cache System
@@ -1068,10 +1516,17 @@ M-x xcode-project:check-compile-lock-error
 
 ## Performance Tips
 
-1. **Use Fast Mode**: `M-x swift-development:set-fast-mode` for balanced performance
-2. **Let Cache Warm**: Don't interrupt the initial cache warming process
-3. **Clean Periodically**: Run `M-x xcode-project:clean-build-folder` when switching branches
-4. **Monitor Cache**: Check `M-x xcode-project:cache-diagnostics` if builds feel slow
+1. **Enable Turbo Mode**: `M-x swift-development-enable-turbo-mode` for maximum incremental build speed
+2. **Optimize Build System**: `M-x swift-development-optimize-build-system` for comprehensive optimization
+3. **Use Incremental Mode**: `M-x swift-development-optimize-for-incremental-builds` for fastest incremental compilation
+4. **Let Cache Warm**: Don't interrupt the initial cache warming process
+5. **Run Without Rebuilding**: Use `M-x swift-development-run` to launch already-built apps instantly
+6. **Monitor Performance**: `M-x swift-development-benchmark-build` to identify bottlenecks
+7. **Clean When Needed**: `M-x xcode-project-deep-clean` for stubborn build issues
+8. **Fix Dependencies**: `M-x swift-development-fix-dependency-issues` for CocoaPods/SPM problems
+9. **Monitor Cache**: Check `M-x xcode-project:cache-diagnostics` if builds feel slow
+
+**Pro tip:** After enabling turbo mode, builds that previously took 30-60 seconds can drop to 5-10 seconds for single-file changes!
 
 ## Known Issues
 
