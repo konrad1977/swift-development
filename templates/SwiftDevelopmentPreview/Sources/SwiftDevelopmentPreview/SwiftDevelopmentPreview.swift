@@ -45,4 +45,28 @@ public enum SwiftDevelopmentPreview {
         }
         return nil
     }
+
+    public static var previewIndex: Int? {
+        let args = ProcessInfo.processInfo.arguments
+        for (index, arg) in args.enumerated() {
+            if arg.hasPrefix("--preview-index=") {
+                return Int(String(arg.dropFirst("--preview-index=".count)))
+            } else if arg == "--preview-index" && index + 1 < args.count {
+                return Int(args[index + 1])
+            }
+        }
+        return nil
+    }
+
+    public static var previewScale: CGFloat? {
+        let args = ProcessInfo.processInfo.arguments
+        for (index, arg) in args.enumerated() {
+            if arg.hasPrefix("--preview-scale=") {
+                return CGFloat(Double(String(arg.dropFirst("--preview-scale=".count))) ?? 2.0)
+            } else if arg == "--preview-scale" && index + 1 < args.count {
+                return CGFloat(Double(args[index + 1]) ?? 2.0)
+            }
+        }
+        return nil
+    }
 }

@@ -13,7 +13,14 @@ extension UIView {
         }
         let bounds = CGRect(origin: .zero, size: targetSize)
 
-        let renderer = UIGraphicsImageRenderer(bounds: bounds)
+        // Use custom scale if provided, otherwise use screen scale
+        let scale = SwiftDevelopmentPreview.previewScale ?? UIScreen.main.scale
+        print("🎨 Rendering at \(scale)x scale")
+
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = scale
+
+        let renderer = UIGraphicsImageRenderer(bounds: bounds, format: format)
         let image = renderer.image { context in
             drawHierarchy(in: bounds, afterScreenUpdates: true)
         }
@@ -26,7 +33,17 @@ extension UIView {
         // Get output path from command line arguments or use default
         let outputPath: String
         if let path = SwiftDevelopmentPreview.previewPath {
-            outputPath = path
+            // If preview index is provided, insert it before the file extension
+            if let index = SwiftDevelopmentPreview.previewIndex {
+                let url = URL(fileURLWithPath: path)
+                let directory = url.deletingLastPathComponent()
+                let filename = url.deletingPathExtension().lastPathComponent
+                let ext = url.pathExtension
+                let numberedFilename = "\(filename)\(String(format: "%02d", index)).\(ext)"
+                outputPath = directory.appendingPathComponent(numberedFilename).path
+            } else {
+                outputPath = path
+            }
         } else {
             // Fallback: use bundle name in temp directory
             let bundleName = Bundle.main.bundleURL.deletingPathExtension().lastPathComponent

@@ -32,6 +32,28 @@ A comprehensive Emacs package for iOS and macOS development with Swift and Xcode
 - **Localization**: Major mode for editing `.strings` files
 - **Device Management**: Deploy and debug on physical iOS devices
 
+## Screenshots
+
+### SwiftUI Preview
+Real-time SwiftUI view previews directly in Emacs with automatic generation and hot reload support.
+
+![SwiftUI Preview](screenshots/swiftui-preview.png)
+
+### Simulator Selection
+Choose from available iOS simulators with easy device selection.
+
+![Device Selection](screenshots/device-selection.png)
+
+### iOS Version Selection
+Select specific iOS versions and device configurations.
+
+![iOS Version Selection](screenshots/ios-version-selection.png)
+
+### Periphery Integration
+Built-in error detection and navigation with Periphery integration.
+
+![Periphery Errors](screenshots/periphery-errors.png)
+
 ## Installation
 
 ### Prerequisites
@@ -212,32 +234,27 @@ The LSP configuration automatically:
 - Adds necessary compiler flags for UIKit/SwiftUI development
 
 ### swiftui-preview.el
-**Fully automatic SwiftUI preview generation and display within Emacs** - with intelligent view routing, automatic generation, and zero manual configuration.
+**Fully automatic SwiftUI preview generation and display within Emacs** - with intelligent view routing, automatic #Preview macro support, and zero-config setup.
+
+#### What's New (2025-10-30)
+
+- ✅ **Zero-Config Setup**: Auto-installs SwiftDevelopmentPreview package and creates PreviewRegistry.swift
+- ✅ **#Preview Macro Support**: Write standard Xcode #Preview macros, compatible with Xcode
+- ✅ **File-Based Naming**: Previews named after Swift files (HomeView.swift → HomeView.png)
+- ✅ **Auto-Show**: Previews appear automatically when opening Swift files
+- ✅ **Auto-Update**: Saves trigger automatic preview regeneration
+- ✅ **Smart Caching**: Only rebuilds when source files change
 
 #### Quick Start
 
-1. **Install Swift Package** (one-time per project):
-   ```bash
-   # Copy the template to your project
-   cp -r ~/.emacs.d/localpackages/swift-development/templates/SwiftDevelopmentPreview /path/to/your/project/
-   ```
+1. **First-time setup** (automatic):
+   - Open any Swift file in your project
+   - Run `M-x swiftui-preview-generate` or press `C-c C-p`
+   - SwiftDevelopmentPreview package is installed automatically
+   - PreviewRegistry.swift is created automatically
+   - That's it! No manual setup required.
 
-2. **Add package to your Xcode project**:
-   - File → Add Package Dependencies...
-   - Click "Add Local..."
-   - Select the `SwiftDevelopmentPreview` directory
-
-3. **Create PreviewRegistry.swift** in your project:
-   ```swift
-   import SwiftUI
-   import SwiftDevelopmentPreview
-
-   func registerAllViewsForPreview() {
-       // This file is auto-updated by Emacs
-   }
-   ```
-
-4. **Update your App file** to use PreviewRoot:
+2. **Update your App file** to use PreviewRoot (one-time):
    ```swift
    import SwiftUI
    import SwiftDevelopmentPreview
@@ -258,7 +275,7 @@ The LSP configuration automatically:
    }
    ```
 
-5. **Mark views for preview** by adding the modifier:
+3. **Write views with #Preview macros** (Xcode-compatible):
    ```swift
    import SwiftUI
    import SwiftDevelopmentPreview
@@ -269,13 +286,20 @@ The LSP configuration automatically:
                Text("Hello, World!")
                Button("Tap me") { }
            }
-           .setupSwiftDevelopmentPreview(hotReload: true) { self }
        }
+   }
+
+   #Preview("Light Mode") {
+       ContentView()
+   }
+
+   #Preview("Dark Mode") {
+       ContentView()
+           .preferredColorScheme(.dark)
    }
    ```
 
-6. **Generate preview**:
-   - Open any Swift file in Emacs (e.g., `HomeView.swift`)
+4. **Generate preview**:
    - Press `C-c C-p` or run `M-x swiftui-preview-generate`
    - Preview appears automatically!
 
@@ -301,6 +325,132 @@ The preview system uses **intelligent dynamic routing** to show the correct view
    → Build (fast!)
    → App launches showing SettingsView
    → SettingsView.png created and displayed
+```
+
+#### Multiple Preview Support 🎨
+
+**NEW:** Write standard #Preview macros - Emacs handles the rest automatically!
+
+SwiftUI preview now has **intelligent support for Xcode's #Preview macros**. Write the same code as in Xcode, and Emacs automatically generates executable wrapper views in the background.
+
+**How it works:**
+
+You write standard Xcode-compatible code:
+```swift
+import SwiftUI
+import SwiftDevelopmentPreview
+
+struct HomeView: View {
+    var body: some View {
+        VStack {
+            Text("Hello, World!")
+        }
+        .padding()
+    }
+}
+
+#Preview("Light Mode") {
+    HomeView()
+}
+
+#Preview("Dark Mode") {
+    HomeView()
+        .preferredColorScheme(.dark)
+}
+
+#Preview("Large Text") {
+    HomeView()
+        .dynamicTypeSize(.xxxLarge)
+}
+```
+
+**When you run `C-c C-p`, this happens automatically:**
+
+1. **Parses #Preview macros** - Emacs reads and extracts all #Preview definitions
+2. **Generates wrapper views** - Automatically creates executable structs in `HomeView.PreviewWrappers.swift` (same directory as HomeView.swift):
+```swift
+struct HomeView_Preview_1: View {
+    var body: some View {
+        HomeView()
+            .setupSwiftDevelopmentPreview() { self }
+    }
+}
+
+struct HomeView_Preview_2: View {
+    var body: some View {
+        HomeView()
+            .preferredColorScheme(.dark)
+            .setupSwiftDevelopmentPreview() { self }
+    }
+}
+
+struct HomeView_Preview_3: View {
+    var body: some View {
+        HomeView()
+            .dynamicTypeSize(.xxxLarge)
+            .setupSwiftDevelopmentPreview() { self }
+    }
+}
+```
+
+3. **Registers in PreviewRegistry** - All wrapper views are registered automatically
+4. **Builds and generates** - Creates preview images for your views
+
+**Benefits:**
+
+✅ **Xcode-compatible syntax** - Same #Preview code works in both Xcode and Emacs
+✅ **No extra code** - No manual wrapper views or registrations
+✅ **Automatic generation** - Wrapper files are created and cleaned automatically
+✅ **Clean** - Wrapper files with `.PreviewWrappers.swift` suffix (easy to gitignore)
+
+**Files created:**
+```
+testpreview/
+├── HomeView.swift                    # Your original code with #Preview
+├── HomeView.PreviewWrappers.swift   # Auto-generated (gitignore this!)
+└── .swift-development/
+    └── swiftuipreview/
+        └── HomeView.png             # Generated preview image
+```
+
+**Gitignore:**
+Add to your `.gitignore`:
+```
+# SwiftUI Preview auto-generated wrapper files
+*.PreviewWrappers.swift
+```
+
+**Configuration:**
+```elisp
+;; Enable multiple preview support (default: t)
+(setq swiftui-preview-multiple-previews-enabled t)
+
+;; Configure which preview types to detect
+(setq swiftui-preview-detect-setup-modifier t)     ; .setupSwiftDevelopmentPreview()
+(setq swiftui-preview-detect-preview-macro t)      ; #Preview macros
+(setq swiftui-preview-detect-preview-provider t)   ; PreviewProvider protocol
+```
+
+**Example with #Preview macros:**
+```swift
+import SwiftUI
+import SwiftDevelopmentPreview
+
+#Preview("Default") {
+    ContentView()
+}
+
+#Preview("Dark Mode") {
+    ContentView()
+        .preferredColorScheme(.dark)
+}
+
+#Preview("Large Text") {
+    ContentView()
+        .dynamicTypeSize(.xxxLarge)
+}
+
+// Press C-c C-p in Emacs to generate preview
 ```
 
 #### Automatic Features
@@ -344,15 +494,13 @@ When preview is visible and you save a Swift file, preview automatically regener
 #### Key Commands
 
 **Basic Commands:**
-- `C-c C-p` / `M-x swiftui-preview-generate` - Generate preview for current view
+- `C-c C-p` / `M-x swiftui-preview-generate` - Generate preview for current view (auto-generates wrappers from #Preview)
 - `M-x swiftui-preview-show-existing` - Show existing preview without regenerating
 - `M-x swiftui-preview-refresh` - Refresh currently displayed preview
-- `M-x swiftui-preview-clear` - Clear all preview images
+- `M-x swiftui-preview-clear` - Clear all preview images and temporary wrapper files
+- `M-x swiftui-preview-clean-temp-files` - Clean only auto-generated wrapper files
 - `M-x swiftui-preview-show-directory` - Open preview directory in Dired
-
-**Hot Reload Commands:**
-- `M-x swiftui-preview-generate-with-hot-reload` - Generate with hot reload enabled
-- `M-x swiftui-preview-stop-hot-reload` - Stop hot reload and terminate app
+- `g` (in preview buffer) - Regenerate current preview
 
 **Configuration Commands:**
 - `M-x swiftui-preview-enable-auto-show` - Enable auto-show on file open
@@ -376,35 +524,6 @@ Previews are saved in `.swift-development/swiftuipreview/` with file-based namin
     └── SettingsView.png
 ```
 
-#### Hot Reload Support
-
-For instant preview updates without rebuilding, integrate with [Inject](https://github.com/krzysztofzablocki/Inject):
-
-1. **Install InjectionIII**:
-   ```bash
-   brew install --cask injectioniii
-   # Or download from: https://github.com/johnno1962/InjectionIII/releases
-   ```
-
-2. **Enable hot reload in your views**:
-   ```swift
-   struct ContentView: View {
-       var body: some View {
-           VStack {
-               Text("Hello!")
-           }
-           .setupSwiftDevelopmentPreview(hotReload: true) { self }
-       }
-   }
-   ```
-
-3. **Use hot reload**:
-   ```elisp
-   ;; First time: M-x swiftui-preview-generate-with-hot-reload
-   ;; Then: Edit code → Save → Preview updates automatically in ~1-2s!
-   ;; Stop: M-x swiftui-preview-stop-hot-reload
-   ```
-
 #### Configuration
 
 ```elisp
@@ -420,15 +539,19 @@ For instant preview updates without rebuilding, integrate with [Inject](https://
 ;; Use file-based naming (HomeView.swift → HomeView.png)
 (setq swiftui-preview-use-file-based-naming t)
 
+;; Multiple preview support (default: t)
+(setq swiftui-preview-multiple-previews-enabled t)
+
+;; Preview detection configuration (all default: t)
+(setq swiftui-preview-detect-setup-modifier t)    ; Detect .setupSwiftDevelopmentPreview()
+(setq swiftui-preview-detect-preview-macro t)     ; Detect #Preview macros
+(setq swiftui-preview-detect-preview-provider t)  ; Detect PreviewProvider
+
 ;; Preview generation settings
 (setq swiftui-preview-poll-interval 0.5)          ; Check for preview every 0.5s
 (setq swiftui-preview-timeout 30)                 ; Wait up to 30 seconds
 (setq swiftui-preview-window-width 0.25)          ; Preview window width (fraction)
 (setq swiftui-preview-debug nil)                  ; Enable debug messages
-
-;; Hot reload settings
-(setq swiftui-preview-hot-reload-enabled nil)     ; Enable by default
-(setq swiftui-preview-hot-reload-refresh-interval 1.0)  ; Check every 1s
 
 ;; Hide compilation buffer on successful builds
 (setq swiftui-preview-hide-compilation-on-success t)
@@ -438,7 +561,7 @@ For instant preview updates without rebuilding, integrate with [Inject](https://
 
 **Adding a new view:**
 ```swift
-// 1. Create SettingsView.swift
+// 1. Create SettingsView.swift with #Preview
 import SwiftUI
 import SwiftDevelopmentPreview
 
@@ -449,8 +572,11 @@ struct SettingsView: View {
                 Text("Username")
             }
         }
-        .setupSwiftDevelopmentPreview(hotReload: true) { self }
     }
+}
+
+#Preview {
+    SettingsView()
 }
 
 // 2. Open file in Emacs → C-c C-p
@@ -486,8 +612,8 @@ struct SettingsView: View {
 
 **Build is slow:**
 - Disable auto-update on save: `(setq swiftui-preview-auto-update-on-save nil)`
-- Use hot reload for faster iteration
 - Check that only PreviewRegistry.swift is being rebuilt (should be very fast)
+- Smart rebuild detection skips rebuilds when no source files changed
 
 **Auto-features not working:**
 - Verify hooks are loaded: `M-x describe-variable swift-mode-hook`
@@ -496,9 +622,9 @@ struct SettingsView: View {
 
 **Common issues:**
 - Preview requires iOS Simulator (macOS only)
-- Hot reload requires InjectionIII running
 - Auto-generate can trigger builds automatically (disable on slow machines)
 - Ensure `PreviewRoot` wraps your root view in App file
+- Make sure #Preview macro or .setupSwiftDevelopmentPreview() is present in your view
 
 ### xcodebuildserver.el
 Automatic Build Server Protocol (BSP) configuration for LSP integration.
@@ -966,6 +1092,43 @@ MIT
 Developed for efficient iOS/macOS development in Emacs.
 
 ## Changelog
+
+### Latest Updates (2025-10-30)
+
+#### 🎨 SwiftUI Preview: Zero-Config & #Preview Macro Support
+- **Zero-config automatic setup**
+  - Auto-installs SwiftDevelopmentPreview package on first preview generation
+  - Auto-creates PreviewRegistry.swift if missing
+  - No manual package copying or registry creation needed
+
+- **Xcode #Preview macro support**
+  - Write standard `#Preview("Name") { View() }` macros
+  - Emacs automatically generates executable wrapper views
+  - Wrapper files (*.PreviewWrappers.swift) generated and cleaned automatically
+  - Compatible with Xcode's #Preview syntax
+
+- **File-based preview naming**
+  - Previews named after Swift files (HomeView.swift → HomeView.png)
+  - Automatic preview switching when changing buffers
+  - Clean organization in .swift-development/swiftuipreview/ directory
+
+- **Enhanced automation**
+  - Auto-show: Existing previews appear when opening files
+  - Auto-generate: Create missing previews on file open (opt-in)
+  - Auto-update: Regenerate preview on save when preview visible
+  - Smart rebuild detection: Only rebuilds when source files change
+
+- **Configurable preview scale**
+  - Set `swiftui-preview-scale` to control image resolution
+  - Options: nil (native), 1.0 (@1x), 2.0 (@2x), 3.0 (@3x)
+  - Lower scales = smaller file sizes, faster generation
+
+#### 📸 Screenshots Added
+- Added visual documentation showcasing:
+  - SwiftUI preview in action
+  - Simulator device selection
+  - iOS version selection
+  - Periphery error integration
 
 ### Recent Updates (2025-10-26)
 

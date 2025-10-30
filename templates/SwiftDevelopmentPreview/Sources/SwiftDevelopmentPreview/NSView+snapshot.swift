@@ -40,7 +40,17 @@ extension NSView {
         // Get output path from command line arguments or use default
         let outputPath: String
         if let path = SwiftDevelopmentPreview.previewPath {
-            outputPath = path
+            // If preview index is provided, insert it before the file extension
+            if let index = SwiftDevelopmentPreview.previewIndex {
+                let url = URL(fileURLWithPath: path)
+                let directory = url.deletingLastPathComponent()
+                let filename = url.deletingPathExtension().lastPathComponent
+                let ext = url.pathExtension
+                let numberedFilename = "\(filename)\(String(format: "%02d", index)).\(ext)"
+                outputPath = directory.appendingPathComponent(numberedFilename).path
+            } else {
+                outputPath = path
+            }
         } else {
             // Fallback: use bundle name in temp directory
             let bundleName = Bundle.main.bundleURL.deletingPathExtension().lastPathComponent
