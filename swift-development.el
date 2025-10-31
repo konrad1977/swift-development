@@ -2045,18 +2045,24 @@ This is the fastest way to rebuild after small changes."
     ;; Check major mode
     (insert (format "Current major mode: %s\n" major-mode))
     (insert (format "Is swift-mode?: %s\n" (derived-mode-p 'swift-mode)))
-    (insert (format "Is swift-ts-mode?: %s\n\n" (derived-mode-p 'swift-ts-mode)))
+    (insert (format "Is swift-ts-mode?: %s\n" (derived-mode-p 'swift-ts-mode)))
+    (insert (format "swift-development-mode active?: %s\n\n"
+                    (if (bound-and-true-p swift-development-mode) "YES" "NO")))
 
     ;; Check hooks
     (insert "=== Hook Status ===\n")
-    (insert (format "swift-mode-hook members: %s\n"
-                    (if (member 'swift-development-auto-warm-cache-on-file-open swift-mode-hook)
+    (insert (format "swift-development-mode-hook: %s\n"
+                    (if (member 'swift-development-auto-warm-cache-on-file-open swift-development-mode-hook)
                         "✓ REGISTERED"
                       "✗ NOT REGISTERED")))
-    (insert (format "swift-ts-mode-hook members: %s\n\n"
-                    (if (member 'swift-development-auto-warm-cache-on-file-open swift-ts-mode-hook)
-                        "✓ REGISTERED"
-                      "✗ NOT REGISTERED")))
+    (insert (format "swift-mode-hook activates swift-development-mode?: %s\n"
+                    (if (member 'swift-development-mode-enable swift-mode-hook)
+                        "✓ YES"
+                      "✗ NO")))
+    (insert (format "swift-ts-mode-hook activates swift-development-mode?: %s\n\n"
+                    (if (member 'swift-development-mode-enable swift-ts-mode-hook)
+                        "✓ YES"
+                      "✗ NO")))
 
     ;; Check project
     (insert "=== Project Status ===\n")
@@ -2081,9 +2087,10 @@ This is the fastest way to rebuild after small changes."
                          (if (swift-cache-get cache-key) "YES" "NO"))))))
 
     (insert "\n=== Recommendation ===\n")
-    (unless (or (member 'swift-development-auto-warm-cache-on-file-open swift-mode-hook)
-                (member 'swift-development-auto-warm-cache-on-file-open swift-ts-mode-hook))
+    (unless (member 'swift-development-auto-warm-cache-on-file-open swift-development-mode-hook)
       (insert "⚠ Hook not registered! Try reloading swift-development.el\n"))
+    (unless (bound-and-true-p swift-development-mode)
+      (insert "⚠ swift-development-mode not active! Ensure it's enabled in your Swift buffer.\n"))
 
     (display-buffer (current-buffer))))
 
@@ -2284,10 +2291,9 @@ Respects the periphery setting - use toggle-periphery-mode to control error disp
       (message ".build directory doesn't exist"))))
 
 ;; Add hook to automatically setup project when opening Swift files
+;; Use swift-development-mode-hook for unified hook across swift-mode and swift-ts-mode
 ;;;###autoload
-(add-hook 'swift-mode-hook 'swift-development-auto-warm-cache-on-file-open)
-;;;###autoload
-(add-hook 'swift-ts-mode-hook 'swift-development-auto-warm-cache-on-file-open)
+(add-hook 'swift-development-mode-hook 'swift-development-auto-warm-cache-on-file-open)
 
 ;; Update project signature when source files are saved (incremental)
 ;;;###autoload

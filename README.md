@@ -14,13 +14,15 @@ A comprehensive Emacs package for iOS and macOS development with Swift and Xcode
 
 ### Core Functionality
 - **Xcode Integration**: Build, run, and debug iOS apps directly from Emacs
+- **Multi-Project Support**: Work on multiple Swift projects simultaneously with buffer-local state
 - **Simulator Management**: Control iOS simulators, view logs, and manage devices
 - **Auto-Launch Simulator**: Automatically starts simulator when opening a project
 - **Multi-Simulator Support**: Run apps on multiple simulators simultaneously
 - **Smart Caching**: Automatic build cache warming for faster compilation
 - **Ultra-Fast Rebuild Detection**: Last-modified file detection (10-50x faster than hash-based)
 - **Persistent Settings**: Project settings survive Emacs restarts
-- **LSP Support**: Enhanced Swift language server integration (swift-mode & swift-ts-mode)
+- **Unified Mode Support**: Works seamlessly with both swift-mode and swift-ts-mode
+- **LSP Support**: Enhanced Swift language server integration
 - **Project Management**: Automatic scheme detection and project configuration
 - **Error Handling**: Advanced error parsing and navigation
 - **Flexible Notifications**: Choose between mode-line-hud, minibuffer, or custom notifications
@@ -146,9 +148,10 @@ Main entry point with build orchestration, app running, and cache warming.
 - `swift-development-toggle-analysis-mode` - Adjust compilation performance
 
 ### xcode-project.el
-Xcode project and scheme management, build folders, and debugging.
+Xcode project and scheme management, build folders, and debugging. Uses buffer-local variables for multi-project support.
 
 **Key functions:**
+- `xcode-project-show-project-info` - Display current buffer's project information (scheme, config, etc.)
 - `xcode-project-reset` - Reset project configuration
 - `xcode-project-clean-build-folder` - Clean build artifacts
 - `xcode-project-cache-diagnostics` - View cache status
@@ -156,7 +159,7 @@ Xcode project and scheme management, build folders, and debugging.
 - `xcode-project-start-debugging` - Launch debugger (requires dape)
 
 ### swift-project-settings.el
-Persistent project settings that survive Emacs restarts. All settings are automatically saved and restored when you reopen your project.
+Persistent project settings that survive Emacs restarts. Settings are stored per-project and automatically loaded into buffer-local variables when you open a Swift file, enabling seamless multi-project workflows.
 
 **Key functions:**
 - `swift-project-settings-save` - Save project settings to disk
@@ -1124,6 +1127,31 @@ M-x swift-development:run-app
 M-x swift-development:build-and-run
 ```
 
+### Multi-Project Workflow
+
+You can work on multiple Swift projects simultaneously. Each buffer maintains its own project context (scheme, build configuration, simulator selection, etc.) using buffer-local variables.
+
+**Example workflow:**
+```elisp
+;; Open first project
+C-x C-f ~/Projects/AppA/ContentView.swift
+C-c C-c  ; Build and run AppA with its saved settings (scheme: "AppA-Debug")
+
+;; Open second project in another buffer
+C-x C-f ~/Projects/AppB/MainView.swift
+C-c C-c  ; Build and run AppB with its saved settings (scheme: "AppB-Release")
+
+;; Switch back to first project
+C-x b ContentView.swift
+C-c C-c  ; Still uses AppA's settings - no interference!
+```
+
+**Key features:**
+- Each project's settings are automatically loaded from `.swift-development/settings`
+- Switching between project buffers automatically switches context
+- No manual project reset needed when switching
+- View current buffer's project info: `M-x xcode-project-show-project-info`
+
 ### Cache Management
 
 The package automatically warms the build cache when you open a Swift file in a new project. This precompiles system frameworks (Foundation, UIKit, SwiftUI, etc.) to speed up subsequent builds.
@@ -1548,7 +1576,32 @@ Developed for efficient iOS/macOS development in Emacs.
 
 ## Changelog
 
-### Latest Updates (2025-10-30)
+### Latest Updates (2025-10-31)
+
+#### 🔄 Multi-Project Support
+- **Buffer-local project state**
+  - All project-specific variables now use buffer-local storage
+  - Work on multiple Swift projects simultaneously without interference
+  - Each buffer maintains its own scheme, build configuration, and simulator selection
+  - Automatic project context switching when changing buffers
+  - View current buffer's project info: `M-x xcode-project-show-project-info`
+
+- **Improved project switching**
+  - Fixed project detection to correctly identify when switching between projects
+  - Settings automatically loaded from each project's `.swift-development/settings`
+  - No manual reset needed when switching projects
+  - Schemes and configurations no longer leak between projects
+
+#### 🔗 Unified Hook System
+- **Consolidated Swift mode initialization**
+  - New `swift-development-mode-hook` provides single entry point for all Swift features
+  - Works seamlessly with both `swift-mode` and `swift-ts-mode`
+  - SwiftUI preview auto-show now uses unified hook system
+  - Auto-warm cache uses unified hook system
+  - Faster startup with reduced hook duplication
+  - More reliable feature activation regardless of Swift mode variant
+
+### Recent Updates (2025-10-30)
 
 #### 🎨 SwiftUI Preview: Zero-Config & #Preview Macro Support
 - **Zero-config automatic setup**
@@ -1656,14 +1709,18 @@ See git history for complete changes.
 
 ## Swift Development Mode
 
-The package includes `swift-development-mode`, a minor mode that provides a unified keymap across all Swift-related buffers (Swift files, .strings files, and iOS simulator output buffers).
+The package includes `swift-development-mode`, a minor mode that provides a unified keymap and hook system across all Swift-related buffers (Swift files, .strings files, and iOS simulator output buffers).
 
 ### Activation
 
 The mode automatically activates for:
-- Swift source files (`swift-ts-mode`)
+- Swift source files (both `swift-mode` and `swift-ts-mode`)
 - Localizeable .strings files (`localizeable-mode`)
 - iOS simulator output buffers
+
+### Unified Hook System
+
+All Swift-related setup functions (auto-warm cache, auto-show preview, etc.) use `swift-development-mode-hook` for consistent initialization across both traditional `swift-mode` and tree-sitter `swift-ts-mode`. This ensures features work reliably regardless of which Swift mode you use.
 
 ### Key Bindings
 

@@ -87,7 +87,9 @@ different buffer types related to Swift development, including:
   "Enable swift-development-mode."
   (swift-development-mode 1))
 
-;; Auto-enable for Swift files
+;; Auto-enable for Swift files (both traditional and tree-sitter modes)
+;;;###autoload
+(add-hook 'swift-mode-hook #'swift-development-mode-enable)
 ;;;###autoload
 (add-hook 'swift-ts-mode-hook #'swift-development-mode-enable)
 

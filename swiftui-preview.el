@@ -180,6 +180,10 @@ Examples: 1.0 = @1x, 2.0 = @2x (Retina), 3.0 = @3x (iPhone Pro)"
 (defvar swiftui-preview--last-buffer nil
   "Last buffer that was active when preview was shown.")
 
+(defvar swiftui-preview--last-display-time nil
+  "Timestamp of last preview display operation.
+Used to debounce buffer-change reactions after auto-show.")
+
 ;;; Directory Management
 
 (defun swiftui-preview--directory (project-root)
@@ -288,7 +292,7 @@ Always generates preview for the currently active Swift buffer."
 
     ;; Get view name for dynamic registry update
     (let* ((view-name (file-name-sans-extension
-                      (file-name-nondirectory swiftui-preview--current-preview-path))))
+                       (file-name-nondirectory swiftui-preview--current-preview-path))))
 
       (when swiftui-preview-debug
         (message "[SwiftUI Preview] View name: %s" view-name))
@@ -305,17 +309,22 @@ Always generates preview for the currently active Swift buffer."
 
       ;; Small delay to ensure file system timestamp is updated
       ;; This ensures rebuild detection sees the PreviewRegistry.swift change
+      ;; IMPORTANT: Capture buffer and buffer-local variables before going async
       (let ((preview-path swiftui-preview--current-preview-path)
-            (captured-project-root project-root))
+            (captured-project-root project-root)
+            (captured-buffer (current-buffer)))
         (run-with-timer 0.1 nil
                         (lambda ()
-                          ;; Build project with captured variables
-                          (swiftui-preview--build-project
-                           :project-root captured-project-root
-                           :callback (lambda ()
-                                       ;; Restore context and launch with correct preview path
-                                       (let ((swiftui-preview--current-preview-path preview-path))
-                                         (swiftui-preview--launch-all-previews captured-project-root))))))))))
+                          ;; Restore buffer context for buffer-local variables (scheme, config, etc.)
+                          (with-current-buffer captured-buffer
+                            ;; Build project with captured variables
+                            (swiftui-preview--build-project
+                             :project-root captured-project-root
+                             :callback (lambda ()
+                                         ;; Restore context and launch with correct preview path
+                                         (with-current-buffer captured-buffer
+                                           (let ((swiftui-preview--current-preview-path preview-path))
+                                             (swiftui-preview--launch-all-previews captured-project-root))))))))))))
 
 (cl-defun swiftui-preview--build-project (&key project-root callback)
   "Build project for preview with PROJECT-ROOT.
@@ -582,6 +591,8 @@ Updates the current preview path to track which preview is being shown."
     (setq swiftui-preview--current-preview-path image-path)
     ;; Remember which buffer this preview is for
     (setq swiftui-preview--last-buffer (current-buffer))
+    ;; Record display time for debouncing
+    (setq swiftui-preview--last-display-time (current-time))
 
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
@@ -878,7 +889,9 @@ Called from swift-mode-hook when swiftui-preview-auto-show-on-open is t."
                                          (when swiftui-preview-debug
                                            (message "[SwiftUI Preview] Auto-showing existing preview for %s"
                                                     (file-name-nondirectory filename)))
-                                         (swiftui-preview--display-image preview-path)))
+                                         ;; Make sure we're in the right buffer before displaying
+                                         (with-current-buffer buffer-name
+                                           (swiftui-preview--display-image preview-path))))
 
                                       ;; Preview doesn't exist - generate if enabled and has any preview definition
                                       ((and swiftui-preview-auto-generate-on-open
@@ -933,10 +946,21 @@ Only triggers if preview buffer is currently visible."
   "Automatically switch or hide preview when buffer changes.
 Switches preview if new buffer has one, hides preview window if it doesn't.
 This is always enabled as it's fundamental preview behavior."
-  (let ((preview-window (get-buffer-window swiftui-preview-buffer-name)))
+  (let ((preview-window (get-buffer-window swiftui-preview-buffer-name))
+        (current-buf (current-buffer))
+        (time-since-display (when swiftui-preview--last-display-time
+                             (float-time (time-subtract (current-time)
+                                                       swiftui-preview--last-display-time)))))
     (when (and preview-window
                ;; Only act if we're in a different buffer than last time
-               (not (eq (current-buffer) swiftui-preview--last-buffer)))
+               (not (eq current-buf swiftui-preview--last-buffer))
+               ;; Don't act if we're IN the preview buffer itself
+               (not (eq current-buf (get-buffer swiftui-preview-buffer-name)))
+               ;; Don't act if we're in a minibuffer or special buffer
+               (not (minibufferp current-buf))
+               (not (string-prefix-p " " (buffer-name current-buf)))
+               ;; Debounce: Don't act within 0.5s of last display
+               (or (not time-since-display) (> time-since-display 0.5)))
       (if (and (buffer-file-name)
                (string-match-p "\\.swift$" (buffer-file-name)))
           ;; We're in a Swift file, check if it has a preview
@@ -954,11 +978,11 @@ This is always enabled as it's fundamental preview behavior."
               (when swiftui-preview-debug
                 (message "[SwiftUI Preview] No preview for %s, hiding window"
                          (file-name-nondirectory (buffer-file-name))))
-              (delete-window preview-window)))
+              (ignore-errors (delete-window preview-window))))
         ;; Not a Swift file, hide preview window
         (when swiftui-preview-debug
           (message "[SwiftUI Preview] Not a Swift file, hiding preview window"))
-        (delete-window preview-window)))))
+        (ignore-errors (delete-window preview-window))))))
 
 ;;;###autoload
 (defun swiftui-preview-test-auto-show ()
@@ -980,16 +1004,14 @@ This is always enabled as it's fundamental preview behavior."
 (defun swiftui-preview-enable-auto-show ()
   "Enable automatic preview display when opening Swift files."
   (interactive)
-  (add-hook 'swift-mode-hook #'swiftui-preview--auto-show-on-open)
-  (add-hook 'swift-ts-mode-hook #'swiftui-preview--auto-show-on-open)
-  (message "SwiftUI Preview auto-show enabled for swift-mode and swift-ts-mode"))
+  (add-hook 'swift-development-mode-hook #'swiftui-preview--auto-show-on-open)
+  (message "SwiftUI Preview auto-show enabled via swift-development-mode-hook"))
 
 ;;;###autoload
 (defun swiftui-preview-disable-auto-show ()
   "Disable automatic preview display when opening Swift files."
   (interactive)
-  (remove-hook 'swift-mode-hook #'swiftui-preview--auto-show-on-open)
-  (remove-hook 'swift-ts-mode-hook #'swiftui-preview--auto-show-on-open)
+  (remove-hook 'swift-development-mode-hook #'swiftui-preview--auto-show-on-open)
   (message "SwiftUI Preview auto-show disabled"))
 
 ;;;###autoload
@@ -1021,9 +1043,9 @@ This is always enabled as it's fundamental preview behavior."
   (message "SwiftUI Preview auto-generate on open disabled"))
 
 ;; Enable auto-show by default if configured
+;; Use swift-development-mode-hook for unified hook across swift-mode and swift-ts-mode
 (when swiftui-preview-auto-show-on-open
-  (add-hook 'swift-mode-hook #'swiftui-preview--auto-show-on-open)
-  (add-hook 'swift-ts-mode-hook #'swiftui-preview--auto-show-on-open))
+  (add-hook 'swift-development-mode-hook #'swiftui-preview--auto-show-on-open))
 
 ;; Always enable auto-update and auto-switch hooks (controlled by their respective variables)
 (add-hook 'after-save-hook #'swiftui-preview--auto-update-on-save)
