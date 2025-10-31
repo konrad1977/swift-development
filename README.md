@@ -61,6 +61,11 @@ Built-in error detection and navigation with Periphery integration.
 
 ![Periphery Errors](screenshots/periphery-errors.png)
 
+### iOS Simulator Console
+Real-time simulator logs and debugging output directly in Emacs.
+
+![iOS Simulator Console](screenshots/ios-simulator-console.png)
+
 ## Installation
 
 ### Prerequisites
