@@ -554,6 +554,12 @@ Uses async rebuild check if swift-development-use-async-rebuild-check is t."
 
   (if (xcode-project-is-xcodeproject)
       (progn
+        ;; Setup current project first to ensure settings are loaded for correct project
+        ;; This handles project switching - if project changed, it resets cached values
+        ;; and loads settings from .swift-development/settings
+        (when (fboundp 'xcode-project-setup-current-project)
+          (xcode-project-setup-current-project (swift-project-root)))
+
         ;; Start simulator early (async, non-blocking) so it's ready when build completes
         (when run
           (require 'ios-simulator)
@@ -2011,7 +2017,7 @@ This is the fastest way to rebuild after small changes."
              (xcode-project-is-xcodeproject))
     (when swift-development-debug
       (message "[DEBUG] Conditions met - calling xcode-project-setup-current-project"))
-    (let ((project-root (xcode-project-project-root)))
+    (let ((project-root (swift-project-root)))
       (when project-root
         (when swift-development-debug
           (message "[DEBUG] Project root found: %s" project-root))
@@ -2021,7 +2027,7 @@ This is the fastest way to rebuild after small changes."
 (defun swift-development-test-auto-warm ()
   "Test the automatic cache warming for current project."
   (interactive)
-  (let ((project-root (xcode-project-project-root)))
+  (let ((project-root (swift-project-root)))
     (if project-root
         (progn
           (message "Testing cache warming for project: %s" project-root)

@@ -91,25 +91,33 @@ This is a compatibility wrapper - prefer using `xcode-project-notify' directly."
 This is a compatibility wrapper - prefer using `xcode-project-notify' directly."
   (apply #'xcode-project-notify args))
 
-(defvar xcode-project--current-project-root nil)
-(defvar xcode-project--previous-project-root nil)
-(defvar xcode-project--current-xcode-scheme nil)
+(defvar-local xcode-project--current-project-root nil
+  "Buffer-local project root path for multi-project support.")
+(defvar-local xcode-project--previous-project-root nil
+  "Buffer-local previous project root for detecting project changes.")
+(defvar-local xcode-project--current-xcode-scheme nil
+  "Buffer-local Xcode scheme for the current project.")
 ;; Removed: current-build-settings-json - now using swift-cache
-(defvar xcode-project--current-buildconfiguration-json-data nil)
-(defvar xcode-project--current-build-configuration nil)
-(defvar xcode-project--current-app-identifier nil)
-(defvar xcode-project--current-build-folder nil)
-(defvar xcode-project--current-is-xcode-project nil)
-(defvar xcode-project--current-local-device-id nil)
-(defvar xcode-project--current-errors-or-warnings nil)
-(defvar xcode-project--last-device-type nil)
-(defvar xcode-project--device-choice nil
-  "Stores the user's choice of device (simulator or physical device).")
+(defvar-local xcode-project--current-buildconfiguration-json-data nil
+  "Buffer-local build configuration JSON data.")
+(defvar-local xcode-project--current-build-configuration nil
+  "Buffer-local build configuration (Debug/Release).")
+(defvar-local xcode-project--current-app-identifier nil
+  "Buffer-local app bundle identifier.")
+(defvar-local xcode-project--current-build-folder nil
+  "Buffer-local build output folder path.")
+(defvar-local xcode-project--current-is-xcode-project nil
+  "Buffer-local flag indicating if current project is an Xcode project.")
+(defvar-local xcode-project--current-local-device-id nil
+  "Buffer-local device ID for physical device builds.")
+(defvar-local xcode-project--current-errors-or-warnings nil
+  "Buffer-local errors or warnings from last build.")
+(defvar-local xcode-project--last-device-type nil
+  "Buffer-local last device type used (:simulator or :device).")
+(defvar-local xcode-project--device-choice nil
+  "Buffer-local user's choice of device (simulator or physical device).")
 (defvar xcode-project--cache-warmed-projects (make-hash-table :test 'equal)
   "Hash table tracking which projects have had their caches warmed.")
-
-(defvar xcode-project--settings-restored-projects (make-hash-table :test 'equal)
-  "Hash table tracking which projects have had their settings restored.")
 
 (defconst xcodebuild-list-config-command "xcrun xcodebuild -list -json")
 
@@ -872,17 +880,16 @@ Returns a list of folder names, excluding hidden folders."
       (setq xcode-project--current-project-root normalized-project))
 
     ;; Always try to restore settings when project is setup (not just when it changes)
-    ;; This handles cases where xcode-project--current-project-root was set by other code
+    ;; For buffer-local variables: restore if scheme is not yet set in this buffer
+    ;; This allows each buffer to have its own project context
     (when (and (fboundp 'swift-project-settings-restore-to-variables)
-               (not (gethash normalized-project xcode-project--settings-restored-projects)))
+               (not xcode-project--current-xcode-scheme))
       (when xcode-project-debug
-        (message "[DEBUG] Attempting to restore project settings..."))
+        (message "[DEBUG] Attempting to restore project settings to buffer-local vars..."))
       (let ((settings (swift-project-settings-restore-to-variables normalized-project)))
         (when settings
-          ;; Mark this project as restored so we don't restore again
-          (puthash normalized-project t xcode-project--settings-restored-projects)
           (when xcode-project-debug
-            (message "[Settings] Restored settings for project: %s"
+            (message "[Settings] Restored settings for project: %s (buffer-local)"
                      (file-name-nondirectory normalized-project)))
 
           ;; Auto-launch simulator if enabled and we have device settings
@@ -928,7 +935,7 @@ Returns a list of folder names, excluding hidden folders."
 (defun xcode-project-setup-project ()
   "Setup the current project."
   (xcode-project-notify :message "Setting up project...")
-  (xcode-project-setup-current-project (xcode-project-project-root))
+  (xcode-project-setup-current-project (swift-project-root))
   (xcode-project-notify
    :message (propertize "Project ready" 'face 'success)
    :seconds 2
@@ -936,14 +943,18 @@ Returns a list of folder names, excluding hidden folders."
 
 ;;;###autoload
 (defun xcode-project-show-project-info ()
-  "Display current project information for debugging."
+  "Display current buffer-local project information for debugging.
+Shows that multi-project support is enabled via buffer-local variables."
   (interactive)
-  (message "Current project root: %s\nPrevious project root: %s\nApp identifier: %s\nBuild folder: %s\nScheme: %s"
+  (message "Buffer: %s\nProject root: %s\nPrevious root: %s\nScheme: %s\nBuild config: %s\nApp identifier: %s\nBuild folder: %s\nDevice choice: %s\n\n(All values are buffer-local for multi-project support)"
+           (buffer-name)
            (or xcode-project--current-project-root "nil")
-           (or xcode-project--previous-project-root "nil") 
+           (or xcode-project--previous-project-root "nil")
+           (or xcode-project--current-xcode-scheme "nil")
+           (or xcode-project--current-build-configuration "nil")
            (or xcode-project--current-app-identifier "nil")
            (or xcode-project--current-build-folder "nil")
-           (or xcode-project--current-xcode-scheme "nil")))
+           (or (and xcode-project--device-choice "Physical Device") "Simulator")))
 
 (defun xcode-project-project-root ()
   "Get the project root as a path string."
@@ -1000,9 +1011,6 @@ Also clears all persistent cache files (.swift-development/)."
         xcode-project--current-errors-or-warnings nil
         xcode-project--device-choice nil
         xcode-project--last-device-type nil)  ; Reset device choice
-
-  ;; Clear the restored projects hash to allow restoration after reset
-  (clrhash xcode-project--settings-restored-projects)
 
   ;; NOTE: We intentionally DO NOT reset swift-development--last-build-succeeded here
   ;; to allow each project to maintain its own build status across project switches.
