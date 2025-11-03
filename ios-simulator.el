@@ -767,12 +767,15 @@ Uses cached simulator data when available to improve performance."
       ;; Save the new selection to settings asynchronously
       (when (and (fboundp 'xcode-project-project-root)
                  (fboundp 'swift-project-settings-capture-from-variables))
-        (let ((project-root (xcode-project-project-root)))
+        (let ((current-buf (current-buffer))
+              (project-root (xcode-project-project-root)))
           (when project-root
             (run-with-idle-timer 0.1 nil
-                                 (lambda (root)
-                                   (swift-project-settings-capture-from-variables root))
-                                 project-root))))
+                                 (lambda (buf root)
+                                   (when (buffer-live-p buf)
+                                     (with-current-buffer buf
+                                       (swift-project-settings-capture-from-variables root))))
+                                 current-buf project-root))))
 
       (ios-simulator-setup-language)
       (ios-simulator-setup-simulator-dwim device-id)
@@ -857,7 +860,8 @@ If TERMINATE-RUNNING is non-nil, terminate any running instance before launching
        :message (format "%s|%s"
                         (propertize applicationName 'face 'font-lock-constant-face)
                         (propertize safe-sim-name 'face 'font-lock-function-name-face))
-       :delay 2.0)))
+       :delay 2.0
+       :reset t)))
 
   (let ((command (append (list "xcrun" "simctl" "launch" "--console-pty"
                                (or simulatorID "booted")

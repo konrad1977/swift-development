@@ -66,9 +66,19 @@ WARNING: Enabling this may cause Emacs to freeze during file operations.")
         (message "[Settings] Created directory: %s" dir)))
     dir))
 
-(defun swift-project-settings--settings-file (project-root)
-  "Get the settings file path for PROJECT-ROOT."
-  (expand-file-name "settings" (swift-project-settings--directory project-root)))
+(defun swift-project-settings--settings-file (project-root &optional scheme)
+  "Get the settings file path for PROJECT-ROOT and optionally SCHEME.
+If SCHEME is provided, returns path like 'settings-Dev', otherwise 'settings'."
+  (let ((filename (if scheme
+                      (format "settings-%s" (swift-project-settings--sanitize-scheme-name scheme))
+                    "settings")))
+    (expand-file-name filename (swift-project-settings--directory project-root))))
+
+(defun swift-project-settings--sanitize-scheme-name (scheme)
+  "Sanitize SCHEME name for use in filename.
+Removes backslashes and quotes only."
+  (let ((clean-name (replace-regexp-in-string "\\\\" "" scheme)))
+    (replace-regexp-in-string "['\"]" "" clean-name)))
 
 (defun swift-project-settings--device-cache-file (project-root)
   "Get the device-cache file path for PROJECT-ROOT."
@@ -106,47 +116,52 @@ Returns data or nil if file doesn't exist."
 
 ;;; Settings Management
 
-(defun swift-project-settings-save (project-root settings)
-  "Save SETTINGS to .swift-development/settings for PROJECT-ROOT.
-SETTINGS should be a plist with keys like :scheme, :device-name, etc."
+(defun swift-project-settings-save (project-root settings &optional scheme)
+  "Save SETTINGS to .swift-development/ for PROJECT-ROOT and SCHEME.
+SETTINGS should be a plist with keys like :scheme, :device-name, etc.
+If SCHEME is provided, saves to 'settings-<scheme>', otherwise 'settings'."
   (swift-project-settings--ensure-directory project-root)
 
-  ;; Add timestamp
-  (let ((settings-with-time (plist-put (copy-sequence settings)
-                                       :last-updated
-                                       (format-time-string "%Y-%m-%dT%H:%M:%S"))))
+  ;; Use scheme from settings if not explicitly provided
+  (let* ((target-scheme (or scheme (plist-get settings :scheme)))
+         (settings-with-time (plist-put (copy-sequence settings)
+                                        :last-updated
+                                        (format-time-string "%Y-%m-%dT%H:%M:%S"))))
 
     (swift-project-settings--write-file
-     (swift-project-settings--settings-file project-root)
+     (swift-project-settings--settings-file project-root target-scheme)
      settings-with-time)
 
     (when swift-project-settings-debug
-      (message "[Settings] Saved settings for scheme: %s"
-               (plist-get settings :scheme)))
+      (message "[Settings] Saved settings for scheme: %s (file: settings-%s)"
+               target-scheme
+               (swift-project-settings--sanitize-scheme-name target-scheme)))
 
     settings-with-time))
 
-(defun swift-project-settings-load (project-root)
-  "Load settings from .swift-development/settings for PROJECT-ROOT.
+(defun swift-project-settings-load (project-root &optional scheme)
+  "Load settings from .swift-development/ for PROJECT-ROOT and SCHEME.
+If SCHEME is provided, loads from 'settings-<scheme>', otherwise 'settings'.
 Returns a plist or nil if no settings exist."
   (let ((settings (swift-project-settings--read-file
-                   (swift-project-settings--settings-file project-root))))
+                   (swift-project-settings--settings-file project-root scheme))))
     (when (and settings swift-project-settings-debug)
-      (message "[Settings] Loaded settings for scheme: %s"
-               (plist-get settings :scheme)))
+      (message "[Settings] Loaded settings for scheme: %s (file: settings-%s)"
+               scheme
+               (if scheme (swift-project-settings--sanitize-scheme-name scheme) "default")))
     settings))
 
-(defun swift-project-settings-update (project-root key value)
-  "Update a single KEY with VALUE in settings for PROJECT-ROOT.
+(defun swift-project-settings-update (project-root key value &optional scheme)
+  "Update a single KEY with VALUE in settings for PROJECT-ROOT and SCHEME.
 Loads existing settings, updates the key, and saves."
-  (let* ((settings (or (swift-project-settings-load project-root)
+  (let* ((settings (or (swift-project-settings-load project-root scheme)
                        (list)))
          (updated (plist-put settings key value)))
-    (swift-project-settings-save project-root updated)))
+    (swift-project-settings-save project-root updated scheme)))
 
-(defun swift-project-settings-get (project-root key &optional default)
-  "Get KEY from settings for PROJECT-ROOT, returning DEFAULT if not found."
-  (let ((settings (swift-project-settings-load project-root)))
+(defun swift-project-settings-get (project-root key &optional default scheme)
+  "Get KEY from settings for PROJECT-ROOT and SCHEME, returning DEFAULT if not found."
+  (let ((settings (swift-project-settings-load project-root scheme)))
     (or (plist-get settings key) default)))
 
 (defun swift-project-settings-clear (project-root)
@@ -296,15 +311,81 @@ This is called when opening a project to restore previous selections."
         (message "[Settings] No settings found to restore"))
       nil)))
 
+(defun swift-project-settings-load-for-scheme (project-root scheme)
+  "Load and apply settings for SCHEME in PROJECT-ROOT.
+This is called when a scheme is selected to load scheme-specific settings.
+IMPORTANT: Clears build-related variables first to prevent leaking between schemes."
+  (when scheme
+    ;; CRITICAL: Clear build-related variables when switching schemes
+    ;; This prevents values from one scheme leaking into another
+    ;; By clearing these, we force fresh lookups which will use the correct
+    ;; scheme-specific cache entries (cache keys include scheme name)
+    (setq xcode-project--current-build-configuration nil
+          xcode-project--current-app-identifier nil
+          xcode-project--current-build-folder nil
+          xcode-project--last-device-type nil)  ; Force rebuild folder detection
+
+    (let ((settings (swift-project-settings-load project-root scheme)))
+      (when swift-project-settings-debug
+        (message "[Settings] Loading settings for scheme: %s (found: %s)" scheme (not (null settings))))
+
+      ;; Apply settings to buffer-local variables if they exist
+      (when settings
+        (when-let ((build-config (plist-get settings :build-config)))
+          (setq xcode-project--current-build-configuration build-config))
+
+        (when-let ((app-id (plist-get settings :app-identifier)))
+          (setq xcode-project--current-app-identifier app-id))
+
+        (when-let ((build-folder (plist-get settings :build-folder)))
+          (setq xcode-project--current-build-folder build-folder))
+
+        (when (boundp 'ios-simulator--current-simulator-name)
+          (when-let ((device-name (plist-get settings :device-name)))
+            (setq ios-simulator--current-simulator-name device-name)))
+
+        (when (boundp 'current-simulator-id)
+          (when-let ((device-id (plist-get settings :device-id)))
+            (setq current-simulator-id device-id))))
+
+      ;; Always try to load build-config from scheme file if not set
+      ;; This handles both: settings exist but lack build-config, or no settings at all
+      (when (not xcode-project--current-build-configuration)
+        (when swift-project-settings-debug
+          (message "[Settings] Build config not set, fetching from scheme file for: %s" scheme))
+        (let* ((xcodeproj-dirs (directory-files project-root t "\\.xcodeproj$"))
+               (xcodeproj-dir (car xcodeproj-dirs))
+               (scheme-file (when xcodeproj-dir
+                              (format "%s/xcshareddata/xcschemes/%s.xcscheme"
+                                      xcodeproj-dir scheme))))
+          (when (and scheme-file (file-exists-p scheme-file))
+            (with-temp-buffer
+              (insert-file-contents scheme-file)
+              (goto-char (point-min))
+              (if (re-search-forward "<LaunchAction[^>]*buildConfiguration\\s-*=\\s-*\"\\([^\"]+\\)\"" nil t)
+                  (setq xcode-project--current-build-configuration (match-string 1))
+                (goto-char (point-min))
+                (if (re-search-forward "<TestAction[^>]*buildConfiguration\\s-*=\\s-*\"\\([^\"]+\\)\"" nil t)
+                    (setq xcode-project--current-build-configuration (match-string 1))
+                  (setq xcode-project--current-build-configuration "Debug"))))
+            (when swift-project-settings-debug
+              (message "[Settings] Fetched build config from scheme file: %s" xcode-project--current-build-configuration)))))
+
+      settings)))
+
 (defun swift-project-settings-capture-from-variables (project-root)
   "Capture current Emacs variables and save as settings for PROJECT-ROOT.
-Only updates fields that have non-nil values, preserving existing saved values."
-  ;; Load existing settings first
-  (let ((settings (or (swift-project-settings-load project-root) (list))))
+Only updates fields that have non-nil values, preserving existing saved values.
+Saves to scheme-specific file if a scheme is set.
+Also saves the current scheme as 'last-scheme' in the base settings file."
+  ;; Get current scheme from buffer-local variable
+  (let* ((current-scheme xcode-project--current-xcode-scheme)
+         ;; Load existing settings for this scheme
+         (settings (or (swift-project-settings-load project-root current-scheme) (list))))
 
     ;; Update only non-nil values
-    (when xcode-project--current-xcode-scheme
-      (setq settings (plist-put settings :scheme xcode-project--current-xcode-scheme)))
+    (when current-scheme
+      (setq settings (plist-put settings :scheme current-scheme)))
 
     (when (and (boundp 'ios-simulator--current-simulator-name)
                ios-simulator--current-simulator-name)
@@ -334,8 +415,19 @@ Only updates fields that have non-nil values, preserving existing saved values."
         (setq settings (plist-put settings :project-file project-file))))
 
     (when swift-project-settings-debug
-      (message "[Settings] Capturing settings: %S" settings))
-    (swift-project-settings-save project-root settings)))
+      (message "[Settings] Capturing settings for scheme '%s': %S" current-scheme settings))
+
+    ;; Save with scheme parameter so it goes to settings-<scheme> file
+    (swift-project-settings-save project-root settings current-scheme)
+
+    ;; Also save the current scheme as "last-scheme" in base settings file
+    ;; This allows us to remember which scheme was used last
+    (when current-scheme
+      (let ((base-settings (or (swift-project-settings-load project-root nil) (list))))
+        (setq base-settings (plist-put base-settings :last-scheme current-scheme))
+        (swift-project-settings-save project-root base-settings nil)
+        (when swift-project-settings-debug
+          (message "[Settings] Saved last-scheme: %s" current-scheme))))))
 
 ;;; Diagnostics
 

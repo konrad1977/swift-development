@@ -421,7 +421,8 @@ Project path: %s"
       .buildSettings.PRODUCT_NAME)))
 
 (defun xcode-project-get-bundle-identifier (config)
-  "Get bundle identifier (as CONFIG)."
+  "Get bundle identifier using CONFIG.
+If CONFIG is nil, uses the scheme's default configuration."
   (condition-case err
       (let ((json (xcode-project-get-build-settings-json :config config)))
         (let-alist (seq-elt json 0)
@@ -430,10 +431,15 @@ Project path: %s"
      ;; Fallback: use xcodebuild directly without JSON
      (let* ((scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme "")))
             (workspace-or-project (xcode-project-get-workspace-or-project))
-            (cmd (format "xcodebuild -showBuildSettings %s -scheme %s -configuration %s 2>/dev/null | grep '^    PRODUCT_BUNDLE_IDENTIFIER' | head -1 | sed 's/.*= //' | tr -d ' '"
-                        workspace-or-project
-                        (shell-quote-argument scheme-name)
-                        (shell-quote-argument config)))
+            ;; If config is nil, don't specify -configuration (let scheme decide)
+            (cmd (if config
+                     (format "xcodebuild -showBuildSettings %s -scheme %s -configuration %s 2>/dev/null | grep '^    PRODUCT_BUNDLE_IDENTIFIER' | head -1 | sed 's/.*= //' | tr -d ' '"
+                             workspace-or-project
+                             (shell-quote-argument scheme-name)
+                             (shell-quote-argument config))
+                   (format "xcodebuild -showBuildSettings %s -scheme %s 2>/dev/null | grep '^    PRODUCT_BUNDLE_IDENTIFIER' | head -1 | sed 's/.*= //' | tr -d ' '"
+                           workspace-or-project
+                           (shell-quote-argument scheme-name))))
             (output (string-trim (shell-command-to-string cmd))))
        (when xcode-project-debug
          (message "Fallback command: %s" cmd)
@@ -504,6 +510,9 @@ Returns a list of folder names, excluding hidden folders."
         (let ((scheme (car schemes)))
           (when scheme  ; Double-check it's not nil
             (setq xcode-project--current-xcode-scheme scheme)
+            ;; Load scheme-specific settings
+            (when (fboundp 'swift-project-settings-load-for-scheme)
+              (swift-project-settings-load-for-scheme (xcode-project-project-root) scheme))
             (xcode-project-notify
              :message (format "Selected scheme: %s"
                               (propertize scheme 'face 'success))
@@ -517,19 +526,18 @@ Returns a list of folder names, excluding hidden folders."
               (xcode-project-build-menu :title "Choose scheme: " :list schemes))
         ;; Only show notification if a scheme was actually selected
         (when xcode-project--current-xcode-scheme
+          ;; Load scheme-specific settings
+          (when (fboundp 'swift-project-settings-load-for-scheme)
+            (swift-project-settings-load-for-scheme (xcode-project-project-root) xcode-project--current-xcode-scheme))
           (xcode-project-notify
            :message (format "Selected scheme: %s"
                             (propertize xcode-project--current-xcode-scheme 'face 'success))
            :seconds 2
            :reset t))))
 
-      ;; Save settings asynchronously to avoid blocking during scheme selection
-      (when (and xcode-project--current-xcode-scheme
-                 (fboundp 'swift-project-settings-capture-from-variables))
-        (run-with-idle-timer 0.1 nil
-                             (lambda (root)
-                               (swift-project-settings-capture-from-variables root))
-                             (xcode-project-project-root)))))
+      ;; NOTE: Settings are saved later after build-config and app-id are fetched
+      ;; See xcode-project-fetch-or-load-build-configuration and xcode-project-fetch-or-load-app-identifier
+      ))
   (if (not xcode-project--current-xcode-scheme)
       (error "No scheme selected")
     (shell-quote-argument xcode-project--current-xcode-scheme)))
@@ -563,18 +571,23 @@ Returns a list of folder names, excluding hidden folders."
       ;; Save build-configuration to settings asynchronously
       (when (and (fboundp 'swift-project-settings-capture-from-variables)
                  (fboundp 'xcode-project-project-root))
-        (let ((project-root (xcode-project-project-root)))
+        (let ((current-buf (current-buffer))
+              (project-root (xcode-project-project-root)))
           (when project-root
             (run-with-idle-timer 0.1 nil
-                                 (lambda (root)
-                                   (swift-project-settings-capture-from-variables root))
-                                 project-root))))
+                                 (lambda (buf root)
+                                   (when (buffer-live-p buf)
+                                     (with-current-buffer buf
+                                       (swift-project-settings-capture-from-variables root))))
+                                 current-buf project-root))))
 
-      (xcode-project-notify
-       :message (format "Build config: %s"
-                        (propertize xcode-project--current-build-configuration 'face 'font-lock-keyword-face))
-       :seconds 2
-       :reset t)))
+      ;; Only show notification if we successfully loaded a build config
+      (when xcode-project--current-build-configuration
+        (xcode-project-notify
+         :message (format "Build config: %s"
+                          (propertize xcode-project--current-build-configuration 'face 'font-lock-keyword-face))
+         :seconds 2
+         :reset t))))
   xcode-project--current-build-configuration)
 
 (defun xcode-project-fetch-or-load-app-identifier ()
@@ -595,12 +608,15 @@ Returns a list of folder names, excluding hidden folders."
       ;; Save app-identifier to settings asynchronously
       (when (and (fboundp 'swift-project-settings-capture-from-variables)
                  (fboundp 'xcode-project-project-root))
-        (let ((project-root (xcode-project-project-root)))
+        (let ((current-buf (current-buffer))
+              (project-root (xcode-project-project-root)))
           (when project-root
             (run-with-idle-timer 0.1 nil
-                                 (lambda (root)
-                                   (swift-project-settings-capture-from-variables root))
-                                 project-root))))
+                                 (lambda (buf root)
+                                   (when (buffer-live-p buf)
+                                     (with-current-buffer buf
+                                       (swift-project-settings-capture-from-variables root))))
+                                 current-buf project-root))))
 
       (xcode-project-notify
        :message (format "App ID: %s"
@@ -662,12 +678,15 @@ Returns a list of folder names, excluding hidden folders."
       (when (and xcode-project--current-build-folder
                  (fboundp 'swift-project-settings-capture-from-variables)
                  (fboundp 'xcode-project-project-root))
-        (let ((project-root (xcode-project-project-root)))
+        (let ((current-buf (current-buffer))
+              (project-root (xcode-project-project-root)))
           (when project-root
             (run-with-idle-timer 0.1 nil
-                                 (lambda (root)
-                                   (swift-project-settings-capture-from-variables root))
-                                 project-root))))
+                                 (lambda (buf root)
+                                   (when (buffer-live-p buf)
+                                     (with-current-buffer buf
+                                       (swift-project-settings-capture-from-variables root))))
+                                 current-buf project-root))))
 
       (when xcode-project-debug
         (message "xcode-project-build-folder: scheme=%s config=%s device=%s folder=%s"
@@ -882,25 +901,38 @@ Returns a list of folder names, excluding hidden folders."
     ;; Always try to restore settings when project is setup (not just when it changes)
     ;; For buffer-local variables: restore if scheme is not yet set in this buffer
     ;; This allows each buffer to have its own project context
-    (when (and (fboundp 'swift-project-settings-restore-to-variables)
+    (when (and (fboundp 'swift-project-settings-load)
+               (fboundp 'swift-project-settings-load-for-scheme)
                (not xcode-project--current-xcode-scheme))
       (when xcode-project-debug
         (message "[DEBUG] Attempting to restore project settings to buffer-local vars..."))
-      (let ((settings (swift-project-settings-restore-to-variables normalized-project)))
-        (when settings
-          (when xcode-project-debug
-            (message "[Settings] Restored settings for project: %s (buffer-local)"
-                     (file-name-nondirectory normalized-project)))
 
-          ;; Auto-launch simulator if enabled and we have device settings
-          (when (and (boundp 'swift-development-auto-launch-simulator)
-                     swift-development-auto-launch-simulator
-                     (plist-get settings :device-id)
-                     (fboundp 'ios-simulator-setup-simulator-dwim))
-            (when xcode-project-debug
-              (message "[Settings] Auto-launching simulator: %s"
-                       (plist-get settings :device-name)))
-            (ios-simulator-setup-simulator-dwim (plist-get settings :device-id))))))
+      ;; First, check base settings for last-scheme
+      (let* ((base-settings (swift-project-settings-load normalized-project nil))
+             (last-scheme (when base-settings (plist-get base-settings :last-scheme))))
+
+        (when last-scheme
+          (when xcode-project-debug
+            (message "[Settings] Found last-scheme: %s" last-scheme))
+
+          ;; Set the scheme
+          (setq xcode-project--current-xcode-scheme last-scheme)
+
+          ;; Load scheme-specific settings
+          (let ((settings (swift-project-settings-load-for-scheme normalized-project last-scheme)))
+            (when settings
+              (when xcode-project-debug
+                (message "[Settings] Restored settings for scheme: %s (buffer-local)" last-scheme))
+
+              ;; Auto-launch simulator if enabled and we have device settings
+              (when (and (boundp 'swift-development-auto-launch-simulator)
+                         swift-development-auto-launch-simulator
+                         (plist-get settings :device-id)
+                         (fboundp 'ios-simulator-setup-simulator-dwim))
+                (when xcode-project-debug
+                  (message "[Settings] Auto-launching simulator: %s"
+                           (plist-get settings :device-name)))
+                (ios-simulator-setup-simulator-dwim (plist-get settings :device-id))))))))
 
     ;; Check cache warming independently of project-changed status
     ;; This handles cases where xcode-project--current-project-root was already set by another function
@@ -997,6 +1029,12 @@ Also clears all persistent cache files (.swift-development/)."
   (when (and xcode-project--current-project-root
              (fboundp 'swift-project-settings-clear-all-cache))
     (swift-project-settings-clear-all-cache xcode-project--current-project-root))
+
+  ;; Clear swift-cache for build folders and other cached data
+  (when (fboundp 'swift-cache-invalidate-pattern)
+    (swift-cache-invalidate-pattern "build-folder-")
+    (swift-cache-invalidate-pattern "build-settings-")
+    (swift-cache-invalidate-pattern "scheme-files"))
 
   (setq current-run-on-device nil
         xcode-project--current-local-device-id nil
