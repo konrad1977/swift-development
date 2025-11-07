@@ -10,6 +10,85 @@ A comprehensive Emacs package for iOS and macOS development with Swift and Xcode
 
 ❤️ [Please sponsor me if you like this package](https://github.com/sponsors/konrad1977)
 
+## Dependencies
+
+> **Note:** This package is designed for **macOS only** as it requires Xcode and iOS Simulator.
+
+### Required System Tools
+
+These must be installed on your system:
+
+- **macOS** - This package requires macOS as it integrates with Xcode and iOS Simulator
+- **Xcode** - Full Xcode installation (not just Command Line Tools) is required for iOS development
+- **Xcode Command Line Tools** - Required for command-line Swift compilation
+  ```bash
+  xcode-select --install
+  ```
+
+- **[xcode-build-server](https://github.com/SolaWing/xcode-build-server)** - Build Server Protocol for LSP integration
+  ```bash
+  brew install xcode-build-server
+  ```
+
+### Recommended System Tools
+
+These enhance functionality and error detection:
+
+- **[periphery](https://github.com/periphery-app/periphery)** - Swift dead code detection and enhanced error parsing
+  ```bash
+  brew install peripheryapp/periphery/periphery
+  ```
+
+### Required Emacs Packages
+
+Built-in packages (no installation needed):
+
+- `project` - Built-in project management
+- `json` - Built-in JSON support
+- `compile` - Built-in compilation mode
+- `cl-lib` - Built-in Common Lisp extensions
+
+### Recommended Emacs Packages
+
+For the best Swift editing experience:
+
+- **[swift-ts-mode](https://codeberg.org/woolsweater/swift-ts-mode)** - Tree-sitter based Swift major mode (recommended)
+  - Superior syntax highlighting and code navigation
+  - Requires Emacs 29+ with tree-sitter support
+  - Alternative: [swift-mode](https://github.com/swift-emacs/swift-mode) (traditional mode, install via MELPA)
+
+### Optional Emacs Packages
+
+These add extra features:
+
+- **[dape](https://github.com/svaante/dape)** - Debug Adapter Protocol support for Emacs
+  - Enables interactive debugging with breakpoints
+  - Install via MELPA: `M-x package-install RET dape RET`
+
+- **[request](https://github.com/tkf/emacs-request)** - HTTP request library
+  - Required for Hacking with Swift integration
+  - Install via MELPA: `M-x package-install RET request RET`
+
+- **[mode-line-hud](https://github.com/konrad1977/mode-line-hud)** - Visual notifications in mode-line
+  - Provides elegant build progress indicators
+  - Install via MELPA or GitHub
+
+- **[nerd-icons](https://github.com/rainstormstudio/nerd-icons.el)** - Icon support
+  - Prettier UI elements
+  - Install via MELPA: `M-x package-install RET nerd-icons RET`
+
+- **[eglot](https://github.com/joaotavora/eglot)** - LSP client (built-in with Emacs 29+)
+  - Enhanced Swift language server integration
+  - Built-in with Emacs 29+, or install via MELPA for earlier versions
+
+### Optional Debugging Tools
+
+For advanced debugging features:
+
+- **[vscode-lldb](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb)** - LLDB debugger adapter
+  - Used with `dape` for debugging Swift/iOS apps
+  - Install via VS Code marketplace or download from GitHub releases
+
 ## Features
 
 ### Core Functionality
@@ -71,23 +150,7 @@ Real-time simulator logs and debugging output directly in Emacs.
 ### Prerequisites
 
 - Emacs 27.1 or higher
-- Xcode Command Line Tools
-- Swift toolchain
-
-### Required Emacs Packages
-
-```elisp
-;; Install via package.el or straight.el
-(require 'project)
-(require 'json)
-(require 'request)
-```
-
-### Optional Dependencies
-
-- `periphery` - For enhanced error parsing
-- `nerd-icons` - For prettier UI elements
-- `dape` - For debugging support
+- See the [Dependencies](#dependencies) section above for required system tools and packages
 
 ### Setup
 
