@@ -34,7 +34,7 @@ These must be installed on your system:
 
 These enhance functionality and error detection:
 
-- **[periphery](https://github.com/periphery-app/periphery)** - Swift dead code detection and enhanced error parsing
+- **[periphery (CLI tool)](https://github.com/peripheryapp/periphery)** - Swift dead code detection
   ```bash
   brew install peripheryapp/periphery/periphery
   ```
@@ -56,6 +56,10 @@ For the best Swift editing experience:
   - Superior syntax highlighting and code navigation
   - Requires Emacs 29+ with tree-sitter support
   - Alternative: [swift-mode](https://github.com/swift-emacs/swift-mode) (traditional mode, install via MELPA)
+
+- **[periphery](https://github.com/konrad1977/periphery)** - Enhanced error parsing and navigation for Swift
+  - Beautiful error display and navigation
+  - Automatic error highlighting and quickfix
 
 ### Optional Emacs Packages
 
