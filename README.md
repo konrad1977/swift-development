@@ -30,15 +30,6 @@ These must be installed on your system:
   brew install xcode-build-server
   ```
 
-### Recommended System Tools
-
-These enhance functionality and error detection:
-
-- **[periphery (CLI tool)](https://github.com/peripheryapp/periphery)** - Swift dead code detection
-  ```bash
-  brew install peripheryapp/periphery/periphery
-  ```
-
 ### Required Emacs Packages
 
 Built-in packages (no installation needed):
