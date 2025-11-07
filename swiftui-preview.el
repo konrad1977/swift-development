@@ -3,8 +3,8 @@
 ;; Copyright (C) 2024
 
 ;; Author: Mikael Konradsson
-;; Keywords: swift, swiftui, preview, ios
-;; Package-Requires: ((emacs "27.1"))
+;; Keywords: Swift, swiftui, preview, ios
+;; Package-Requires: ((emacs "28.1"))
 
 ;;; Commentary:
 
@@ -943,7 +943,7 @@ Only triggers if preview buffer is currently visible."
         (swiftui-preview-generate)))))
 
 (defun swiftui-preview--on-buffer-change ()
-  "Automatically switch or hide preview when buffer changes.
+  "Automatically switch or hide preview when buffer change.
 Switches preview if new buffer has one, hides preview window if it doesn't.
 This is always enabled as it's fundamental preview behavior."
   (let ((preview-window (get-buffer-window swiftui-preview-buffer-name))

@@ -418,7 +418,7 @@ Project path: %s"
   (let* ((config (or xcode-project--current-build-configuration "Debug"))
          (json (xcode-project-get-build-settings-json :config config)))
     (let-alist (seq-elt json 0)
-      .buildSettings.PRODUCT_NAME)))
+      (xcode-project--clean-display-name .buildSettings.PRODUCT_NAME))))
 
 (defun xcode-project-get-bundle-identifier (config)
   "Get bundle identifier using CONFIG.
@@ -515,7 +515,7 @@ Returns a list of folder names, excluding hidden folders."
               (swift-project-settings-load-for-scheme (xcode-project-project-root) scheme))
             (xcode-project-notify
              :message (format "Selected scheme: %s"
-                              (propertize scheme 'face 'success))
+                              (propertize (xcode-project--clean-display-name scheme) 'face 'success))
              :seconds 2
              :reset t))))
 
@@ -531,7 +531,7 @@ Returns a list of folder names, excluding hidden folders."
             (swift-project-settings-load-for-scheme (xcode-project-project-root) xcode-project--current-xcode-scheme))
           (xcode-project-notify
            :message (format "Selected scheme: %s"
-                            (propertize xcode-project--current-xcode-scheme 'face 'success))
+                            (propertize (xcode-project--clean-display-name xcode-project--current-xcode-scheme) 'face 'success))
            :seconds 2
            :reset t))))
 
@@ -541,6 +541,14 @@ Returns a list of folder names, excluding hidden folders."
   (if (not xcode-project--current-xcode-scheme)
       (error "No scheme selected")
     (shell-quote-argument xcode-project--current-xcode-scheme)))
+
+(defun xcode-project-scheme-display-name ()
+  "Get the scheme name for display purposes (without shell escaping).
+This should be used for user-facing messages and UI, not for shell commands."
+  (xcode-project-scheme)  ; Ensure scheme is loaded
+  (if (not xcode-project--current-xcode-scheme)
+      (error "No scheme selected")
+    (xcode-project--clean-display-name xcode-project--current-xcode-scheme)))
 
 (defun xcode-project-fetch-or-load-build-configuration ()
   "Get the build configuration from the scheme file."
@@ -1276,6 +1284,16 @@ IGNORE-LIST is a list of folder names to ignore during cleaning."
            (command "xed ."))
       (inhibit-sentinel-messages #'call-process-shell-command command)))
 
+(defun xcode-project--clean-display-name (str)
+  "Remove escape sequences and quotes from xcodebuild output names.
+Handles escaped parentheses like \\( and \\), quotes, and other escaped characters."
+  (when str
+    (thread-last str
+      ;; Remove backslash-escaped characters (e.g., \( becomes (, \" becomes ")
+      (replace-regexp-in-string "\\\\\\(.\\)" "\\1")
+      ;; Remove any remaining standalone quotes
+      (replace-regexp-in-string "\"" ""))))
+
 (cl-defun xcode-project-parse-compile-lines-output (&key input)
   "Parse compile output and print unique matched lines using separate message calls.
    Also prints compiler messages for C++ errors, warnings, and notes."
@@ -1326,20 +1344,26 @@ IGNORE-LIST is a list of folder names to ignore during cleaning."
             (puthash msg t seen-messages))))
        ;; Building specific targets
        ((string-match "Build target \\([^ ]+\\)" line)
-        (let ((msg (format "Building target: %s" (match-string 1 line))))
+        (let* ((target-raw (match-string 1 line))
+               (target (xcode-project--clean-display-name target-raw))
+               (msg (format "Building target: %s" target)))
           (unless (gethash msg seen-messages)
             (xcode-project-safe-mode-line-update :message
                                                    (format "  %s" (propertize msg 'face 'font-lock-builtin-face)))
             (puthash msg t seen-messages))))
        ;; Linking
        ((string-match "\\bLd\\b.*/\\([^/[:space:]]+\\)\\(?: normal\\| \\)" line)
-        (let* ((filename (match-string 1 line))
+        (let* ((filename-raw (match-string 1 line))
+               ;; Strip escape sequences and quotes
+               (filename (xcode-project--clean-display-name filename-raw))
                ;; Filter out very short names (< 2 chars), argument flags, and paths with extensions
                (is-meaningful (and filename
                                   (>= (length filename) 2)
                                   (not (string-prefix-p "-" filename))
                                   (not (string-match-p "\\." filename))
                                   (not (string-match-p "^[a-z]$" filename)))))
+          (when xcode-project-debug
+            (message "[DEBUG Linking] raw='%s' clean='%s' is-meaningful=%s" filename-raw filename is-meaningful))
           (when is-meaningful
             (let ((msg (format "Linking: %s" filename)))
               (unless (gethash msg seen-messages)
@@ -1348,27 +1372,35 @@ IGNORE-LIST is a list of folder names to ignore during cleaning."
                 (puthash msg t seen-messages))))))
        ;; Code signing
        ((string-match "CodeSign \\(.+\\)/\\([^/[:space:]]+\\.app\\)" line)
-        (let ((msg (format "Signing: %s" (match-string 2 line))))
+        (let* ((app-raw (match-string 2 line))
+               (app (xcode-project--clean-display-name app-raw))
+               (msg (format "Signing: %s" app)))
           (unless (gethash msg seen-messages)
             (xcode-project-safe-mode-line-update :message
                                                    (format "  %s" (propertize msg 'face 'font-lock-constant-face)))
             (puthash msg t seen-messages))))
        ;; C compilation
        ((string-match "CompileC.*/\\([^/[:space:]]+\\.[cm]\\)\\b" line)
-        (let ((msg (format "Compiling C: %s" (match-string 1 line))))
+        (let* ((file-raw (match-string 1 line))
+               (file (xcode-project--clean-display-name file-raw))
+               (msg (format "Compiling C: %s" file)))
           (unless (gethash msg seen-messages)
             (xcode-project-safe-mode-line-update :message
                                                    (format "  %s" (propertize msg 'face 'warning)))
             (puthash msg t seen-messages))))
        ((string-match "CompileSwiftModule \\([^ ]+\\)" line)
-        (let ((msg (format "Compiling Swift: %s" (match-string 1 line))))
+        (let* ((module-raw (match-string 1 line))
+               (module (xcode-project--clean-display-name module-raw))
+               (msg (format "Compiling Swift: %s" module)))
           (unless (gethash msg seen-messages)
             (xcode-project-safe-mode-line-update :message
                                                    (format "  %s" (propertize msg 'face 'warning)))
             (puthash msg t seen-messages))))
        ;; Swift files
        ((string-match "CompileSwift.*\\([^/]+\\.swift\\)" line)
-        (let ((msg (format "Swift: %s" (match-string 1 line))))
+        (let* ((file-raw (match-string 1 line))
+               (file (xcode-project--clean-display-name file-raw))
+               (msg (format "Swift: %s" file)))
           (unless (gethash msg seen-messages)
             (xcode-project-safe-mode-line-update :message
                                                    (format "  %s" (propertize msg 'face 'font-lock-type-face)))

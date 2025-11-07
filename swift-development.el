@@ -161,7 +161,7 @@ This also invalidates the build status to force a rebuild on next compile."
   (when (fboundp 'xcode-project-notify)
     (xcode-project-notify
      :message (format "Built %s in %s seconds"
-                      (propertize (xcode-project-scheme) 'face 'font-lock-builtin-face)
+                      (propertize (xcode-project-scheme-display-name) 'face 'font-lock-builtin-face)
                       (propertize (swift-development--compilation-time) 'face 'warning))))
 
   ;; Save last-modified file to settings (fast, synchronous)
@@ -183,7 +183,7 @@ This also invalidates the build status to force a rebuild on next compile."
   (when (fboundp 'xcode-project-notify)
     (xcode-project-notify
      :message (format "Built %s in %s seconds"
-                      (propertize (xcode-project-scheme) 'face 'font-lock-builtin-face)
+                      (propertize (xcode-project-scheme-display-name) 'face 'font-lock-builtin-face)
                       (propertize (swift-development--compilation-time) 'face 'warning))))
 
   ;; Save last-modified file to settings (fast, synchronous)
