@@ -262,17 +262,23 @@ Returns device list or nil if cache is invalid."
 (defun swift-project-settings-restore-to-variables (project-root)
   "Restore settings from .swift-development to Emacs variables for PROJECT-ROOT.
 This is called when opening a project to restore previous selections."
-  (let ((settings (swift-project-settings-load project-root)))
+  (let* ((base-settings (swift-project-settings-load project-root))
+         (last-scheme (when base-settings (plist-get base-settings :last-scheme)))
+         (settings (if last-scheme
+                      (swift-project-settings-load-for-scheme project-root last-scheme)
+                    base-settings)))
     (when swift-project-settings-debug
       (message "[Settings] Attempting to restore settings from: %s"
-               (swift-project-settings--settings-file project-root)))
+               (swift-project-settings--settings-file project-root))
+      (when last-scheme
+        (message "[Settings] Found last-scheme: %s" last-scheme)))
     (if settings
         (progn
           (when swift-project-settings-debug
             (message "[Settings] Found settings: %S" settings))
 
           ;; Restore to xcode-project variables
-          (when-let ((scheme (plist-get settings :scheme)))
+          (when-let ((scheme (or (plist-get settings :scheme) last-scheme)))
             (setq xcode-project--current-xcode-scheme scheme)
             (when swift-project-settings-debug
               (message "[Settings] Restored scheme: %s" scheme)))
@@ -438,7 +444,11 @@ Also saves the current scheme as 'last-scheme' in the base settings file."
          (dir (swift-project-settings--directory project-root))
          (settings-file (swift-project-settings--settings-file project-root))
          (device-cache-file (swift-project-settings--device-cache-file project-root))
-         (settings (swift-project-settings-load project-root))
+         (base-settings (swift-project-settings-load project-root))
+         (last-scheme (when base-settings (plist-get base-settings :last-scheme)))
+         (scheme-settings (when last-scheme
+                           (swift-project-settings-load-for-scheme project-root last-scheme)))
+         (settings (or scheme-settings base-settings))
          (device-cache (swift-project-settings--read-file device-cache-file)))
 
     (with-current-buffer (get-buffer-create "*Swift Project Settings*")
@@ -454,11 +464,15 @@ Also saves the current scheme as 'last-scheme' in the base settings file."
         (insert "=== Settings File ===\n")
         (insert (format "Path: %s\n" settings-file))
         (insert (format "Exists: %s\n" (if (file-exists-p settings-file) "YES" "NO")))
+        (when last-scheme
+          (insert (format "Last Scheme: %s\n" last-scheme))
+          (insert (format "Scheme Settings File: %s\n"
+                         (swift-project-settings--settings-file project-root last-scheme))))
 
         (if settings
             (progn
               (insert "\n=== Current Settings ===\n")
-              (insert (format "Scheme: %s\n" (plist-get settings :scheme)))
+              (insert (format "Scheme: %s\n" (or (plist-get settings :scheme) last-scheme)))
               (insert (format "Device Name: %s\n" (plist-get settings :device-name)))
               (insert (format "Device ID: %s\n" (plist-get settings :device-id)))
               (insert (format "Platform: %s\n" (plist-get settings :platform)))

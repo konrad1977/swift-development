@@ -743,25 +743,47 @@ This should be used for user-facing messages and UI, not for shell commands."
 
 (defun xcode-project-find-exact-build-folder (folders scheme config target-suffix)
   "Find build folder matching scheme-config-platform pattern."
-  (let ((patterns (list
-                   ;; Pattern: Debug-iphonesimulator, Release-iphoneos, etc.
-                   (format "%s-%s" config target-suffix)
-                   ;; Pattern: MyApp_Debug-iphonesimulator
-                   (format "%s_%s-%s" scheme config target-suffix)
-                   ;; Pattern: MyApp-Debug-iphonesimulator  
-                   (format "%s-%s-%s" scheme config target-suffix))))
+  (let* ((scheme-base (if (and scheme (string-match "^\\([^(]+\\)" scheme))
+                         (string-trim (match-string 1 scheme))
+                       scheme))
+         ;; Extract suffix from scheme, e.g., "Bruce (Staging)" -> "Staging"
+         (scheme-suffix (when (and scheme (string-match "(\\([^)]+\\))" scheme))
+                         (match-string 1 scheme)))
+         (patterns (list
+                   ;; Pattern 1: Debug (Staging)-iphonesimulator (most specific - check first!)
+                   ;; Use regexp-quote to escape special regex characters like parentheses
+                   (when (and scheme-suffix config)
+                     (regexp-quote (format "%s (%s)-%s" config scheme-suffix target-suffix)))
+                   ;; Pattern 1b: Any folder containing (Staging)-iphonesimulator (when config is nil)
+                   (when (and scheme-suffix (not config))
+                     (format "(%s)-%s" (regexp-quote scheme-suffix) (regexp-quote target-suffix)))
+                   ;; Pattern 2: MyApp-Debug-iphonesimulator
+                   (when (and scheme-base config)
+                     (regexp-quote (format "%s-%s-%s" scheme-base config target-suffix)))
+                   ;; Pattern 3: MyApp_Debug-iphonesimulator
+                   (when (and scheme-base config)
+                     (regexp-quote (format "%s_%s-%s" scheme-base config target-suffix)))
+                   ;; Pattern 4: Debug-iphonesimulator (least specific - check last!)
+                   (when config
+                     (format "^%s-%s$" (regexp-quote config) (regexp-quote target-suffix))))))
     (cl-some (lambda (pattern)
-              (cl-find-if (lambda (folder) 
-                           (string-match-p (regexp-quote pattern) folder))
-                         folders))
+              (when pattern  ; Skip nil patterns
+                (cl-find-if (lambda (folder)
+                             (string-match-p pattern folder))
+                           folders)))
             patterns)))
 
 (defun xcode-project-find-config-platform-folder (folders config target-suffix)
-  "Find build folder matching config-platform pattern."
-  (let ((pattern (format "%s.*%s" config target-suffix)))
-    (cl-find-if (lambda (folder) 
-                 (string-match-p pattern folder))
-               folders)))
+  "Find build folder matching config-platform pattern.
+Only matches if there's exactly one match to avoid ambiguity."
+  (when config
+    (let* ((pattern (format "%s.*%s" (regexp-quote config) (regexp-quote target-suffix)))
+           (matches (seq-filter (lambda (folder)
+                                 (string-match-p pattern folder))
+                               folders)))
+      ;; Only return a match if there's exactly one - avoid ambiguity
+      (when (= (length matches) 1)
+        (car matches)))))
 
 (defun xcode-project-find-platform-folder (folders target-suffix)
   "Find any build folder matching the platform."
@@ -931,6 +953,37 @@ This should be used for user-facing messages and UI, not for shell commands."
             (when settings
               (when xcode-project-debug
                 (message "[Settings] Restored settings for scheme: %s (buffer-local)" last-scheme))
+
+              ;; Restore app-identifier from settings
+              (when-let ((app-id (plist-get settings :app-identifier)))
+                (setq xcode-project--current-app-identifier app-id)
+                (when xcode-project-debug
+                  (message "[Settings] Restored app-identifier: %s" app-id)))
+
+              ;; Restore build-config from settings
+              (when-let ((build-config (plist-get settings :build-config)))
+                (setq xcode-project--current-build-configuration build-config)
+                (when xcode-project-debug
+                  (message "[Settings] Restored build-config: %s" build-config)))
+
+              ;; Restore build-folder from settings
+              (when-let ((build-folder (plist-get settings :build-folder)))
+                (setq xcode-project--current-build-folder build-folder)
+                (when xcode-project-debug
+                  (message "[Settings] Restored build-folder: %s" build-folder)))
+
+              ;; Restore simulator selection
+              (when (boundp 'ios-simulator--current-simulator-name)
+                (when-let ((device-name (plist-get settings :device-name)))
+                  (setq ios-simulator--current-simulator-name device-name)
+                  (when xcode-project-debug
+                    (message "[Settings] Restored simulator name: %s" device-name))))
+
+              (when (boundp 'ios-simulator--current-simulator-id)
+                (when-let ((device-id (plist-get settings :device-id)))
+                  (setq ios-simulator--current-simulator-id device-id)
+                  (when xcode-project-debug
+                    (message "[Settings] Restored simulator ID: %s" device-id))))
 
               ;; Auto-launch simulator if enabled and we have device settings
               (when (and (boundp 'swift-development-auto-launch-simulator)
