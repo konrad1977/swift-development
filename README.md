@@ -64,9 +64,13 @@ These add extra features:
   - Required for Hacking with Swift integration
   - Install via MELPA: `M-x package-install RET request RET`
 
-- **[mode-line-hud](https://github.com/konrad1977/mode-line-hud)** - Visual notifications in mode-line
+- **[mode-line-hud](https://github.com/konrad1977/punch-line/blob/master/mode-line-hud.el)** - Visual notifications in mode-line
   - Provides elegant build progress indicators
-  - Install via MELPA or GitHub
+  - Install via Github
+
+- **[knockknock](https://github.com/konrad1977/knockknock)** - Visual notifications
+  - Provides elegant progress indicators in a posframe
+  - Install via GitHub
 
 - **[nerd-icons](https://github.com/rainstormstudio/nerd-icons.el)** - Icon support
   - Prettier UI elements

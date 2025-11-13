@@ -128,12 +128,15 @@ With prefix argument CHOOSE-NEW-SIMULATOR, also select a new simulator."
         current-language-selection ios-simulator-default-language
         current-root-folder-simulator nil)
   (ios-simulator-kill-buffer)
-  ;; (ios-simulator-shut-down-all)
+  (when (fboundp 'xcode-project-notify)
+    (xcode-project-notify
+     :message (propertize "Simulator reset" 'face 'success)
+     :seconds 2
+     :reset t))
   (when (or choose-new-simulator
             (when (called-interactively-p 'any)
               (y-or-n-p "Choose a new simulator? ")))
-    (ios-simulator-choose-simulator))
-  (message "Simulator settings reset"))
+    (ios-simulator-choose-simulator)))
 
 (defun ios-simulator-current-sdk-version ()
   "Get the current simulator sdk-version."
@@ -417,6 +420,9 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
   "Launch a specific simulator with (as ID)."
   (when ios-simulator-debug
     (message "Starting simulator with id: %s" id))
+  (when (fboundp 'xcode-project-notify)
+    (xcode-project-notify
+     :message (format "Starting simulator with id %s..." (propertize id 'face 'font-lock-constant-face))))
   (make-process
    :name "start-simulator"
    :command (list "sh" "-c" (format "open -a simulator --args -CurrentDeviceUDID %s" id))
@@ -432,10 +438,14 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
 
 (cl-defun ios-simulator-boot-command (&key id)
   "Boot simulator (as ID)."
+  (when (fboundp 'xcode-project-notify)
+    (xcode-project-notify
+     :message (format "No simulator running. Booting device id: %s..." (propertize id 'face 'font-lock-constant-face))))
   (format "xcrun simctl boot %s" id))
 
 (cl-defun ios-simulator-is-simulator-app-running (&key callback)
-  "Check if simulator is running. If CALLBACK provided, run asynchronously."
+  "Check if simulator is running.
+If CALLBACK provided, run asynchronously."
   (if callback
       (make-process
        :name "check-simulator"
@@ -455,7 +465,8 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
       (not (string= "" output)))))
 
 (cl-defun ios-simulator-simulator-name-from (&key id &key callback)
-  "Get simulator name (as ID). If CALLBACK provided, run asynchronously."
+  "Get simulator name (as ID).
+If CALLBACK provided, run asynchronously."
   (if callback
       (make-process
        :name "simulator-name"
@@ -521,7 +532,8 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
     (sort versions 'version<)))
 
 (defun ios-simulator-available-ios-versions-async (callback)
-  "Get list of available iOS versions asynchronously. Calls CALLBACK with version list."
+  "Get list of available iOS versions asynchronously.
+Calls CALLBACK with version list."
   (ios-simulator-run-command-and-get-json-async
    list-simulators-command
    (lambda (json)
@@ -548,7 +560,7 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
          (funcall callback (sort versions 'version<)))))))
 
 (defun ios-simulator-devices-for-ios-version (ios-version)
-  "Get available devices for a specific iOS version."
+  "Get available devices for a specific IOS-VERSION."
   (let* ((json (ios-simulator-run-command-and-get-json-simple list-simulators-command))
          (devices (cdr (assoc 'devices json)))
          (matching-devices '()))
