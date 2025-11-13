@@ -1286,6 +1286,61 @@ The package includes a flexible notification system that can display build progr
 
 All notifications automatically force a display update before blocking operations, ensuring you always see status messages before long-running tasks.
 
+### Using knockknock Instead of mode-line-hud
+
+If you prefer to use [knockknock](https://github.com/konrad1977/knockknock) for visual notifications in a posframe instead of the mode-line, here's a complete example:
+
+```elisp
+(use-package knockknock
+  :ensure nil
+  :config
+  (setopt knockknock-border-color "black")
+
+  (defun my-xcode-knockknock-notify (&rest args)
+    "Custom notification function using knockknock for xcode-project.
+Accepts keyword arguments from xcode-project-notify:
+  :message - The message to display
+  :delay   - Optional delay (ignored for knockknock)
+  :seconds - How long to show notification
+  :reset   - Whether to reset (ignored for knockknock)
+  :face    - Face for styling (ignored for knockknock)"
+    (let* ((message-text (plist-get args :message))
+           (seconds (or (plist-get args :seconds) 3))
+           ;; Choose icon based on message content
+           (icon (cond
+                  ((string-match-p "\\(success\\|complete\\|passed\\)" message-text)
+                   "nf-cod-check")
+                  ((string-match-p "\\(error\\|fail\\)" message-text)
+                   "nf-cod-error")
+                  ((string-match-p "\\(warning\\|warn\\)" message-text)
+                   "nf-cod-warning")
+                  ((string-match-p "\\(build\\|compil\\)" message-text)
+                   "nf-cod-tools")
+                  (t "nf-dev-xcode")))
+           ;; Try to extract title from message if it contains a colon
+           (parts (split-string message-text ": " t))
+           (title (if (> (length parts) 1) (car parts) "Swift-development"))
+           (msg (if (> (length parts) 1)
+                    (string-join (cdr parts) ": ")
+                  message-text)))
+
+      (knockknock-notify
+       :title title
+       :message msg
+       :icon icon
+       :duration seconds)))
+
+  ;; Configure xcode-project to use custom backend
+  (setq xcode-project-notification-backend 'custom)
+  (setq xcode-project-notification-function #'my-xcode-knockknock-notify))
+```
+
+This configuration:
+- Uses knockknock posframes instead of mode-line notifications
+- Automatically selects appropriate icons based on message content (success, error, warning, build)
+- Extracts titles from messages that contain colons (e.g., "Build: Complete" becomes title "Build" with message "Complete")
+- Respects the `:seconds` parameter for notification duration
+
 ## Ultra-Fast Rebuild Detection
 
 The package automatically detects when rebuilds are needed using an extremely fast last-modified file detection system (0.1-0.5 seconds for 1000+ files).
