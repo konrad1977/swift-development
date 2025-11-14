@@ -1666,30 +1666,15 @@ This is the fastest way to rebuild after small changes."
     ;; First clear project-specific build folder
     (when (file-exists-p project-build-path)
       (message "Clearing project build folder at %s..." project-build-path)
-      (async-start
-       `(lambda ()
-          (let ((default-directory ,project-build-path))
-            (dolist (item (directory-files default-directory t "^[^.]"))
-              (when (file-directory-p item)
-                (delete-directory item t)))
-            "completed"))
-       (lambda (result)
-         (message "Project build folder clearing %s" result))))
+      (start-process "clean-build-folder" nil "sh" "-c"
+                     (format "find %s -mindepth 1 -maxdepth 1 ! -name '.*' -exec rm -rf {} +" project-build-path)))
     
     ;; Then ask about clearing all derived data
     (when (file-exists-p derived-data-path)
       (when (yes-or-no-p "Clear all Xcode derived data. This will force a full rebuild?")
         (message "Clearing derived data...")
-        (async-start
-         `(lambda ()
-            (let ((default-directory ,derived-data-path))
-              (dolist (item (directory-files default-directory t "^[^.]"))
-                (when (and (file-directory-p item)
-                           (not (string-match-p "ModuleCache" item)))
-                  (delete-directory item t)))
-              "completed"))
-         (lambda (result)
-           (message "Derived data clearing %s" result)))))))
+        (start-process "clean-derived-data" nil "sh" "-c"
+                       (format "find %s -mindepth 1 -maxdepth 1 ! -name 'ModuleCache' -exec rm -rf {} +" derived-data-path))))))
 
 ;;;###autoload
 (defun swift-development-optimize-build-system ()
@@ -1705,11 +1690,8 @@ This is the fastest way to rebuild after small changes."
   ;; Clear module caches
   (let ((module-cache (expand-file-name "~/Library/Developer/Xcode/DerivedData/ModuleCache")))
     (when (file-exists-p module-cache)
-      (async-start
-       `(lambda ()
-          (delete-directory ,module-cache t)
-          "completed")
-       (lambda (_) (message "Module cache cleared")))))
+      (start-process "clean-module-cache" nil "rm" "-rf" module-cache)
+      (message "Module cache cleared")))
   
   ;; Stop Swift Package Manager daemons
   (call-process "pkill" nil nil nil "-f" "swift-package")
@@ -2281,12 +2263,7 @@ Respects the periphery setting - use toggle-periphery-mode to control error disp
     (when (file-exists-p build-dir)
       (when (yes-or-no-p "Clean .build directory? This will force re-download of all packages.")
         (message "Cleaning .build directory...")
-        (async-start
-         `(lambda ()
-            (delete-directory ,build-dir t)
-            "completed")
-         (lambda (result)
-           (message ".build directory cleaned: %s" result)))))
+        (start-process "clean-build-dir" nil "rm" "-rf" build-dir)))
     (unless (file-exists-p build-dir)
       (message ".build directory doesn't exist"))))
 

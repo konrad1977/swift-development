@@ -307,9 +307,17 @@ This is called when opening a project to restore previous selections."
 
           (when (boundp 'current-simulator-id)
             (when-let ((device-id (plist-get settings :device-id)))
-              (setq current-simulator-id device-id)
-              (when swift-project-settings-debug
-                (message "[Settings] Restored device-id: %s" device-id))))
+              ;; Validate that the device still exists before restoring
+              (if (and (fboundp 'ios-simulator-device-exists-p)
+                       (ios-simulator-device-exists-p device-id))
+                  (progn
+                    (setq current-simulator-id device-id)
+                    (when swift-project-settings-debug
+                      (message "[Settings] Restored device-id: %s" device-id)))
+                (progn
+                  (when swift-project-settings-debug
+                    (message "[Settings] Saved device-id %s no longer exists, skipping restore" device-id))
+                  (setq current-simulator-id nil)))))
 
           ;; Return settings for further use
           settings)
@@ -352,7 +360,14 @@ IMPORTANT: Clears build-related variables first to prevent leaking between schem
 
         (when (boundp 'current-simulator-id)
           (when-let ((device-id (plist-get settings :device-id)))
-            (setq current-simulator-id device-id))))
+            ;; Validate that the device still exists before restoring
+            (if (and (fboundp 'ios-simulator-device-exists-p)
+                     (ios-simulator-device-exists-p device-id))
+                (setq current-simulator-id device-id)
+              (progn
+                (when swift-project-settings-debug
+                  (message "[Settings] Saved device-id %s no longer exists, skipping restore" device-id))
+                (setq current-simulator-id nil))))))
 
       ;; Always try to load build-config from scheme file if not set
       ;; This handles both: settings exist but lack build-config, or no settings at all

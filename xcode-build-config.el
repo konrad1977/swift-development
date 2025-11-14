@@ -551,7 +551,7 @@ SIM-ID is the simulator identifier, DERIVED-PATH is the derived data path."
                        (list
                         "xcrun xcodebuild build"
                         (format "%s" workspace-or-project)
-                        (format "-scheme %s" (xcode-project-scheme))
+                        (format "-scheme '%s'" (xcode-project-scheme-display-name))
                         ;; NOTE: -resolvePackageDependencies cannot be used with build command!
                         ;; It makes xcodebuild ONLY resolve packages and then exit
                         ;; Package cache paths - use Xcode defaults for best compatibility
@@ -565,12 +565,8 @@ SIM-ID is the simulator identifier, DERIVED-PATH is the derived data path."
                         "-parallelizeTargets"
                         (format "-jobs %d" (* (num-processors) xcode-build-config-parallel-jobs-multiplier))
                         ;; Destination
-                        (if sim-id
-                            (format "-destination 'generic/platform=iOS Simulator,id=%s'" sim-id)
-                          "-destination 'generic/platform=iOS' -sdk iphoneos")
-                        ;; SDK for simulator
                         (when sim-id
-                          "SDKROOT=$(xcrun --sdk iphonesimulator --show-sdk-path)")
+                          (format "-destination 'platform=iOS Simulator,id=%s'" sim-id))
                         ;; Configuration if specified
                         (when xcode-build-config-default-configuration
                           (format "-configuration %s" xcode-build-config-default-configuration))

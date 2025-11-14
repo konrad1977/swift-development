@@ -226,7 +226,7 @@ MAX-RETRIES specifies maximum retry attempts."
   
   ;; Strategy 1: Clean module cache
   (when (file-exists-p "~/Library/Developer/Xcode/DerivedData/ModuleCache")
-    (delete-directory "~/Library/Developer/Xcode/DerivedData/ModuleCache" t))
+    (call-process "rm" nil nil nil "-rf" (expand-file-name "~/Library/Developer/Xcode/DerivedData/ModuleCache")))
   
   ;; Strategy 2: Reset package resolved if it exists
   (when (file-exists-p "Package.resolved")

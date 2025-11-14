@@ -341,19 +341,27 @@ Project path: %s"
                 nil)))))))
 
 (defun xcode-project-run-command-and-get-json (command)
-  "Run a shell COMMAND and return the JSON output."
+  "Run a shell COMMAND and return the JSON output.
+Returns nil if command fails or produces invalid JSON."
   (let* ((json-output (shell-command-to-string command)))
     (when xcode-project-debug
       (message "Command: %s" command)
       (message "JSON output length: %d" (length json-output))
       (message "JSON output preview: %s" (substring json-output 0 (min 200 (length json-output)))))
-    (condition-case err
-        (json-read-from-string json-output)
-      (error
-       (when xcode-project-debug
-         (message "JSON parsing error: %s" (error-message-string err))
-         (message "Full JSON output: %s" json-output))
-       (error "JSON parsing failed: %s" (error-message-string err))))))
+    ;; Check if output is empty or whitespace only
+    (if (or (string-empty-p json-output)
+            (string-match-p "\\`[[:space:]]*\\'" json-output))
+        (progn
+          (when xcode-project-debug
+            (message "Command returned empty output"))
+          nil)
+      (condition-case err
+          (json-read-from-string json-output)
+        (error
+         (when xcode-project-debug
+           (message "JSON parsing error: %s" (error-message-string err))
+           (message "Full JSON output: %s" json-output))
+         nil)))))
 
 (defun xcode-project-get-schemes-from-xcodebuild ()
   "Get list of schemes using xcodebuild -list command as fallback."
@@ -385,71 +393,93 @@ Project path: %s"
        (message "Error running xcodebuild -list: %s" (error-message-string err)))
      nil)))
 
-(cl-defun xcode-project-get-build-settings-json (&key (config "Debug"))
-  "Get build settings from xcodebuild CONFIG."
+(cl-defun xcode-project-get-build-settings-json (&key config sdk)
+  "Get build settings from xcodebuild CONFIG and SDK.
+If CONFIG is nil, lets the scheme choose its default configuration.
+SDK: Optional SDK (e.g., iphonesimulator, iphoneos)."
   (let* ((project-root (xcode-project-project-root))
+         (config-key (or config "default"))
+         (sdk-key (or sdk "default"))
          (cache-key (when (fboundp 'swift-cache-project-key)
-                      (swift-cache-project-key project-root 
-                                              (format "build-settings-%s-%s" 
+                      (swift-cache-project-key project-root
+                                              (format "build-settings-%s-%s-%s"
                                                       (or xcode-project--current-xcode-scheme "default")
-                                                      config)))))
+                                                      config-key
+                                                      sdk-key)))))
     (if (and cache-key (fboundp 'swift-cache-with))
         (swift-cache-with cache-key 1800  ; Cache for 30 minutes
-          (let ((project-dir (or project-root default-directory)))
-            (let ((default-directory project-dir)
-                  (scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme ""))))
-              (xcode-project-run-command-and-get-json 
-               (format "xcrun xcodebuild %s -scheme %s -showBuildSettings -configuration %s -json 2>/dev/null" 
-                       (xcode-project-get-workspace-or-project)
-                       (shell-quote-argument scheme-name)
-                       (shell-quote-argument config))))))
+          (let ((default-directory (or project-root default-directory))
+                (scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme ""))))
+            (xcode-project-run-command-and-get-json
+             (format "xcrun xcodebuild %s -scheme %s -showBuildSettings %s %s -skipPackagePluginValidation -skipMacroValidation -json 2>/dev/null"
+                     (xcode-project-get-workspace-or-project)
+                     (shell-quote-argument scheme-name)
+                     (if config (format "-configuration %s" (shell-quote-argument config)) "")
+                     (if sdk (format "-sdk %s" sdk) "")))))
       ;; Fallback when swift-cache not available
-      (let ((project-dir (or project-root default-directory)))
-        (let ((default-directory project-dir)
-              (scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme ""))))
-          (xcode-project-run-command-and-get-json 
-           (format "xcrun xcodebuild %s -scheme %s -showBuildSettings -configuration %s -json 2>/dev/null" 
-                   (xcode-project-get-workspace-or-project)
-                   (shell-quote-argument scheme-name)
-                   (shell-quote-argument config))))))))
+      (let ((default-directory (or project-root default-directory))
+            (scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme ""))))
+        (xcode-project-run-command-and-get-json
+         (format "xcrun xcodebuild %s -scheme %s -showBuildSettings %s %s -skipPackagePluginValidation -skipMacroValidation -json 2>/dev/null"
+                 (xcode-project-get-workspace-or-project)
+                 (shell-quote-argument scheme-name)
+                 (if config (format "-configuration %s" (shell-quote-argument config)) "")
+                 (if sdk (format "-sdk %s" sdk) "")))))))
 
 (defun xcode-project-product-name ()
-  "Get product name."
+  "Get product name from build settings or derive from scheme/project name."
   (let* ((config (or xcode-project--current-build-configuration "Debug"))
          (json (xcode-project-get-build-settings-json :config config)))
-    (let-alist (seq-elt json 0)
-      (xcode-project--clean-display-name .buildSettings.PRODUCT_NAME))))
+    (or
+     ;; First try: get from build settings
+     (when (and json (> (length json) 0))
+       (let-alist (seq-elt json 0)
+         (xcode-project--clean-display-name .buildSettings.PRODUCT_NAME)))
+     ;; Second try: derive from scheme name
+     (when xcode-project--current-xcode-scheme
+       (let ((scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" xcode-project--current-xcode-scheme)))
+         (if (string-match "^\\([^(]+\\)\\s-*(.*)" scheme-name)
+             ;; Scheme has format "Name (Config)" - extract Name
+             (string-trim (match-string 1 scheme-name))
+           ;; Use full scheme name
+           scheme-name)))
+     ;; Last resort: use project directory name
+     (when-let ((project-root (xcode-project-project-root)))
+       (file-name-nondirectory (directory-file-name project-root)))
+     ;; Ultimate fallback
+     "Unknown")))
 
 (defun xcode-project-get-bundle-identifier (config)
   "Get bundle identifier using CONFIG.
 If CONFIG is nil, uses the scheme's default configuration."
-  (condition-case err
-      (let ((json (xcode-project-get-build-settings-json :config config)))
-        (let-alist (seq-elt json 0)
-          .buildSettings.PRODUCT_BUNDLE_IDENTIFIER))
-    (error
-     ;; Fallback: use xcodebuild directly without JSON
-     (let* ((scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme "")))
-            (workspace-or-project (xcode-project-get-workspace-or-project))
-            ;; If config is nil, don't specify -configuration (let scheme decide)
-            (cmd (if config
-                     (format "xcodebuild -showBuildSettings %s -scheme %s -configuration %s 2>/dev/null | grep '^    PRODUCT_BUNDLE_IDENTIFIER' | head -1 | sed 's/.*= //' | tr -d ' '"
-                             workspace-or-project
-                             (shell-quote-argument scheme-name)
-                             (shell-quote-argument config))
-                   (format "xcodebuild -showBuildSettings %s -scheme %s 2>/dev/null | grep '^    PRODUCT_BUNDLE_IDENTIFIER' | head -1 | sed 's/.*= //' | tr -d ' '"
-                           workspace-or-project
-                           (shell-quote-argument scheme-name))))
-            (output (string-trim (shell-command-to-string cmd))))
-       (when xcode-project-debug
-         (message "Fallback command: %s" cmd)
-         (message "Fallback output: %s" output))
-       (if (string-empty-p output)
-           (progn
-             (when xcode-project-debug
-               (message "No bundle identifier found, using generic fallback"))
-             "com.example.app")  ; Generic fallback
-         output)))))
+  (let* ((json (xcode-project-get-build-settings-json :config config))
+         (bundle-id (when (and json (> (length json) 0))
+                     (let-alist (seq-elt json 0)
+                       .buildSettings.PRODUCT_BUNDLE_IDENTIFIER))))
+    (if (and bundle-id (not (string-empty-p bundle-id)))
+        bundle-id
+      ;; Fallback: use xcodebuild directly without JSON
+      (let* ((scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme "")))
+             (workspace-or-project (xcode-project-get-workspace-or-project))
+             ;; If config is nil, don't specify -configuration (let scheme decide)
+             (cmd (if config
+                      (format "xcodebuild -showBuildSettings %s -scheme %s -configuration %s 2>/dev/null | grep '^    PRODUCT_BUNDLE_IDENTIFIER' | head -1 | sed 's/.*= //' | tr -d ' '"
+                              workspace-or-project
+                              (shell-quote-argument scheme-name)
+                              (shell-quote-argument config))
+                    (format "xcodebuild -showBuildSettings %s -scheme %s 2>/dev/null | grep '^    PRODUCT_BUNDLE_IDENTIFIER' | head -1 | sed 's/.*= //' | tr -d ' '"
+                            workspace-or-project
+                            (shell-quote-argument scheme-name))))
+             (output (string-trim (shell-command-to-string cmd))))
+        (when xcode-project-debug
+          (message "Fallback command: %s" cmd)
+          (message "Fallback output: %s" output))
+        (if (string-empty-p output)
+            (progn
+              (when xcode-project-debug
+                (message "No bundle identifier found, using generic fallback"))
+              "com.example.app")  ; Generic fallback
+          output)))))
 
 (cl-defun xcode-project-build-menu (&key title list)
   "Builds a widget menu from (as TITLE as LIST)."
@@ -608,7 +638,8 @@ This should be used for user-facing messages and UI, not for shell commands."
       (when xcode-project-debug
         (message "xcode-project-fetch-or-load-app-identifier - scheme: %s, config: %s"
                  xcode-project--current-xcode-scheme config))
-      (setq xcode-project--current-app-identifier (xcode-project-get-bundle-identifier config))
+      ;; Use nil config to let scheme choose its own configuration
+      (setq xcode-project--current-app-identifier (xcode-project-get-bundle-identifier nil))
       (when xcode-project-debug
         (message "xcode-project-fetch-or-load-app-identifier - bundle ID: %s"
                  xcode-project--current-app-identifier))
@@ -643,15 +674,15 @@ This should be used for user-facing messages and UI, not for shell commands."
         (xcode-project-get-schemes-from-xcodebuild))))
 
 (cl-defun xcode-project-build-folder (&key (device-type :device))
-  "Get build folder. Auto-detect based on scheme, configuration, and device type."
+  "Get build folder directly from xcodebuild -showBuildSettings.
+This is more reliable than auto-detection via pattern matching."
   (when (or (not xcode-project--current-build-folder)
             (not (eq device-type xcode-project--last-device-type)))
     (let* ((scheme (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme "")))
            (config (xcode-project-fetch-or-load-build-configuration))
-           (build-products-dir (xcode-project-get-build-products-directory))
            (target-suffix (if (eq device-type :simulator) "iphonesimulator" "iphoneos"))
            (cache-key (when (fboundp 'swift-cache-project-key)
-                       (swift-cache-project-key 
+                       (swift-cache-project-key
                         (xcode-project-project-root)
                         (format "build-folder-%s-%s-%s" scheme config target-suffix)))))
 
@@ -660,25 +691,45 @@ This should be used for user-facing messages and UI, not for shell commands."
                             (swift-cache-get cache-key))))
         (if (and cached-folder (file-exists-p cached-folder))
             (setq xcode-project--current-build-folder cached-folder)
-          ;; Auto-detect build folder
-          (setq xcode-project--current-build-folder 
-                (xcode-project-auto-detect-build-folder 
-                 :build-products-dir build-products-dir
-                 :scheme scheme
-                 :config config
-                 :device-type device-type
-                 :target-suffix target-suffix))
-          
-          ;; Format the full path
-          (when xcode-project--current-build-folder
-            (setq xcode-project--current-build-folder 
-                  (if (file-name-absolute-p xcode-project--current-build-folder)
-                      xcode-project--current-build-folder
-                    (concat build-products-dir xcode-project--current-build-folder "/"))))
-          
-          ;; Cache the result
-          (when (and cache-key (fboundp 'swift-cache-set) xcode-project--current-build-folder)
-            (swift-cache-set cache-key xcode-project--current-build-folder 1800))))  ; Cache for 30 minutes
+
+          ;; Get build folder: use .build if exists, extract config folder from xcodebuild
+          (let* ((sdk (if (eq device-type :simulator) "iphonesimulator" "iphoneos"))
+                 (json (xcode-project-get-build-settings-json :config config :sdk sdk))
+                 (xcode-built-products-dir (when (and json (> (length json) 0))
+                                            (let-alist (seq-elt json 0)
+                                              .buildSettings.BUILT_PRODUCTS_DIR)))
+                 ;; Get base build products dir (prefers .build over DerivedData)
+                 (base-build-products-dir (xcode-project-get-build-products-directory)))
+
+            (setq xcode-project--current-build-folder
+                  (if base-build-products-dir
+                      ;; Extract just the configuration folder name from xcodebuild's path
+                      ;; e.g., "Debug (Production)-iphonesimulator" from full DerivedData path
+                      (let ((config-folder-name (when xcode-built-products-dir
+                                                  (file-name-nondirectory
+                                                   (directory-file-name xcode-built-products-dir)))))
+                        (if (and config-folder-name
+                                 (file-directory-p (concat base-build-products-dir config-folder-name)))
+                            ;; Use xcodebuild's config folder name with our .build base path
+                            (file-name-as-directory (concat base-build-products-dir config-folder-name))
+                          ;; Fallback to auto-detection if folder doesn't exist
+                          (let ((detected (xcode-project-auto-detect-build-folder
+                                          :build-products-dir base-build-products-dir
+                                          :scheme scheme
+                                          :config config
+                                          :device-type device-type
+                                          :target-suffix target-suffix)))
+                            (when detected
+                              (if (file-name-absolute-p detected)
+                                  detected
+                                (concat base-build-products-dir detected "/"))))))
+                    ;; Last resort: use xcodebuild's path directly (DerivedData)
+                    (when (and xcode-built-products-dir (file-directory-p xcode-built-products-dir))
+                      (file-name-as-directory xcode-built-products-dir)))))
+
+            ;; Cache the result
+            (when (and cache-key (fboundp 'swift-cache-set) xcode-project--current-build-folder)
+              (swift-cache-set cache-key xcode-project--current-build-folder 1800))))  ; Cache for 30 minutes
 
       (setq xcode-project--last-device-type device-type)
 
@@ -707,39 +758,42 @@ This should be used for user-facing messages and UI, not for shell commands."
          (local-build-dir (concat project-root ".build/Build/Products/")))
     (if (file-exists-p local-build-dir)
         local-build-dir
-      ;; Fallback to derived data path  
+      ;; Fallback to derived data path
       (let ((derived-path (xcode-project-derived-data-path)))
-        (cond
-         ;; If derived path ends with .build, append Build/Products
-         ((string-suffix-p ".build" derived-path)
-          (concat derived-path "/Build/Products/"))
-         ;; Otherwise use the path as-is with Build/Products
-         (t (concat (file-name-as-directory derived-path) "Build/Products/")))))))
+        (when derived-path
+          (cond
+           ;; If derived path ends with .build, append Build/Products
+           ((string-suffix-p ".build" derived-path)
+            (concat derived-path "/Build/Products/"))
+           ;; Otherwise use the path as-is with Build/Products
+           (t (concat (file-name-as-directory derived-path) "Build/Products/"))))))))
 
 (cl-defun xcode-project-auto-detect-build-folder (&key build-products-dir scheme config device-type target-suffix)
-  "Intelligently auto-detect the correct build folder."
-  (let* ((default-directory build-products-dir)
-         (all-folders (xcode-project-parse-build-folder default-directory)))
-    
-    (when xcode-project-debug
-      (message "Auto-detecting build folder: scheme=%s config=%s target=%s" scheme config target-suffix)
-      (message "Available folders: %s" all-folders))
-    
-    (or 
-     ;; Strategy 1: Look for exact match with scheme-config-platform
-     (xcode-project-find-exact-build-folder all-folders scheme config target-suffix)
-     
-     ;; Strategy 2: Look for config-platform match
-     (xcode-project-find-config-platform-folder all-folders config target-suffix)
-     
-     ;; Strategy 3: Look for platform-only match
-     (xcode-project-find-platform-folder all-folders target-suffix)
-     
-     ;; Strategy 4: Look for any folder containing the scheme name
-     (xcode-project-find-scheme-folder all-folders scheme)
-     
-     ;; Strategy 5: Interactive fallback
-     (xcode-project-interactive-build-folder-selection all-folders target-suffix))))
+  "Intelligently auto-detect the correct build folder.
+Returns nil if build-products-dir is nil or doesn't exist."
+  (when (and build-products-dir (file-directory-p build-products-dir))
+    (let* ((default-directory build-products-dir)
+           (all-folders (xcode-project-parse-build-folder default-directory)))
+
+      (when xcode-project-debug
+        (message "Auto-detecting build folder: scheme=%s config=%s target=%s" scheme config target-suffix)
+        (message "Available folders: %s" all-folders))
+
+      (or
+       ;; Strategy 1: Look for exact match with scheme-config-platform
+       (xcode-project-find-exact-build-folder all-folders scheme config target-suffix)
+
+       ;; Strategy 2: Look for config-platform match
+       (xcode-project-find-config-platform-folder all-folders config target-suffix)
+
+       ;; Strategy 3: Look for platform-only match
+       (xcode-project-find-platform-folder all-folders target-suffix)
+
+       ;; Strategy 4: Look for any folder containing the scheme name
+       (xcode-project-find-scheme-folder all-folders scheme)
+
+       ;; Strategy 5: Interactive fallback
+       (xcode-project-interactive-build-folder-selection all-folders target-suffix)))))
 
 (defun xcode-project-find-exact-build-folder (folders scheme config target-suffix)
   "Find build folder matching scheme-config-platform pattern."
@@ -749,23 +803,33 @@ This should be used for user-facing messages and UI, not for shell commands."
          ;; Extract suffix from scheme, e.g., "Bruce (Staging)" -> "Staging"
          (scheme-suffix (when (and scheme (string-match "(\\([^)]+\\))" scheme))
                          (match-string 1 scheme)))
+         ;; IMPORTANT: Extract suffix from config as well, e.g., "Debug (Production)" -> "Production"
+         ;; This is needed because scheme name might be "Bruce (Prod-debug)" but config is "Debug (Production)"
+         (config-base (if (and config (string-match "^\\([^(]+\\)" config))
+                         (string-trim (match-string 1 config))
+                       config))
+         (config-suffix (when (and config (string-match "(\\([^)]+\\))" config))
+                         (match-string 1 config)))
          (patterns (list
-                   ;; Pattern 1: Debug (Staging)-iphonesimulator (most specific - check first!)
+                   ;; Pattern 1: Debug (Production)-iphonesimulator (using config suffix - most specific!)
                    ;; Use regexp-quote to escape special regex characters like parentheses
-                   (when (and scheme-suffix config)
-                     (regexp-quote (format "%s (%s)-%s" config scheme-suffix target-suffix)))
-                   ;; Pattern 1b: Any folder containing (Staging)-iphonesimulator (when config is nil)
-                   (when (and scheme-suffix (not config))
-                     (format "(%s)-%s" (regexp-quote scheme-suffix) (regexp-quote target-suffix)))
+                   (when (and config-suffix config-base)
+                     (regexp-quote (format "%s (%s)-%s" config-base config-suffix target-suffix)))
+                   ;; Pattern 1b: Debug (Staging)-iphonesimulator (using scheme suffix as fallback)
+                   (when (and scheme-suffix config-base)
+                     (regexp-quote (format "%s (%s)-%s" config-base scheme-suffix target-suffix)))
+                   ;; Pattern 1c: Any folder containing (Production)-iphonesimulator (when config-base is nil)
+                   (when (and config-suffix (not config-base))
+                     (format "(%s)-%s" (regexp-quote config-suffix) (regexp-quote target-suffix)))
                    ;; Pattern 2: MyApp-Debug-iphonesimulator
-                   (when (and scheme-base config)
-                     (regexp-quote (format "%s-%s-%s" scheme-base config target-suffix)))
+                   (when (and scheme-base config-base)
+                     (regexp-quote (format "%s-%s-%s" scheme-base config-base target-suffix)))
                    ;; Pattern 3: MyApp_Debug-iphonesimulator
-                   (when (and scheme-base config)
-                     (regexp-quote (format "%s_%s-%s" scheme-base config target-suffix)))
+                   (when (and scheme-base config-base)
+                     (regexp-quote (format "%s_%s-%s" scheme-base config-base target-suffix)))
                    ;; Pattern 4: Debug-iphonesimulator (least specific - check last!)
-                   (when config
-                     (format "^%s-%s$" (regexp-quote config) (regexp-quote target-suffix))))))
+                   (when config-base
+                     (format "^%s-%s$" (regexp-quote config-base) (regexp-quote target-suffix))))))
     (cl-some (lambda (pattern)
               (when pattern  ; Skip nil patterns
                 (cl-find-if (lambda (folder)
@@ -777,7 +841,11 @@ This should be used for user-facing messages and UI, not for shell commands."
   "Find build folder matching config-platform pattern.
 Only matches if there's exactly one match to avoid ambiguity."
   (when config
-    (let* ((pattern (format "%s.*%s" (regexp-quote config) (regexp-quote target-suffix)))
+    ;; Extract base config if it has suffix, e.g., "Debug (Production)" -> "Debug"
+    (let* ((config-base (if (string-match "^\\([^(]+\\)" config)
+                           (string-trim (match-string 1 config))
+                         config))
+           (pattern (format "%s.*%s" (regexp-quote config-base) (regexp-quote target-suffix)))
            (matches (seq-filter (lambda (folder)
                                  (string-match-p pattern folder))
                                folders)))
@@ -1220,43 +1288,24 @@ Automatically builds the app if sources have changed."
   "Clean Swift package manager caches."
   (let ((package-cache-dir (expand-file-name "~/Library/Caches/org.swift.packages"))
         (cloned-sources-dir (expand-file-name "~/Library/Caches/org.swift.cloned-sources")))
-    
+
     (when (file-exists-p package-cache-dir)
       (message "Cleaning Swift package cache...")
-      (async-start
-       `(lambda ()
-          (delete-directory ,package-cache-dir t)
-          "Swift package cache cleaned")
-       (lambda (result)
-         (message "%s" result))))
-    
+      (start-process "clean-swift-cache" nil "rm" "-rf" package-cache-dir))
+
     (when (file-exists-p cloned-sources-dir)
       (message "Cleaning Swift cloned sources...")
-      (async-start
-       `(lambda ()
-          (delete-directory ,cloned-sources-dir t)
-          "Swift cloned sources cleaned")
-       (lambda (result)
-         (message "%s" result))))))
+      (start-process "clean-swift-sources" nil "rm" "-rf" cloned-sources-dir))))
 
 (defun xcode-project-clean-project-derived-data ()
   "Clean Xcode derived data for the current project."
   (let* ((project-name (xcode-project-product-name))
          (derived-data-dir (expand-file-name "~/Library/Developer/Xcode/DerivedData"))
-         (project-pattern (concat "^" (regexp-quote project-name) "-")))
-    
-    (when (file-exists-p derived-data-dir)
-      (message "Cleaning derived data for %s..." project-name)
-      (async-start
-       `(lambda ()
-          (let ((cleaned-count 0))
-            (dolist (dir (directory-files ,derived-data-dir t ,project-pattern))
-              (when (file-directory-p dir)
-                (delete-directory dir t)
-                (setq cleaned-count (1+ cleaned-count))))
-            (format "Cleaned %d derived data folder(s) for %s" cleaned-count ,project-name)))
-       (lambda (result)
-         (message "%s" result))))))
+         (project-pattern (concat project-name "-")))
+
+    (message "Cleaning derived data for %s..." project-name)
+    (start-process "clean-derived-data" nil "sh" "-c"
+                   (format "rm -rf %s/%s*" derived-data-dir project-pattern))))
 
 (defun xcode-project-deep-clean ()
   "Perform a deep clean: build folder, Swift package caches, and all derived data."
@@ -1280,55 +1329,49 @@ Automatically builds the app if sources have changed."
       (let ((derived-data-dir (expand-file-name "~/Library/Developer/Xcode/DerivedData")))
         (when (file-exists-p derived-data-dir)
           (message "Cleaning all derived data...")
-          (async-start
-           `(lambda ()
-              (dolist (dir (directory-files ,derived-data-dir t "^[^.]"))
-                (when (and (file-directory-p dir)
-                           (not (string-match-p "ModuleCache" dir)))
-                  (delete-directory dir t)))
-              "All derived data cleaned")
-           (lambda (result)
-             (message "%s" result))))))))
+          (start-process "clean-all-derived-data" nil "sh" "-c"
+                         (format "find %s -mindepth 1 -maxdepth 1 ! -name 'ModuleCache' -exec rm -rf {} +" derived-data-dir)))))))
 
 (cl-defun xcode-project-clean-build-folder-with (&key root build-folder project-name ignore-list)
   "Clean build folder with ROOT, BUILD-FOLDER, PROJECT-NAME asynchronously.
 IGNORE-LIST is a list of folder names to ignore during cleaning."
-  (when xcode-project-debug
-    (message "Cleaning build folder: %s for %s" build-folder project-name))
-  (let ((default-directory build-folder))
-    (if (file-directory-p default-directory)
-        (progn
-          (xcode-project-safe-mode-line-update
-           :message (format "Cleaning build folder for %s"
-                            (propertize project-name 'face 'warning)))
-          (async-start
-           `(lambda ()
-              ,(async-inject-variables "default-directory")
-              (defun delete-directory-contents (directory ignore-list)
-                "Delete contents of DIRECTORY, ignoring folders in IGNORE-LIST."
-                (dolist (file (directory-files directory t))
-                  (let ((file-name (file-name-nondirectory file)))
-                    (unless (or (member file-name '("." ".."))
-                                (member file-name ignore-list))
-                      (if (file-directory-p file)
-                          (progn
-                            (delete-directory file t t))
-                        (delete-file file t))))))
-              (condition-case err
-                  (progn
-                    (delete-directory-contents ,default-directory ',ignore-list) "successfully")
-                (error (format "Error during cleaning: %s" (error-message-string err)))))
-           `(lambda (result)
-              (xcode-project-safe-mode-line-notification
-               :message (format "Cleaning %s %s"
-                                (propertize ,project-name 'face 'warning)
-                                result)
-               :seconds 3
-               :reset t))))
-      (xcode-project-safe-mode-line-notification
-       :message (propertize "Build folder is empty or does not exist." 'face 'warning)
-       :seconds 3
-       :reset t))))
+  (let ((display-name (or project-name "project")))
+    (when xcode-project-debug
+      (message "Cleaning build folder: %s for %s" build-folder display-name))
+    (let ((default-directory build-folder))
+      (if (file-directory-p default-directory)
+          (progn
+            (xcode-project-safe-mode-line-update
+             :message (format "Cleaning build folder for %s"
+                              (propertize display-name 'face 'warning)))
+            (async-start
+             `(lambda ()
+                ,(async-inject-variables "default-directory")
+                (defun delete-directory-contents (directory ignore-list)
+                  "Delete contents of DIRECTORY, ignoring folders in IGNORE-LIST."
+                  (dolist (file (directory-files directory t))
+                    (let ((file-name (file-name-nondirectory file)))
+                      (unless (or (member file-name '("." ".."))
+                                  (member file-name ignore-list))
+                        (if (file-directory-p file)
+                            (progn
+                              (delete-directory file t t))
+                          (delete-file file t))))))
+                (condition-case err
+                    (progn
+                      (delete-directory-contents ,default-directory ',ignore-list) "successfully")
+                  (error (format "Error during cleaning: %s" (error-message-string err)))))
+             `(lambda (result)
+                (xcode-project-safe-mode-line-notification
+                 :message (format "Cleaning %s %s"
+                                  (propertize ,display-name 'face 'warning)
+                                  result)
+                 :seconds 3
+                 :reset t))))
+        (xcode-project-safe-mode-line-notification
+         :message (propertize "Build folder is empty or does not exist." 'face 'warning)
+         :seconds 3
+         :reset t)))))
 
 (defun xcode-project-open-in-xcode ()
   "Open project in xcode."
@@ -1404,6 +1447,71 @@ Handles escaped parentheses like \\( and \\), quotes, and other escaped characte
             (xcode-project-safe-mode-line-update :message
                                                    (format "  %s" (propertize msg 'face 'font-lock-builtin-face)))
             (puthash msg t seen-messages))))
+       ;; Build phase script execution (SwiftGen, SwiftLint, etc.)
+       ((string-match "PhaseScriptExecution.*\"\\([^\"]+\\)\"" line)
+        (let* ((script-name-raw (match-string 1 line))
+               (script-name (xcode-project--clean-display-name script-name-raw))
+               (msg (format "Running script: %s" script-name)))
+          (unless (gethash msg seen-messages)
+            (xcode-project-safe-mode-line-update :message
+                                                   (format "  %s" (propertize msg 'face 'font-lock-function-name-face)))
+            (puthash msg t seen-messages))))
+       ;; Asset catalog compilation
+       ((string-match "CompileAssetCatalog.*/\\([^/[:space:]]+\\.xcassets\\)" line)
+        (let* ((catalog-raw (match-string 1 line))
+               (catalog (xcode-project--clean-display-name catalog-raw))
+               (msg (format "Compiling assets: %s" catalog)))
+          (unless (gethash msg seen-messages)
+            (xcode-project-safe-mode-line-update :message
+                                                   (format "  %s" (propertize msg 'face 'font-lock-variable-name-face)))
+            (puthash msg t seen-messages))))
+       ;; Info.plist processing
+       ((string-match "ProcessInfoPlistFile.*/\\([^/[:space:]]+\\.plist\\)" line)
+        (let* ((plist-raw (match-string 1 line))
+               (plist (xcode-project--clean-display-name plist-raw))
+               (msg (format "Processing: %s" plist)))
+          (unless (gethash msg seen-messages)
+            (xcode-project-safe-mode-line-update :message
+                                                   (format "  %s" (propertize msg 'face 'font-lock-doc-face)))
+            (puthash msg t seen-messages))))
+       ;; Copy Swift libraries
+       ((string-match "CopySwiftLibs" line)
+        (let ((msg "Copying Swift libraries"))
+          (unless (gethash msg seen-messages)
+            (xcode-project-safe-mode-line-update :message
+                                                   (format "  %s" (propertize msg 'face 'font-lock-preprocessor-face)))
+            (puthash msg t seen-messages))))
+       ;; Copy resources/files
+       ((string-match "\\bCopy\\b.*/\\([^/[:space:]]+\\)" line)
+        (let* ((filename-raw (match-string 1 line))
+               (filename (xcode-project--clean-display-name filename-raw))
+               ;; Only show meaningful copy operations (not very short names or weird patterns)
+               (is-meaningful (and filename
+                                  (>= (length filename) 3)
+                                  (not (string-match-p "^[0-9]+$" filename)))))
+          (when is-meaningful
+            (let ((msg (format "Copying: %s" filename)))
+              (unless (gethash msg seen-messages)
+                (xcode-project-safe-mode-line-update :message
+                                                       (format "  %s" (propertize msg 'face 'font-lock-comment-face)))
+                (puthash msg t seen-messages))))))
+       ;; Create build directories
+       ((or (string-match "CreateBuildDirectory" line)
+            (string-match "^MkDir " line))
+        (let ((msg "Creating build directories"))
+          (unless (gethash msg seen-messages)
+            (xcode-project-safe-mode-line-update :message
+                                                   (format "  %s" (propertize msg 'face 'font-lock-comment-face)))
+            (puthash msg t seen-messages))))
+       ;; Touch files (final build step marker)
+       ((string-match "^Touch .*/\\([^/[:space:]]+\\.app\\)" line)
+        (let* ((app-raw (match-string 1 line))
+               (app (xcode-project--clean-display-name app-raw))
+               (msg (format "Finalizing: %s" app)))
+          (unless (gethash msg seen-messages)
+            (xcode-project-safe-mode-line-update :message
+                                                   (format "  %s" (propertize msg 'face 'success)))
+            (puthash msg t seen-messages))))
        ;; Linking
        ((string-match "\\bLd\\b.*/\\([^/[:space:]]+\\)\\(?: normal\\| \\)" line)
         (let* ((filename-raw (match-string 1 line))
@@ -1464,15 +1572,20 @@ Handles escaped parentheses like \\( and \\), quotes, and other escaped characte
         (periphery-run-parser xcode-project--current-errors-or-warnings))))))
 
 (defun xcode-project-derived-data-path ()
-  "Get the actual DerivedData path by running xcodebuild -showBuildSettings."
+  "Get the actual DerivedData path by running xcodebuild -showBuildSettings.
+Returns nil if build settings cannot be retrieved."
   (let* ((default-directory (or (xcode-project-project-root) default-directory))
          (config (or xcode-project--current-build-configuration "Debug"))
          (json (xcode-project-get-build-settings-json :config config)))
-    (when json
-      (let-alist (seq-elt json 0)
-        (or .buildSettings.BUILD_DIR
-            .buildSettings.SYMROOT
-            (concat (xcode-project-project-root) "/.build"))))))
+    (if (and json (> (length json) 0))
+        (let-alist (seq-elt json 0)
+          (or .buildSettings.BUILD_DIR
+              .buildSettings.SYMROOT
+              (concat (xcode-project-project-root) "/.build")))
+      ;; Fallback when build settings unavailable
+      (let ((project-root (xcode-project-project-root)))
+        (when project-root
+          (concat project-root "/.build"))))))
 
 (defun xcode-project-target-build-directory (&optional configuration)
   "Get the build directory from xcodebuild -showBuildSettings output.

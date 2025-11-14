@@ -628,6 +628,17 @@ Calls CALLBACK with version list."
 
 (cl-defun ios-simulator-simulator-identifier (&key callback)
   "Get the booted simulator id or fetch a suitable one. If CALLBACK provided, run asynchronously."
+  ;; Validate current-simulator-id if it exists
+  (when (and current-simulator-id
+             (not (ios-simulator-device-exists-p current-simulator-id)))
+    (when ios-simulator-debug
+      (message "Cached simulator ID %s no longer exists, clearing it" current-simulator-id))
+    (when (fboundp 'xcode-project-notify)
+      (xcode-project-notify
+       :message "Saved simulator no longer available, please select a new one"
+       :seconds 3))
+    (setq current-simulator-id nil))
+
   (if callback
       ;; Asynchronous version
       (if current-simulator-id
@@ -656,6 +667,17 @@ If multiple simulators are booted, let user choose which is the main one."
     (ios-simulator-preload-cache))
 
   (let ((booted-simulators (ios-simulator-get-all-booted-simulators)))
+    ;; Validate current-simulator-id if it exists
+    (when (and current-simulator-id
+               (not (ios-simulator-device-exists-p current-simulator-id)))
+      (when ios-simulator-debug
+        (message "Saved simulator ID %s no longer exists, clearing it" current-simulator-id))
+      (when (fboundp 'xcode-project-notify)
+        (xcode-project-notify
+         :message (format "Saved simulator no longer available, please select a new one")
+         :seconds 3))
+      (setq current-simulator-id nil))
+
     (if (and current-simulator-id
              ;; Only use cached ID if a simulator is actually booted
              (or booted-simulators
@@ -792,6 +814,25 @@ Uses cached simulator data when available to improve performance."
       (ios-simulator-setup-language)
       (ios-simulator-setup-simulator-dwim device-id)
       device-id)))
+
+(defun ios-simulator-device-exists-p (device-id)
+  "Check if DEVICE-ID exists in available simulators.
+Returns t if the device exists, nil otherwise."
+  (when device-id
+    (let* ((json-data (ios-simulator-run-command-and-get-json-simple
+                       "xcrun simctl list devices available -j"))
+           (devices-dict (when json-data (cdr (assoc 'devices json-data))))
+           (found nil))
+      (when devices-dict
+        (dolist (runtime-entry devices-dict)
+          (let ((devices-list (cdr runtime-entry)))
+            (when (vectorp devices-list)
+              (mapc (lambda (device)
+                      (let ((udid (cdr (assoc 'udid device))))
+                        (when (string= udid device-id)
+                          (setq found t))))
+                    (append devices-list nil))))))
+      found)))
 
 (defun ios-simulator-get-all-booted-simulators ()
   "Get list of all currently booted simulators.
@@ -1457,6 +1498,14 @@ TERMINATE-FIRST: Whether to terminate existing app instance"
 
 ;; Auto-setup hooks when this file is loaded
 (ios-simulator-setup-hooks)
+
+(defun ios-simulator-reset-selection ()
+  "Reset the current simulator selection.
+Useful when the saved simulator no longer exists."
+  (interactive)
+  (setq current-simulator-id nil
+        ios-simulator--current-simulator-name nil)
+  (message "Simulator selection cleared. You will be prompted to choose a new one on next build."))
 
 (provide 'ios-simulator)
 
