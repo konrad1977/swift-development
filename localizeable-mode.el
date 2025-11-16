@@ -1,6 +1,14 @@
 ;;; localizeable-mode.el --- Major mode for editing .strings files -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, localization
+
 ;;; Commentary:
-;; A simple major mode for editing .strings files used in iOS/macOS localization.
+
+;; A simple major mode for editing .strings files used in iOS/macOS localization
 
 ;;; Code:
 

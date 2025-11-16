@@ -1,6 +1,13 @@
 ;;; swift-features.el --- Additional features for Swift development -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, features
+
 ;;; Commentary:
+
 ;; Provides SwiftUI preview, test coverage, and other advanced features
 
 ;;; Code:

@@ -1,6 +1,6 @@
 ;;; swiftui-preview.el --- SwiftUI preview support for swift-development -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2024
+;; Copyright (C) 2025
 
 ;; Author: Mikael Konradsson
 ;; Keywords: Swift, swiftui, preview, ios

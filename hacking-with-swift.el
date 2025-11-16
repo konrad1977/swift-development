@@ -1,7 +1,16 @@
-;;; hacking-with-swift.el --- Package for querying Hacking with Swift -*- lexical-binding: t; -*-
-;;; commentary:
+;;; hacking-with-swift.el --- Query Hacking with Swift tutorials -*- lexical-binding: t; -*-
 
-;;; code:
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1") (request "0.3.0"))
+;; Keywords: swift, documentation
+
+;;; Commentary:
+
+;; Query and browse Hacking with Swift tutorials from Emacs
+
+;;; Code:
 
 (require 'request)
 (require 'browse-url)

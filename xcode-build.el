@@ -1,9 +1,16 @@
-;;; xcode-build.el --- Simple package for building and running swift apps in Emacs -*- lexical-binding: t; -*-
+;;; xcode-build.el --- Build and run Swift apps using Xcode -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, xcode, build
 
 ;;; Commentary:
+
 ;; Run project using Xcode with optimized build settings
 
-;;; code:
+;;; Code:
 
 (require 'cl-lib)
 

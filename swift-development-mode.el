@@ -1,5 +1,11 @@
 ;;; swift-development-mode.el --- Minor mode for Swift development -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, convenience
+
 ;;; Commentary:
 
 ;; Minor mode that provides a unified keymap for Swift development across

@@ -1,6 +1,13 @@
 ;;; swift-cache.el --- Unified caching system for Swift development tools -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, cache
+
 ;;; Commentary:
+
 ;; Provides a unified caching system for Swift/Xcode development tools
 
 ;;; Code:

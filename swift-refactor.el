@@ -1,4 +1,15 @@
-;;; swift-refactor.el --- A small package for refactoring -*- lexical-binding: t -*-
+;;; swift-refactor.el --- Swift code refactoring utilities -*- lexical-binding: t -*-
+
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, refactoring
+
+;;; Commentary:
+
+;; Provides refactoring tools for Swift code
+
 ;;; Code:
 
 (defgroup swift-refactor nil

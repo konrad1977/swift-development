@@ -1,5 +1,15 @@
-;;; Simulator --- A small package for viewing iOS simulator logs -*- lexical-binding: t -*-
-;;; Commentary: This package provides some support for iOS Simulator
+;;; ios-simulator.el --- iOS Simulator management and control -*- lexical-binding: t -*-
+
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, ios, simulator
+
+;;; Commentary:
+
+;; This package provides iOS Simulator management, log viewing, and device control
+
 ;;; Code:
 
 (require 'nerd-icons nil t)

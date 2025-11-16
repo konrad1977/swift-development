@@ -1,7 +1,14 @@
 ;;; swift-project.el --- Swift project management utilities -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, project
+
 ;;; Commentary:
-;;; Helper function for setting up project root
+
+;; Helper functions for Swift project detection and root management
 
 ;;; Code:
 

@@ -1,6 +1,16 @@
-;;; xcode-project.el --- package for compiling and running swift apps in  -*- lexical-binding: t; -*-
-;;; commentary:
-;;; code:
+;;; xcode-project.el --- Xcode project management and build control -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, ios, xcode
+
+;;; Commentary:
+
+;; Xcode project management, build control, and notification system
+
+;;; Code:
 
 (require 'project)
 (require 'xcodebuildserver)

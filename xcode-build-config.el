@@ -1,6 +1,13 @@
 ;;; xcode-build-config.el --- Xcode build configuration and command construction -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, xcode, build
+
 ;;; Commentary:
+
 ;; This module handles all build configuration, command construction,
 ;; environment setup, and build flags for Xcode builds.
 ;; Extracted from swift-development.el for better modularity.

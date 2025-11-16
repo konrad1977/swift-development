@@ -1,6 +1,13 @@
 ;;; swift-error-handler.el --- Enhanced error handling for Swift development tools -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, errors
+
 ;;; Commentary:
+
 ;; Provides comprehensive error handling and recovery for Swift/Xcode development
 
 ;;; Code:

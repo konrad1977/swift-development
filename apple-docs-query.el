@@ -1,6 +1,16 @@
-;;; apple-docs-query.el --- package for querying Apple Docs using completing-read -*- lexical-binding: t; -*-
-;;; commentary:
-;;; code:
+;;; apple-docs-query.el --- Query Apple Developer Documentation -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, documentation
+
+;;; Commentary:
+
+;; Query Apple Developer Documentation from Emacs
+
+;;; Code:
 
 (defconst apple-developer-url "https://developer.apple.com"
   "Developer apple site.")

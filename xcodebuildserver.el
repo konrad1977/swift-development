@@ -1,8 +1,16 @@
-;;; xcodebuildserver.el --- package for automate setup of xcode-build-server -*- lexical-binding: t; -*-
+;;; xcodebuildserver.el --- Automated xcode-build-server setup -*- lexical-binding: t; -*-
 
-;;; commentary:
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, xcode, lsp
 
-;;; code:
+;;; Commentary:
+
+;; Automated setup and configuration for xcode-build-server LSP integration
+
+;;; Code:
 ;; Optional dependency
 (defvar mode-line-hud-available-p (require 'mode-line-hud nil t)
   "Whether mode-line-hud is available.")

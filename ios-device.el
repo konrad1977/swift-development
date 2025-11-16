@@ -1,8 +1,14 @@
-;;; ios-device.el --- package for compiling and running swift apps in emacs -*- lexical-binding: t; -*-
+;;; ios-device.el --- iOS physical device management -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, ios, device
 
 ;;; Commentary:
 
-;;; Package for handling an iOS device.
+;; Package for handling iOS physical devices - installation, launching, and logs
 
 ;;; Code:
 

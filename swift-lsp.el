@@ -1,5 +1,14 @@
-;;; swift-lsp --- Language Server Protocol (LSP) support for Swift -*- lexical-binding: t; -*-
+;;; swift-lsp.el --- Language Server Protocol (LSP) support for Swift -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2025 Mikael Konradsson
+;; Author: Mikael Konradsson
+;; Version: 1.0
+;; Package-Requires: ((emacs "28.1"))
+;; Keywords: swift, lsp
+
 ;;; Commentary:
+
+;; LSP support and configuration for Swift development
 
 ;;; Code:
 (require 'cl-lib) ;; Ensure cl-lib is available for cl-pushnew
