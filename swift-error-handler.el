@@ -40,6 +40,15 @@
 (defvar swift-error-handler--retry-table (make-hash-table :test 'equal)
   "Table tracking retry counts for operations.")
 
+(defun swift-error-handler-cleanup-global-state ()
+  "Clean up global state to prevent memory leaks."
+  (interactive)
+  (when (hash-table-p swift-error-handler--retry-table)
+    (clrhash swift-error-handler--retry-table)))
+
+;; Register cleanup on Emacs exit
+(add-hook 'kill-emacs-hook #'swift-error-handler-cleanup-global-state)
+
 ;; Error types
 (cl-defstruct swift-error
   "Swift error structure."
@@ -65,30 +74,43 @@
       (when (swift-error-recoverable-p error-obj)
         (insert "  [Recoverable]\n")))))
 
+(defun swift-error-handler--retry-async (operation-id max-tries body-fn callback)
+  "Internal function to handle async retry for OPERATION-ID.
+MAX-TRIES is max attempts, BODY-FN is the function to execute,
+CALLBACK is called with the result on success."
+  (let ((retry-count (or (gethash operation-id swift-error-handler--retry-table) 0)))
+    (condition-case err
+        (let ((result (funcall body-fn)))
+          (remhash operation-id swift-error-handler--retry-table)
+          (when callback (funcall callback result))
+          result)
+      (error
+       (if (< retry-count max-tries)
+           (progn
+             (puthash operation-id (1+ retry-count) swift-error-handler--retry-table)
+             (message "Operation %s failed (attempt %d/%d): %s. Retrying in %ds..."
+                      operation-id (1+ retry-count) max-tries
+                      (error-message-string err)
+                      swift-error-handler-retry-delay)
+             ;; Use run-with-timer instead of blocking sit-for
+             (run-with-timer swift-error-handler-retry-delay nil
+                             #'swift-error-handler--retry-async
+                             operation-id max-tries body-fn callback))
+         (progn
+           (remhash operation-id swift-error-handler--retry-table)
+           (signal (car err) (cdr err))))))))
+
 (defmacro swift-error-handler-with-retry (operation-id max-retries &rest body)
   "Execute BODY with automatic retry on failure.
 OPERATION-ID uniquely identifies the operation.
-MAX-RETRIES specifies maximum retry attempts."
+MAX-RETRIES specifies maximum retry attempts.
+Note: This is now non-blocking and uses timers for delays."
   (declare (indent 2))
-  `(cl-block retry-block
-     (let ((retry-count (or (gethash ,operation-id swift-error-handler--retry-table) 0))
-           (max-tries (or ,max-retries swift-error-handler-max-retries)))
-       (condition-case err
-           (progn
-             (remhash ,operation-id swift-error-handler--retry-table)
-             ,@body)
-         (error
-          (if (< retry-count max-tries)
-              (progn
-                (puthash ,operation-id (1+ retry-count) swift-error-handler--retry-table)
-                (message "Operation %s failed (attempt %d/%d): %s. Retrying..."
-                         ,operation-id (1+ retry-count) max-tries
-                         (error-message-string err))
-                (sit-for swift-error-handler-retry-delay)
-                (swift-error-handler-with-retry ,operation-id ,max-retries ,@body))
-            (progn
-              (remhash ,operation-id swift-error-handler--retry-table)
-              (signal (car err) (cdr err)))))))))
+  `(swift-error-handler--retry-async
+    ,operation-id
+    (or ,max-retries swift-error-handler-max-retries)
+    (lambda () ,@body)
+    nil))
 
 (defun swift-error-handler-handle (error-obj)
   "Handle ERROR-OBJ with appropriate recovery strategy."
@@ -149,9 +171,11 @@ MAX-RETRIES specifies maximum retry attempts."
                    :recovery-fn (lambda ()
                                  (message "Shutting down all simulators...")
                                  (call-process-shell-command "xcrun simctl shutdown all")
-                                 (sit-for 2)
-                                 (message "Retrying simulator boot...")
-                                 (ios-simulator-boot-simulator-with-id simulator-id)))))
+                                 ;; Use timer instead of blocking sit-for
+                                 (run-with-timer 2 nil
+                                                 (lambda ()
+                                                   (message "Retrying simulator boot...")
+                                                   (ios-simulator-boot-simulator-with-id simulator-id)))))))
     (swift-error-handler-handle error-obj)))
 
 (defun swift-error-handler-app-install-failed (app-path device-id)
@@ -164,13 +188,14 @@ MAX-RETRIES specifies maximum retry attempts."
                    :recoverable-p t
                    :recovery-fn (lambda ()
                                  (when (yes-or-no-p "Uninstall existing app and retry?")
-                                   (call-process-shell-command 
+                                   (call-process-shell-command
                                     (format "xcrun simctl uninstall %s %s"
-                                            device-id
-                                            (xcode-project-fetch-or-load-app-identifier)))
-                                   (sit-for 1)
-                                   ;; Retry installation
-                                   (message "Retrying installation..."))))))
+                                            (shell-quote-argument device-id)
+                                            (shell-quote-argument (xcode-project-fetch-or-load-app-identifier))))
+                                   ;; Use timer instead of blocking sit-for
+                                   (run-with-timer 1 nil
+                                                   (lambda ()
+                                                     (message "Retrying installation..."))))))))
     (swift-error-handler-handle error-obj)))
 
 (defun swift-error-handler-validate-environment ()

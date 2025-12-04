@@ -124,8 +124,27 @@
 
 (defun ios-simulator-cleanup ()
   "Clean up simulator resources."
-  (when ios-simulator--installation-process
-    (delete-process ios-simulator--installation-process)))
+  (when (and ios-simulator--installation-process
+             (process-live-p ios-simulator--installation-process))
+    (delete-process ios-simulator--installation-process))
+  (setq ios-simulator--installation-process nil))
+
+(defun ios-simulator-cleanup-global-state ()
+  "Clean up global hash tables to prevent memory leaks.
+This is called on `kill-emacs-hook' to ensure proper cleanup."
+  (interactive)
+  (when (hash-table-p ios-simulator--active-simulators)
+    (clrhash ios-simulator--active-simulators))
+  (when (hash-table-p ios-simulator--simulator-buffers)
+    (clrhash ios-simulator--simulator-buffers))
+  ;; Clear legacy cache variables
+  (setq ios-simulator--cached-devices nil
+        ios-simulator--cache-timestamp nil
+        ios-simulator--target-simulators nil)
+  (message "iOS Simulator global state cleaned up"))
+
+;; Register cleanup on Emacs exit
+(add-hook 'kill-emacs-hook #'ios-simulator-cleanup-global-state)
 
 (defun ios-simulator-reset (&optional choose-new-simulator)
   "Reset current settings.
@@ -451,7 +470,7 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
   (when (fboundp 'xcode-project-notify)
     (xcode-project-notify
      :message (format "No simulator running. Booting device id: %s..." (propertize id 'face 'font-lock-constant-face))))
-  (format "xcrun simctl boot %s" id))
+  (format "xcrun simctl boot %s" (shell-quote-argument id)))
 
 (cl-defun ios-simulator-is-simulator-app-running (&key callback)
   "Check if simulator is running.
@@ -466,10 +485,9 @@ If CALLBACK provided, run asynchronously."
                    (when (string= event "finished\n")
                      (let ((buf (process-buffer proc)))
                        (when (buffer-live-p buf)
-                         (with-current-buffer buf
-                           (let ((output (buffer-string)))
-                             (kill-buffer)
-                             (funcall callback (not (string= "" output))))))))))
+                         (let ((output (with-current-buffer buf (buffer-string))))
+                           (kill-buffer buf)
+                           (funcall callback (not (string= "" output)))))))))
     ;; Synchronous fallback
     (let ((output (shell-command-to-string "ps ax | grep -v grep | grep Simulator.app")))
       (not (string= "" output)))))
@@ -480,20 +498,19 @@ If CALLBACK provided, run asynchronously."
   (if callback
       (make-process
        :name "simulator-name"
-       :command (list "sh" "-c" (format "xcrun simctl list devices | grep %s | awk -F \"(\" '{ print $1 }'" id))
+       :command (list "sh" "-c" (format "xcrun simctl list devices | grep %s | awk -F \"(\" '{ print $1 }'" (shell-quote-argument id)))
        :noquery t
        :buffer " *simulator-name-temp*"
        :sentinel (lambda (proc event)
                    (when (string= event "finished\n")
                      (let ((buf (process-buffer proc)))
                        (when (buffer-live-p buf)
-                         (with-current-buffer buf
-                           (let ((result (string-trim (buffer-string))))
-                             (kill-buffer)
-                             (funcall callback result))))))))
+                         (let ((result (string-trim (with-current-buffer buf (buffer-string)))))
+                           (kill-buffer buf)
+                           (funcall callback result)))))))
     ;; Synchronous fallback
     (string-trim
-     (shell-command-to-string (format "xcrun simctl list devices | grep %s | awk -F \"(\" '{ print $1 }'" id)))))
+     (shell-command-to-string (format "xcrun simctl list devices | grep %s | awk -F \"(\" '{ print $1 }'" (shell-quote-argument id))))))
 
 (defun ios-simulator-available-simulators ()
   "List available simulators with iOS version displayed."
@@ -884,10 +901,9 @@ Returns list of (name . id) pairs."
                    (when (string= event "finished\n")
                      (let ((buf (process-buffer proc)))
                        (when (buffer-live-p buf)
-                         (with-current-buffer buf
-                           (let ((device-id (string-trim (buffer-string))))
-                             (kill-buffer)
-                             (funcall callback (if (string= "" device-id) nil device-id)))))))))
+                         (let ((device-id (string-trim (with-current-buffer buf (buffer-string)))))
+                           (kill-buffer buf)
+                           (funcall callback (if (string= "" device-id) nil device-id))))))))
     ;; Synchronous fallback
     (let ((device-id (shell-command-to-string ios-simulator-get-booted-simulator-command)))
       (if (not (string= "" device-id))
@@ -993,15 +1009,15 @@ If TERMINATE-RUNNING is non-nil, terminate any running instance before launching
                (when (string= event "finished\n")
                  (let ((buf (process-buffer proc)))
                    (when (buffer-live-p buf)
-                     (with-current-buffer buf
-                       (let ((json-data (condition-case err
-                                            (json-read-from-string (buffer-string))
-                                          (error
-                                           (message "Failed to parse JSON: %s" err)
-                                           nil))))
-                         (kill-buffer)
-                         (when callback
-                           (funcall callback json-data))))))))))
+                     (let ((json-data (condition-case err
+                                          (json-read-from-string
+                                           (with-current-buffer buf (buffer-string)))
+                                        (error
+                                         (message "Failed to parse JSON: %s" err)
+                                         nil))))
+                       (kill-buffer buf)
+                       (when callback
+                         (funcall callback json-data)))))))))
 
 (defun ios-simulator-run-command-and-get-json-simple (command)
   "Run a shell COMMAND and return JSON. Simple synchronous version with timeout.
@@ -1053,8 +1069,11 @@ The command should be fast (<0.3s) but we add a 5s timeout as safety measure."
                              (string-trim
                               (concat
                                (if simulatorID
-                                   (format "xcrun simctl terminate %s %s" simulatorID appIdentifier)
-                                 (format "xcrun simctl terminate booted %s" appIdentifier))))))
+                                   (format "xcrun simctl terminate %s %s"
+                                           (shell-quote-argument simulatorID)
+                                           (shell-quote-argument appIdentifier))
+                                 (format "xcrun simctl terminate booted %s"
+                                         (shell-quote-argument appIdentifier)))))))
 
 (defun ios-simulator-send-notification ()
   "Send a notification to the current simulator and app."
@@ -1064,25 +1083,36 @@ The command should be fast (<0.3s) but we add a 5s timeout as safety measure."
   (unless xcode-project--current-app-identifier
     (error "No app selected"))
 
-  (let* ((text (read-string "Notification text: "))
-         (payload (format "{\"aps\":{\"alert\":\"%s\",\"sound\":\"default\"}}" text))
-         (temp-file (make-temp-file "ios-notification" nil ".json" payload)))
+  (let* ((text (read-string "Notification text: ")))
     (when (and text (not (string-empty-p text)))
-      (let ((command (format "xcrun simctl push %s %s %s"
-                            current-simulator-id
-                            xcode-project--current-app-identifier
-                            temp-file)))
-        (async-shell-command command)
-        (run-at-time 2 nil (lambda () (delete-file temp-file)))
-      (message "Notification sent to %s" current-app-name)))))
+      (let* ((payload (json-encode `((aps . ((alert . ,text) (sound . "default"))))))
+             (temp-file (make-temp-file "ios-notification" nil ".json" payload))
+             (sim-id current-simulator-id)
+             (app-id xcode-project--current-app-identifier)
+             (app-name current-app-name))
+        (make-process
+         :name "ios-notification-push"
+         :command (list "xcrun" "simctl" "push" sim-id app-id temp-file)
+         :noquery t
+         :sentinel (lambda (proc event)
+                     (unwind-protect
+                         (when (string-match-p "finished" event)
+                           (message "Notification sent to %s" app-name))
+                       ;; Always cleanup temp file
+                       (when (file-exists-p temp-file)
+                         (condition-case nil
+                             (delete-file temp-file)
+                           (file-error nil))))))))))
 
 (defun ios-simulator-appcontainer ()
   "Get the app container of the current app (as SIMULATORID, APPIDENTIFIER)."
   (interactive)
   (if-let* ((identifier xcode-project--current-app-identifier)
            (id current-simulator-id)
-           (command (shell-command-to-string (format "xcrun simctl get_app_container %s %s data" id identifier))))
-      (async-shell-command (concat "open " command))))
+           (command (shell-command-to-string (format "xcrun simctl get_app_container %s %s data"
+                                                     (shell-quote-argument id)
+                                                     (shell-quote-argument identifier)))))
+      (async-shell-command (concat "open " (shell-quote-argument (string-trim command))))))
 
 (defun ios-simulator-fetch-available-simulators ()
   "List available simulators, using persistent device-cache if valid."
@@ -1465,7 +1495,9 @@ TERMINATE-FIRST: Whether to terminate existing app instance"
   (when-let* ((info (gethash simulator-id ios-simulator--active-simulators))
               (app-id (plist-get info :app-identifier)))
     (call-process-shell-command
-     (format "xcrun simctl terminate %s %s" simulator-id app-id))
+     (format "xcrun simctl terminate %s %s"
+             (shell-quote-argument simulator-id)
+             (shell-quote-argument app-id)))
     (message "Terminated app on simulator: %s" (plist-get info :name))))
 
 ;;;###autoload
@@ -1480,7 +1512,7 @@ TERMINATE-FIRST: Whether to terminate existing app instance"
                            sims)
                          nil t)))
   (when-let* ((info (gethash simulator-id ios-simulator--active-simulators)))
-    (call-process-shell-command (format "xcrun simctl shutdown %s" simulator-id))
+    (call-process-shell-command (format "xcrun simctl shutdown %s" (shell-quote-argument simulator-id)))
     (remhash simulator-id ios-simulator--active-simulators)
     (remhash simulator-id ios-simulator--simulator-buffers)
     (message "Shutdown simulator: %s" (plist-get info :name))))

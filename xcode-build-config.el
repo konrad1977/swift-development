@@ -547,9 +547,10 @@ If FOR-DEVICE is non-nil, setup for device build (with signing), otherwise for s
       "env /usr/bin/arch -x86_64 xcrun xcodebuild build"
     "xcrun xcodebuild build"))
 
-(cl-defun xcode-build-config-build-app-command (&key sim-id derived-path)
+(cl-defun xcode-build-config-build-app-command (&key sim-id device-id derived-path)
   "Generate optimized xcodebuild command with aggressive parallelization and CocoaPods support.
-SIM-ID is the simulator identifier, DERIVED-PATH is the derived data path."
+SIM-ID is the simulator identifier, DEVICE-ID is the physical device identifier,
+DERIVED-PATH is the derived data path."
   (if xcode-build-config--current-build-command
       xcode-build-config--current-build-command
     (let ((workspace-or-project (xcode-project-get-workspace-or-project)))
@@ -572,8 +573,11 @@ SIM-ID is the simulator identifier, DERIVED-PATH is the derived data path."
                         "-parallelizeTargets"
                         (format "-jobs %d" (* (num-processors) xcode-build-config-parallel-jobs-multiplier))
                         ;; Destination
-                        (when sim-id
+                        (cond
+                         (sim-id
                           (format "-destination 'platform=iOS Simulator,id=%s'" sim-id))
+                         (device-id
+                          (format "-destination 'platform=iOS,id=%s'" device-id)))
                         ;; Configuration if specified
                         (when xcode-build-config-default-configuration
                           (format "-configuration %s" xcode-build-config-default-configuration))

@@ -288,7 +288,9 @@ Always generates preview for the currently active Swift buffer."
 
     ;; Delete old preview file if it exists
     (when (file-exists-p swiftui-preview--current-preview-path)
-      (delete-file swiftui-preview--current-preview-path))
+      (condition-case nil
+          (delete-file swiftui-preview--current-preview-path)
+        (file-error nil)))
 
     ;; Get view name for dynamic registry update
     (let* ((view-name (file-name-sans-extension
@@ -711,10 +713,15 @@ Keep app running and automatically update preview when code changes."
          (count 0))
     (when project-root
       (dolist (file (directory-files-recursively project-root "\\.PreviewWrappers\\.swift$"))
-        (delete-file file)
-        (setq count (1+ count))
-        (when swiftui-preview-debug
-          (message "[SwiftUI Preview] Deleted wrapper file: %s" file)))
+        (condition-case err
+            (progn
+              (delete-file file)
+              (setq count (1+ count))
+              (when swiftui-preview-debug
+                (message "[SwiftUI Preview] Deleted wrapper file: %s" file)))
+          (file-error
+           (when swiftui-preview-debug
+             (message "[SwiftUI Preview] Could not delete %s: %s" file (error-message-string err))))))
       (if (> count 0)
           (message "Cleaned %d wrapper file(s)" count)
         (message "No wrapper files found")))))
@@ -730,12 +737,19 @@ Keep app running and automatically update preview when code changes."
       ;; Clear preview images
       (when (file-exists-p preview-dir)
         (dolist (file (directory-files preview-dir t "\\.png$"))
-          (delete-file file)))
+          (condition-case nil
+              (delete-file file)
+            (file-error nil))))
       ;; Clear wrapper files (*.PreviewWrappers.swift)
       (dolist (file (directory-files-recursively project-root "\\.PreviewWrappers\\.swift$"))
-        (delete-file file)
-        (when swiftui-preview-debug
-          (message "[SwiftUI Preview] Deleted wrapper file: %s" file)))
+        (condition-case err
+            (progn
+              (delete-file file)
+              (when swiftui-preview-debug
+                (message "[SwiftUI Preview] Deleted wrapper file: %s" file)))
+          (file-error
+           (when swiftui-preview-debug
+             (message "[SwiftUI Preview] Could not delete %s: %s" file (error-message-string err))))))
       (message "Cleared all preview images and wrapper files"))))
 
 ;;;###autoload

@@ -11,6 +11,9 @@
 ;; Automated setup and configuration for xcode-build-server LSP integration
 
 ;;; Code:
+
+(require 'cl-lib)
+
 ;; Optional dependency
 (defvar mode-line-hud-available-p (require 'mode-line-hud nil t)
   "Whether mode-line-hud is available.")

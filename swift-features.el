@@ -151,12 +151,14 @@
 (defun swift-features-launch-on-simulator (simulator-id)
   "Launch app on specific SIMULATOR-ID."
   (ios-simulator-boot-simulator-with-id simulator-id)
-  (sit-for 2)
-  (ios-simulator-install-and-run-app
-   :rootfolder (xcode-project-project-root)
-   :build-folder (xcode-project-build-folder :device-type :simulator)
-   :simulatorId simulator-id
-   :appIdentifier (xcode-project-fetch-or-load-app-identifier)))
+  ;; Use timer instead of blocking sit-for to wait for simulator to boot
+  (run-with-timer 2 nil
+                  (lambda ()
+                    (ios-simulator-install-and-run-app
+                     :rootfolder (xcode-project-project-root)
+                     :build-folder (xcode-project-build-folder :device-type :simulator)
+                     :simulatorId simulator-id
+                     :appIdentifier (xcode-project-fetch-or-load-app-identifier)))))
 
 (defun swift-features-terminate-all-simulators ()
   "Terminate app on all active simulators."

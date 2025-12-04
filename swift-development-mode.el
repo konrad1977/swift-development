@@ -52,7 +52,7 @@
     ;; Xcode Commands
     (define-key map (kbd "M-K") #'xcode-project-clean-build-folder)
     (define-key map (kbd "C-c C-d") #'xcode-project-start-debugging)
-    (define-key map (kbd "C-c x t") #'xcode-project-toggle-device-choice)
+    (define-key map (kbd "C-c x t") #'swift-development-toggle-device-choice)
     (define-key map (kbd "C-c x c") #'xcode-project-show-current-configuration)
 
     ;; Refactoring Commands

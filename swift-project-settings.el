@@ -294,10 +294,20 @@ This is called when opening a project to restore previous selections."
             (when swift-project-settings-debug
               (message "[Settings] Restored app-identifier: %s" app-id)))
 
-          (when-let ((build-folder (plist-get settings :build-folder)))
-            (setq xcode-project--current-build-folder build-folder)
-            (when swift-project-settings-debug
-              (message "[Settings] Restored build-folder: %s" build-folder)))
+          ;; NOTE: We intentionally do NOT restore build-folder from settings.
+          ;; The build folder depends on the device type (simulator vs device)
+          ;; and should be auto-detected by xcode-project-build-folder based on
+          ;; the current device-type. Restoring a stale folder causes issues
+          ;; when switching between simulator and physical device.
+
+          ;; Restore device choice (physical device vs simulator)
+          (when (boundp 'swift-development--device-choice)
+            (when-let ((platform (plist-get settings :platform)))
+              (setq swift-development--device-choice
+                    (string= platform "Physical Device"))
+              (when swift-project-settings-debug
+                (message "[Settings] Restored platform: %s (device-choice=%s)"
+                         platform swift-development--device-choice))))
 
           ;; Restore simulator selection (if variables exist)
           (when (boundp 'ios-simulator--current-simulator-name)
@@ -352,23 +362,31 @@ IMPORTANT: Clears build-related variables first to prevent leaking between schem
         (when-let ((app-id (plist-get settings :app-identifier)))
           (setq xcode-project--current-app-identifier app-id))
 
-        (when-let ((build-folder (plist-get settings :build-folder)))
-          (setq xcode-project--current-build-folder build-folder))
+        ;; NOTE: Do NOT restore build-folder - let it be auto-detected based on device type
 
-        (when (boundp 'ios-simulator--current-simulator-name)
-          (when-let ((device-name (plist-get settings :device-name)))
-            (setq ios-simulator--current-simulator-name device-name)))
+        ;; Restore device choice (physical device vs simulator)
+        (when (boundp 'swift-development--device-choice)
+          (when-let ((platform (plist-get settings :platform)))
+            (setq swift-development--device-choice
+                  (string= platform "Physical Device"))))
 
-        (when (boundp 'current-simulator-id)
-          (when-let ((device-id (plist-get settings :device-id)))
-            ;; Validate that the device still exists before restoring
-            (if (and (fboundp 'ios-simulator-device-exists-p)
-                     (ios-simulator-device-exists-p device-id))
-                (setq current-simulator-id device-id)
-              (progn
-                (when swift-project-settings-debug
-                  (message "[Settings] Saved device-id %s no longer exists, skipping restore" device-id))
-                (setq current-simulator-id nil))))))
+        ;; Only restore device settings if user hasn't already selected a simulator
+        ;; This prevents overwriting manual simulator selection after reset
+        (unless (and (boundp 'current-simulator-id) current-simulator-id)
+          (when (boundp 'ios-simulator--current-simulator-name)
+            (when-let ((device-name (plist-get settings :device-name)))
+              (setq ios-simulator--current-simulator-name device-name)))
+
+          (when (boundp 'current-simulator-id)
+            (when-let ((device-id (plist-get settings :device-id)))
+              ;; Validate that the device still exists before restoring
+              (if (and (fboundp 'ios-simulator-device-exists-p)
+                       (ios-simulator-device-exists-p device-id))
+                  (setq current-simulator-id device-id)
+                (progn
+                  (when swift-project-settings-debug
+                    (message "[Settings] Saved device-id %s no longer exists, skipping restore" device-id))
+                  (setq current-simulator-id nil)))))))
 
       ;; Always try to load build-config from scheme file if not set
       ;; This handles both: settings exist but lack build-config, or no settings at all
@@ -399,7 +417,8 @@ IMPORTANT: Clears build-related variables first to prevent leaking between schem
   "Capture current Emacs variables and save as settings for PROJECT-ROOT.
 Only updates fields that have non-nil values, preserving existing saved values.
 Saves to scheme-specific file if a scheme is set.
-Also saves the current scheme as 'last-scheme' in the base settings file."
+Also saves the current scheme as 'last-scheme' in the base settings file.
+IMPORTANT: Device-specific settings are ONLY saved to scheme-specific files."
   ;; Get current scheme from buffer-local variable
   (let* ((current-scheme xcode-project--current-xcode-scheme)
          ;; Load existing settings for this scheme
@@ -409,29 +428,35 @@ Also saves the current scheme as 'last-scheme' in the base settings file."
     (when current-scheme
       (setq settings (plist-put settings :scheme current-scheme)))
 
-    (when (and (boundp 'ios-simulator--current-simulator-name)
-               ios-simulator--current-simulator-name)
-      (setq settings (plist-put settings :device-name ios-simulator--current-simulator-name)))
+    ;; Device-specific settings - ONLY save if we have a scheme
+    ;; This prevents device info from being saved to the base settings file
+    (when current-scheme
+      (when (and (boundp 'ios-simulator--current-simulator-name)
+                 ios-simulator--current-simulator-name)
+        (setq settings (plist-put settings :device-name ios-simulator--current-simulator-name)))
 
-    (when (and (boundp 'current-simulator-id)
-               current-simulator-id)
-      (setq settings (plist-put settings :device-id current-simulator-id)))
+      (when (and (boundp 'current-simulator-id)
+                 current-simulator-id)
+        (setq settings (plist-put settings :device-id current-simulator-id)))
 
-    (when xcode-project--device-choice
-      (setq settings (plist-put settings :platform
-                                (if (eq xcode-project--device-choice 'device)
-                                    "Physical Device"
-                                  "iOS Simulator"))))
+      (when swift-development--device-choice
+        (setq settings (plist-put settings :platform
+                                  (if swift-development--device-choice
+                                      "Physical Device"
+                                    "iOS Simulator"))))
 
-    (when xcode-project--current-build-configuration
-      (setq settings (plist-put settings :build-config xcode-project--current-build-configuration)))
+      (when xcode-project--current-build-configuration
+        (setq settings (plist-put settings :build-config xcode-project--current-build-configuration)))
 
-    (when xcode-project--current-app-identifier
-      (setq settings (plist-put settings :app-identifier xcode-project--current-app-identifier)))
+      (when xcode-project--current-app-identifier
+        (setq settings (plist-put settings :app-identifier xcode-project--current-app-identifier)))
 
-    (when xcode-project--current-build-folder
-      (setq settings (plist-put settings :build-folder xcode-project--current-build-folder)))
+      ;; NOTE: We intentionally do NOT save build-folder to settings.
+      ;; Build folder is device-type dependent (iphoneos vs iphonesimulator)
+      ;; and should be auto-detected by xcode-project-build-folder.
+      )
 
+    ;; Project file can be saved regardless of scheme
     (let ((project-file (swift-project-settings--get-project-file project-root)))
       (when project-file
         (setq settings (plist-put settings :project-file project-file))))
@@ -439,17 +464,28 @@ Also saves the current scheme as 'last-scheme' in the base settings file."
     (when swift-project-settings-debug
       (message "[Settings] Capturing settings for scheme '%s': %S" current-scheme settings))
 
-    ;; Save with scheme parameter so it goes to settings-<scheme> file
-    (swift-project-settings-save project-root settings current-scheme)
-
-    ;; Also save the current scheme as "last-scheme" in base settings file
-    ;; This allows us to remember which scheme was used last
+    ;; Only save if we have a scheme - don't pollute base settings with device info
     (when current-scheme
+      (swift-project-settings-save project-root settings current-scheme)
+
+      ;; Also save the current scheme as "last-scheme" in base settings file
+      ;; This allows us to remember which scheme was used last
+      ;; IMPORTANT: Only save :last-scheme and :project-file to base, NOT device info
       (let ((base-settings (or (swift-project-settings-load project-root nil) (list))))
+        ;; Remove device-related keys from base settings to keep it clean
         (setq base-settings (plist-put base-settings :last-scheme current-scheme))
+        (setq base-settings (map-delete base-settings :device-name))
+        (setq base-settings (map-delete base-settings :device-id))
+        (setq base-settings (map-delete base-settings :platform))
+        (setq base-settings (map-delete base-settings :build-config))
+        (setq base-settings (map-delete base-settings :app-identifier))
+        (setq base-settings (map-delete base-settings :build-folder))
+        (let ((project-file (swift-project-settings--get-project-file project-root)))
+          (when project-file
+            (setq base-settings (plist-put base-settings :project-file project-file))))
         (swift-project-settings-save project-root base-settings nil)
         (when swift-project-settings-debug
-          (message "[Settings] Saved last-scheme: %s" current-scheme))))))
+          (message "[Settings] Saved last-scheme: %s (cleaned base settings)" current-scheme))))))
 
 ;;; Diagnostics
 

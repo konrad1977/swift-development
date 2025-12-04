@@ -14,6 +14,7 @@
 
 (require 'periphery-helper nil t)
 (require 'cl-lib)
+(require 'json)
 
 (defgroup ios-device nil
   "Customization group for ios-device package."
@@ -31,6 +32,8 @@
 
 (defvar ios-device--current-buffer-name nil)
 (defvar ios-device--current-device-id nil)
+(defvar ios-device--current-device-udid nil
+  "Cached UDID for xcodebuild (different from CoreDevice UUID).")
 (defvar ios-device--current-install-command nil)
 (defvar ios-device--current-app-identifier nil)
 (defvar ios-device--current-buffer nil)
@@ -111,39 +114,20 @@
   "Generate run command for device (IDENTIFIER APPIDENTIFIER)."
   (when ios-device-debug
     (message "xcrun devicectl device process launch --terminate-existing --device %s %s" identifier appIdentifier))
-  (format "sh -c '\
-    xcrun devicectl device process launch --terminate-existing --console --device %s %s & \
-    wait'"
+  (format "xcrun devicectl device process launch --terminate-existing --console --device %s %s"
           identifier
-          appIdentifier
-          identifier
-          appIdentifier
-          identifier
-          (file-name-base appIdentifier)))
+          appIdentifier))
 
 (defun ios-device-reset()
   "Reset the iOS device."
   (ios-device-kill-buffer)
   (setq ios-device--current-buffer-name nil)
   (setq ios-device--current-device-id nil)
+  (setq ios-device--current-device-udid nil)
   (setq ios-device--current-install-command nil)
   (setq ios-device--current-app-identifier nil)
   (setq ios-device--current-buffer nil))
 
-(defun ios-device-reset-privacy ()
-  "Reset all privacy settings for the booted iOS simulator."
-  (interactive)
-  (let ((command "xcrun simctl privacy booted reset all"))
-    (message "Resetting privacy settings for booted simulator...")
-    (shell-command command)
-    (message "Privacy settings reset successfully")))
-
-(defun ios-device-clear-cache ()
-  "Clear cache and data for the booted iOS simulator."
-  (interactive)
-  (message "Clearing simulator cache...")
-  (shell-command "xcrun simctl erase booted")
-  (message "Simulator cache cleared - device has been erased"))
 
 (defun ios-device-cleanup ()
   "Cleanup function to terminate the app when the buffer is closed."
@@ -162,12 +146,18 @@
     (setq ios-device--current-app-identifier nil)))
 
 (cl-defun ios-device-install-app-async (&key buildfolder &key appIdentifier)
-  "Install app on device (PROJECT-ROOT BUILDFOLDER APPNAME)."
+  "Install app on device from BUILDFOLDER with APPIDENTIFIER."
   (ios-device-kill-buffer)
   (let* ((default-directory buildfolder)
          (identifier (ios-device-identifier))
-         (buffer (get-buffer-create (concat ios-device-buffer-name appname "*"))))
+         (appname (ios-device-app-name-from :buildfolder buildfolder))
+         (app-path (expand-file-name (concat appname ".app") buildfolder))
+         (buffer (get-buffer-create (concat ios-device-buffer-name appname "*")))
+         (command (format "xcrun devicectl device install app --device %s %s"
+                          (shell-quote-argument identifier)
+                          (shell-quote-argument app-path))))
     (setq ios-device--current-buffer-name buffer)
+    (setq ios-device--current-app-identifier appIdentifier)
     (async-shell-command command buffer)))
 
 (cl-defun ios-device-app-name-from (&key buildfolder)
@@ -227,6 +217,58 @@ Each device is represented as a plist with :name, :hostname, :identifier, :state
             (when selected-device
               (plist-get selected-device :identifier)))))))))
 
+(defun ios-device-parse-xctrace-devices ()
+  "Parse xctrace output and return a list of physical iOS devices with UDIDs.
+Each device is a plist with :name, :version, and :udid.
+This returns the UDID format that xcodebuild expects."
+  (let ((output (shell-command-to-string "xcrun xctrace list devices 2>/dev/null"))
+        (devices '())
+        (in-devices-section nil))
+    (dolist (line (split-string output "\n"))
+      ;; Track sections - only parse "== Devices ==" section
+      (cond
+       ((string-match "^== Devices ==" line)
+        (setq in-devices-section t))
+       ((string-match "^== " line)
+        (setq in-devices-section nil))
+       ;; Parse device lines: "Name (version) (UDID)"
+       ((and in-devices-section
+             (string-match "^\\(.+\\) (\\([0-9.]+\\)) (\\([0-9A-Fa-f-]+\\))$" line))
+        (let ((name (string-trim (match-string 1 line)))
+              (version (match-string 2 line))
+              (udid (match-string 3 line)))
+          ;; Only include iPhone/iPad devices (exclude Mac, Apple Watch)
+          (when (string-match-p "iPhone\\|iPad" name)
+            (push (list :name name :version version :udid udid) devices))))))
+    (nreverse devices)))
+
+(defun ios-device-get-udid-for-name (device-name)
+  "Get the UDID (xcodebuild format) for DEVICE-NAME."
+  (let ((devices (ios-device-parse-xctrace-devices)))
+    (when-let ((device (seq-find (lambda (d)
+                                   (string= (plist-get d :name) device-name))
+                                 devices)))
+      (plist-get device :udid))))
+
+(defun ios-device-udid ()
+  "Get the UDID for xcodebuild destination.
+This returns the UDID format that xcodebuild expects, not the CoreDevice UUID."
+  (or ios-device--current-device-udid
+      (let* ((devices (ios-device-parse-xctrace-devices)))
+        (cond
+         ((null devices)
+          (message "No iOS devices found")
+          nil)
+         ((= (length devices) 1)
+          (setq ios-device--current-device-udid (plist-get (car devices) :udid)))
+         (t
+          ;; Multiple devices - let user choose
+          (let* ((device-names (mapcar (lambda (d) (plist-get d :name)) devices))
+                 (selected-name (completing-read "Select device for build: " device-names nil t)))
+            (when selected-name
+              (setq ios-device--current-device-udid
+                    (ios-device-get-udid-for-name selected-name)))))))))
+
 ;; Get first iPhone UUID
 (defun ios-device-get-iphone-id ()
   "Get the UUID of the first iPhone device found."
@@ -252,6 +294,42 @@ Each device is represented as a plist with :name, :hostname, :identifier, :state
                  (shell-command-to-string
                   "xcrun devicectl list devices | grep iPhone | sed -E 's/.*([0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}).*/\\1/'"))))
     (if (string= result "") nil result)))
+
+(cl-defun ios-device-launch-for-debug (&key device-id app-identifier)
+  "Launch app on device in stopped state for debugging.
+DEVICE-ID is the device UUID, APP-IDENTIFIER is the bundle ID.
+Returns the process ID (PID) on success, nil on failure."
+  (let* ((json-file (make-temp-file "devicectl-launch" nil ".json"))
+         (command (format "xcrun devicectl device process launch --start-stopped --device %s %s --json-output %s"
+                          (shell-quote-argument device-id)
+                          (shell-quote-argument app-identifier)
+                          (shell-quote-argument json-file)))
+         (output (shell-command-to-string command))
+         (pid nil))
+    (when ios-device-debug
+      (message "Device launch command: %s" command)
+      (message "Device launch output: %s" output))
+    ;; Parse the JSON output to get the PID
+    (when (file-exists-p json-file)
+      (condition-case err
+          (let* ((json-data (json-read-file json-file))
+                 (result (cdr (assoc 'result json-data)))
+                 (process-info (cdr (assoc 'process result))))
+            (setq pid (cdr (assoc 'processIdentifier process-info)))
+            (when ios-device-debug
+              (message "Launched app with PID: %s" pid)))
+        (error
+         (message "Failed to parse devicectl JSON output: %s" (error-message-string err))))
+      (delete-file json-file))
+    pid))
+
+(defun ios-device-get-device-name (device-id)
+  "Get the device name for DEVICE-ID."
+  (let ((devices (ios-device-parse-devices)))
+    (when-let ((device (seq-find (lambda (d)
+                                   (string= (plist-get d :identifier) device-id))
+                                 devices)))
+      (plist-get device :name))))
 
 (provide 'ios-device)
 ;;; ios-device.el ends here

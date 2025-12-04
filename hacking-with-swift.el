@@ -16,7 +16,7 @@
 (require 'browse-url)
 (require 'json)
 (require 'url-http)
-(require 'cl)
+(require 'cl-lib)
 
 (defconst hackingWithSwiftUrl "https://www.hackingwithswift.com"
   "Hacking with swift base url.")

@@ -17,17 +17,20 @@
 (require 'swift-project)
 (require 'xcode-build-config)
 (require 'swift-project-settings)  ; Persistent project settings
+(require 'swift-notification)      ; Unified notification system
+(require 'xcode-clean nil t)       ; Cleaning utilities (optional)
 (require 'periphery nil t)
 (require 'periphery-helper nil t)
 (require 'swift-cache nil t)  ; Optional - graceful fallback if not available
 
-;; Optional dependencies
-(defvar mode-line-hud-available-p (require 'mode-line-hud nil t)
-  "Whether mode-line-hud is available.")
+;; Legacy compatibility - now using swift-notification
+(defvar mode-line-hud-available-p swift-notification--mode-line-hud-available-p
+  "Whether mode-line-hud is available. Deprecated: use swift-notification module.")
 
-;; Notification backend configuration
+;; Notification backend configuration - now delegates to swift-notification
 (defcustom xcode-project-notification-backend 'mode-line-hud
   "Backend to use for displaying build progress and notifications.
+Deprecated: Set `swift-notification-backend' instead.
 Options:
 - \\='mode-line-hud: Use mode-line-hud package (visual mode line updates)
 - \\='message: Use Emacs message with colored propertized text
@@ -42,54 +45,25 @@ Options:
 Function should accept keyword arguments :message, :delay, :seconds, and :reset.")
 
 (defun xcode-project-notify (&rest args)
-  "Universal notification function that delegates to configured backend.
+  "Universal notification function that delegates to swift-notification.
 Accepts keyword arguments:
   :message - The message to display
   :delay - Optional delay before showing (for mode-line-hud)
   :seconds - How long to show notification
   :reset - Whether to reset after showing
   :face - Face to apply to message (for message backend)
-  :no-redisplay - If t, skip the automatic redisplay (default nil)"
-  (let ((message-text (plist-get args :message))
-        (delay (plist-get args :delay))
-        (seconds (plist-get args :seconds))
-        (reset (plist-get args :reset))
-        (face (plist-get args :face))
-        (no-redisplay (plist-get args :no-redisplay)))
+  :no-redisplay - If t, skip the automatic redisplay (default nil)
 
-    (pcase xcode-project-notification-backend
-      ('mode-line-hud
-       (when mode-line-hud-available-p
-         (cond
-          ;; Notification style (with seconds and reset)
-          ((and seconds reset)
-           (mode-line-hud:notification :message message-text :seconds seconds :reset reset))
-          ;; Update with delay
-          (delay
-           (mode-line-hud:updateWith :message message-text :delay delay))
-          ;; Simple update
-          (t
-           (mode-line-hud:update :message message-text)))))
-
-      ('message
-       ;; Use minibuffer messages with optional color
-       (if face
-           (message "%s" (propertize message-text 'face face))
-         (message "%s" message-text)))
-
-      ('custom
-       ;; Call custom function if configured
-       (when (functionp xcode-project-notification-function)
-         (apply xcode-project-notification-function args)))
-
-      (_
-       ;; Fallback to message if backend unknown
-       (message "%s" message-text)))
-
-    ;; Force display update so notification is visible before any blocking operation
-    ;; This is especially important before shell commands, file I/O, or user input
-    (unless no-redisplay
-      (redisplay t))))
+This function is kept for backwards compatibility.
+Prefer using `swift-notification-send' directly in new code."
+  ;; Sync backend setting if user changed xcode-project-notification-backend
+  (unless (eq swift-notification-backend xcode-project-notification-backend)
+    (setq swift-notification-backend xcode-project-notification-backend))
+  (when (and (eq xcode-project-notification-backend 'custom)
+             (not swift-notification-function)
+             xcode-project-notification-function)
+    (setq swift-notification-function xcode-project-notification-function))
+  (apply #'swift-notification-send args))
 
 (defun xcode-project-safe-mode-line-update (&rest args)
   "Safely call notification system with update semantics.
@@ -124,12 +98,116 @@ This is a compatibility wrapper - prefer using `xcode-project-notify' directly."
   "Buffer-local errors or warnings from last build.")
 (defvar-local xcode-project--last-device-type nil
   "Buffer-local last device type used (:simulator or :device).")
-(defvar-local xcode-project--device-choice nil
-  "Buffer-local user's choice of device (simulator or physical device).")
+;; Note: swift-development--device-choice is now defined in swift-development.el
+;; with a defvaralias for backwards compatibility
 (defvar xcode-project--cache-warmed-projects (make-hash-table :test 'equal)
   "Hash table tracking which projects have had their caches warmed.")
 
+(defvar xcode-project--async-processes (make-hash-table :test 'equal)
+  "Hash table tracking active async processes by key.")
+
+;; Forward declaration to avoid byte-compile warnings
+(defvar xcode-project-debug)
+
 (defconst xcodebuild-list-config-command "xcrun xcodebuild -list -json")
+
+;;; Async command execution infrastructure
+
+(cl-defun xcode-project-run-command-async (command callback &key cache-key cache-ttl error-callback)
+  "Run shell COMMAND asynchronously and call CALLBACK with parsed JSON result.
+CALLBACK receives the parsed JSON data (or nil if parsing fails).
+ERROR-CALLBACK is called on process errors if provided.
+If CACHE-KEY is provided, results are cached with CACHE-TTL (default 300s)."
+  ;; Check cache first
+  (when cache-key
+    (let ((cached (swift-cache-get cache-key)))
+      (when cached
+        (when xcode-project-debug
+          (message "xcode-project-run-command-async: Cache hit for %s" cache-key))
+        (funcall callback cached)
+        (cl-return-from xcode-project-run-command-async nil))))
+
+  ;; Kill any existing process with same cache-key
+  (when cache-key
+    (let ((existing-proc (gethash cache-key xcode-project--async-processes)))
+      (when (and existing-proc (process-live-p existing-proc))
+        (when xcode-project-debug
+          (message "xcode-project-run-command-async: Killing existing process for %s" cache-key))
+        (delete-process existing-proc))))
+
+  (let* ((output-buffer (generate-new-buffer " *xcode-async-output*"))
+         (proc (make-process
+                :name "xcode-async"
+                :buffer output-buffer
+                :command (list shell-file-name shell-command-switch command)
+                :sentinel
+                (lambda (process event)
+                  (when xcode-project-debug
+                    (message "xcode-project-run-command-async: Process event: %s" (string-trim event)))
+                  (when (memq (process-status process) '(exit signal))
+                    ;; Remove from active processes
+                    (when cache-key
+                      (remhash cache-key xcode-project--async-processes))
+                    (if (and (eq (process-status process) 'exit)
+                             (= (process-exit-status process) 0))
+                        (let ((json-data nil))
+                          (with-current-buffer output-buffer
+                            (goto-char (point-min))
+                            (condition-case err
+                                (setq json-data (json-read))
+                              (error
+                               (when xcode-project-debug
+                                 (message "xcode-project-run-command-async: JSON parse error: %s"
+                                          (error-message-string err))))))
+                          ;; Cache the result if cache-key provided
+                          (when (and cache-key json-data)
+                            (swift-cache-set cache-key json-data (or cache-ttl 300)))
+                          (kill-buffer output-buffer)
+                          (funcall callback json-data))
+                      ;; Process failed
+                      (kill-buffer output-buffer)
+                      (if error-callback
+                          (funcall error-callback event)
+                        (funcall callback nil))))))))
+    ;; Track the process
+    (when cache-key
+      (puthash cache-key proc xcode-project--async-processes))
+    proc))
+
+(defun xcode-project-warm-cache ()
+  "Warm up xcode-project caches asynchronously.
+This pre-fetches scheme list and build settings in the background
+to avoid blocking when they're needed later."
+  (interactive)
+  (let ((project-root (xcode-project-project-root)))
+    (when project-root
+      ;; Check if already warming/warmed
+      (let ((warm-key (format "%s::cache-warming" project-root)))
+        (unless (gethash warm-key xcode-project--cache-warmed-projects)
+          (puthash warm-key t xcode-project--cache-warmed-projects)
+          (when xcode-project-debug
+            (message "xcode-project-warm-cache: Starting async cache warm for %s" project-root))
+
+          ;; 1. Fetch schemes asynchronously
+          (xcode-project-get-scheme-list-async
+           (lambda (schemes)
+             (when xcode-project-debug
+               (message "xcode-project-warm-cache: Schemes cached: %s" schemes))
+             ;; 2. If we have a scheme, also warm build settings
+             (when (and schemes xcode-project--current-xcode-scheme)
+               (xcode-project-get-build-settings-json-async
+                (lambda (_json)
+                  (when xcode-project-debug
+                    (message "xcode-project-warm-cache: Build settings cached")))
+                :config nil)))))))))
+
+(defun xcode-project-warm-cache-if-needed ()
+  "Warm cache if not already done for current project.
+Safe to call multiple times - will only warm once per project."
+  (let* ((project-root (xcode-project-project-root))
+         (warm-key (when project-root (format "%s::cache-warming" project-root))))
+    (when (and warm-key (not (gethash warm-key xcode-project--cache-warmed-projects)))
+      (xcode-project-warm-cache))))
 
 (defgroup xcode-project-xcodebuild nil
   "REPL."
@@ -374,67 +452,107 @@ Returns nil if command fails or produces invalid JSON."
          nil)))))
 
 (defun xcode-project-get-schemes-from-xcodebuild ()
-  "Get list of schemes using xcodebuild -list command as fallback."
+  "Get list of schemes using xcodebuild -list command as fallback.
+DEPRECATED: This function blocks Emacs. Use `xcode-project-get-schemes-from-xcodebuild-async' instead."
   (when xcode-project-debug
-    (message "Falling back to xcodebuild -list for scheme detection"))
+    (message "Falling back to xcodebuild -list for scheme detection (BLOCKING)"))
   (condition-case err
       (let* ((project-dir (or (xcode-project-project-root) default-directory))
              (json-data (let ((default-directory project-dir))
                           (xcode-project-run-command-and-get-json "xcrun xcodebuild -list -json 2>/dev/null"))))
         (when json-data
-          (let-alist json-data
-            (cond
-             ;; Workspace case
-             (.workspace.schemes
-              (when xcode-project-debug
-                (message "Found schemes via xcodebuild (workspace): %s" .workspace.schemes))
-              .workspace.schemes)
-             ;; Project case  
-             (.project.schemes
-              (when xcode-project-debug
-                (message "Found schemes via xcodebuild (project): %s" .project.schemes))
-              .project.schemes)
-             (t
-              (when xcode-project-debug
-                (message "No schemes found in xcodebuild output"))
-              nil)))))
+          (xcode-project--parse-schemes-from-json json-data)))
     (error
      (when xcode-project-debug
        (message "Error running xcodebuild -list: %s" (error-message-string err)))
      nil)))
 
+(defun xcode-project--parse-schemes-from-json (json-data)
+  "Parse scheme list from JSON-DATA returned by xcodebuild -list."
+  (when json-data
+    (let-alist json-data
+      (cond
+       ;; Workspace case
+       (.workspace.schemes
+        (when xcode-project-debug
+          (message "Found schemes via xcodebuild (workspace): %s" .workspace.schemes))
+        (append .workspace.schemes nil))  ; Convert vector to list
+       ;; Project case
+       (.project.schemes
+        (when xcode-project-debug
+          (message "Found schemes via xcodebuild (project): %s" .project.schemes))
+        (append .project.schemes nil))  ; Convert vector to list
+       (t
+        (when xcode-project-debug
+          (message "No schemes found in xcodebuild output"))
+        nil)))))
+
+(defun xcode-project-get-schemes-from-xcodebuild-async (callback)
+  "Get list of schemes using xcodebuild -list asynchronously.
+CALLBACK is called with the list of schemes (or nil if none found)."
+  (when xcode-project-debug
+    (message "Fetching schemes via xcodebuild -list (async)"))
+  (let* ((project-dir (or (xcode-project-project-root) default-directory))
+         (cache-key (swift-cache-project-key project-dir "xcodebuild-schemes")))
+    (xcode-project-run-command-async
+     (format "cd %s && xcrun xcodebuild -list -json 2>/dev/null"
+             (shell-quote-argument project-dir))
+     (lambda (json-data)
+       (let ((schemes (xcode-project--parse-schemes-from-json json-data)))
+         (funcall callback schemes)))
+     :cache-key cache-key
+     :cache-ttl 600)))
+
+(defun xcode-project--build-settings-cache-key (config sdk)
+  "Generate cache key for build settings with CONFIG and SDK."
+  (let ((project-root (xcode-project-project-root))
+        (config-key (or config "default"))
+        (sdk-key (or sdk "default")))
+    (when (fboundp 'swift-cache-project-key)
+      (swift-cache-project-key project-root
+                               (format "build-settings-%s-%s-%s"
+                                       (or xcode-project--current-xcode-scheme "default")
+                                       config-key
+                                       sdk-key)))))
+
+(defun xcode-project--build-settings-command (config sdk)
+  "Generate xcodebuild command for build settings with CONFIG and SDK."
+  (let ((scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme ""))))
+    (format "xcrun xcodebuild %s -scheme %s -showBuildSettings %s %s -skipPackagePluginValidation -skipMacroValidation -json 2>/dev/null"
+            (xcode-project-get-workspace-or-project)
+            (shell-quote-argument scheme-name)
+            (if config (format "-configuration %s" (shell-quote-argument config)) "")
+            (if sdk (format "-sdk %s" sdk) ""))))
+
 (cl-defun xcode-project-get-build-settings-json (&key config sdk)
   "Get build settings from xcodebuild CONFIG and SDK.
 If CONFIG is nil, lets the scheme choose its default configuration.
-SDK: Optional SDK (e.g., iphonesimulator, iphoneos)."
+SDK: Optional SDK (e.g., iphonesimulator, iphoneos).
+NOTE: This blocks Emacs on first call. Use async version for background loading."
   (let* ((project-root (xcode-project-project-root))
-         (config-key (or config "default"))
-         (sdk-key (or sdk "default"))
-         (cache-key (when (fboundp 'swift-cache-project-key)
-                      (swift-cache-project-key project-root
-                                              (format "build-settings-%s-%s-%s"
-                                                      (or xcode-project--current-xcode-scheme "default")
-                                                      config-key
-                                                      sdk-key)))))
+         (cache-key (xcode-project--build-settings-cache-key config sdk)))
     (if (and cache-key (fboundp 'swift-cache-with))
         (swift-cache-with cache-key 1800  ; Cache for 30 minutes
-          (let ((default-directory (or project-root default-directory))
-                (scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme ""))))
+          (let ((default-directory (or project-root default-directory)))
             (xcode-project-run-command-and-get-json
-             (format "xcrun xcodebuild %s -scheme %s -showBuildSettings %s %s -skipPackagePluginValidation -skipMacroValidation -json 2>/dev/null"
-                     (xcode-project-get-workspace-or-project)
-                     (shell-quote-argument scheme-name)
-                     (if config (format "-configuration %s" (shell-quote-argument config)) "")
-                     (if sdk (format "-sdk %s" sdk) "")))))
+             (xcode-project--build-settings-command config sdk))))
       ;; Fallback when swift-cache not available
-      (let ((default-directory (or project-root default-directory))
-            (scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme ""))))
+      (let ((default-directory (or project-root default-directory)))
         (xcode-project-run-command-and-get-json
-         (format "xcrun xcodebuild %s -scheme %s -showBuildSettings %s %s -skipPackagePluginValidation -skipMacroValidation -json 2>/dev/null"
-                 (xcode-project-get-workspace-or-project)
-                 (shell-quote-argument scheme-name)
-                 (if config (format "-configuration %s" (shell-quote-argument config)) "")
-                 (if sdk (format "-sdk %s" sdk) "")))))))
+         (xcode-project--build-settings-command config sdk))))))
+
+(cl-defun xcode-project-get-build-settings-json-async (callback &key config sdk)
+  "Get build settings asynchronously with CONFIG and SDK.
+CALLBACK is called with the parsed JSON result.
+Results are cached for 30 minutes."
+  (let* ((project-root (xcode-project-project-root))
+         (cache-key (xcode-project--build-settings-cache-key config sdk))
+         (default-directory (or project-root default-directory)))
+    (xcode-project-run-command-async
+     (xcode-project--build-settings-command config sdk)
+     callback
+     :cache-key cache-key
+     :cache-ttl 1800)))
 
 (defun xcode-project-product-name ()
   "Get product name from build settings or derive from scheme/project name."
@@ -459,37 +577,168 @@ SDK: Optional SDK (e.g., iphonesimulator, iphoneos)."
      ;; Ultimate fallback
      "Unknown")))
 
+(defun xcode-project--extract-bundle-id-from-json (json)
+  "Extract bundle identifier from build settings JSON."
+  (when (and json (> (length json) 0))
+    (let-alist (seq-elt json 0)
+      .buildSettings.PRODUCT_BUNDLE_IDENTIFIER)))
+
 (defun xcode-project-get-bundle-identifier (config)
   "Get bundle identifier using CONFIG.
-If CONFIG is nil, uses the scheme's default configuration."
-  (let* ((json (xcode-project-get-build-settings-json :config config))
-         (bundle-id (when (and json (> (length json) 0))
-                     (let-alist (seq-elt json 0)
-                       .buildSettings.PRODUCT_BUNDLE_IDENTIFIER))))
+If CONFIG is nil, uses the scheme's default configuration.
+Uses fast methods (cache, Info.plist) first, triggers async fetch if needed.
+NEVER blocks Emacs with synchronous xcodebuild calls."
+  (let* ((cache-key (xcode-project--build-settings-cache-key config nil))
+         ;; Try cache first
+         (cached-json (when cache-key (swift-cache-get cache-key)))
+         (bundle-id (xcode-project--extract-bundle-id-from-json cached-json)))
     (if (and bundle-id (not (string-empty-p bundle-id)))
         bundle-id
-      ;; Fallback: use xcodebuild directly without JSON
-      (let* ((scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme "")))
-             (workspace-or-project (xcode-project-get-workspace-or-project))
-             ;; If config is nil, don't specify -configuration (let scheme decide)
-             (cmd (if config
-                      (format "xcodebuild -showBuildSettings %s -scheme %s -configuration %s 2>/dev/null | grep '^    PRODUCT_BUNDLE_IDENTIFIER' | head -1 | sed 's/.*= //' | tr -d ' '"
-                              workspace-or-project
-                              (shell-quote-argument scheme-name)
-                              (shell-quote-argument config))
-                    (format "xcodebuild -showBuildSettings %s -scheme %s 2>/dev/null | grep '^    PRODUCT_BUNDLE_IDENTIFIER' | head -1 | sed 's/.*= //' | tr -d ' '"
-                            workspace-or-project
-                            (shell-quote-argument scheme-name))))
-             (output (string-trim (shell-command-to-string cmd))))
-        (when xcode-project-debug
-          (message "Fallback command: %s" cmd)
-          (message "Fallback output: %s" output))
-        (if (string-empty-p output)
-            (progn
-              (when xcode-project-debug
-                (message "No bundle identifier found, using generic fallback"))
-              "com.example.app")  ; Generic fallback
-          output)))))
+      ;; Try to read from Info.plist files (fast, no xcodebuild)
+      (let ((plist-id (xcode-project--get-bundle-id-from-plist)))
+        (if (and plist-id (not (string-empty-p plist-id)))
+            plist-id
+          ;; Trigger async fetch for next time, return fallback now
+          (when xcode-project-debug
+            (message "Bundle ID not cached, triggering async fetch"))
+          (xcode-project-get-bundle-identifier-async
+           config
+           (lambda (id)
+             (when (and id (not (string-equal id "com.example.app")))
+               (setq xcode-project--current-app-identifier id)
+               (when xcode-project-debug
+                 (message "Async bundle ID fetch complete: %s" id)))))
+          ;; Return fallback immediately
+          "com.example.app")))))
+
+(defun xcode-project--get-bundle-id-from-plist ()
+  "Try to get bundle identifier from project files.
+Checks xcconfig first (scheme-aware), then Info.plist, then pbxproj.
+This is a fast method that doesn't require xcodebuild."
+  (let* ((project-root (xcode-project-project-root))
+         (scheme (or xcode-project--current-xcode-scheme ""))
+         (scheme-base (if (string-match "^\\([^(]+\\)" scheme)
+                          (string-trim (match-string 1 scheme))
+                        scheme))
+         ;; Extract environment from scheme, e.g., "Bruce (Staging)" -> "Staging"
+         (scheme-env (when (string-match "(\\([^)]+\\))" scheme)
+                       (match-string 1 scheme))))
+    (when project-root
+      (or
+       ;; First: Try xcconfig file matching the scheme environment
+       (when scheme-env
+         (xcode-project--get-bundle-id-from-xcconfig project-root scheme-env))
+       ;; Second: Try Info.plist files
+       (let ((plist-files (directory-files-recursively
+                           project-root
+                           "Info\\.plist$"
+                           nil
+                           (lambda (dir)
+                             ;; Skip build directories and Pods
+                             (not (or (string-match-p "/\\.build/" dir)
+                                      (string-match-p "/Build/" dir)
+                                      (string-match-p "/DerivedData/" dir)
+                                      (string-match-p "/Pods/" dir)
+                                      (string-match-p "/Frameworks/" dir)))))))
+         (cl-loop for plist in plist-files
+                  for bundle-id = (xcode-project--read-bundle-id-from-plist plist)
+                  when (and bundle-id
+                            (or (string-match-p (regexp-quote scheme-base) plist)
+                                (not (string-match-p "Tests" plist))))
+                  return bundle-id))
+       ;; Last: Fallback to pbxproj (not scheme-aware, will get first match)
+       (xcode-project--get-bundle-id-from-pbxproj project-root)))))
+
+(defun xcode-project--get-bundle-id-from-xcconfig (project-root env-name)
+  "Try to get bundle identifier from xcconfig file for ENV-NAME in PROJECT-ROOT.
+Looks for files like Staging.xcconfig, Production.xcconfig, etc."
+  (let* ((config-dirs (list
+                       (expand-file-name "Configs" project-root)
+                       (expand-file-name (concat (xcode-project-project-name) "/Configs") project-root)
+                       project-root))
+         (config-file nil))
+    ;; Find the xcconfig file
+    (cl-loop for dir in config-dirs
+             for file = (expand-file-name (concat env-name ".xcconfig") dir)
+             when (file-exists-p file)
+             do (setq config-file file)
+             and return nil)
+    ;; Read APP_BUNDLE_ID from the config file
+    (when config-file
+      (xcode-project--read-bundle-id-from-xcconfig config-file))))
+
+(defun xcode-project--read-bundle-id-from-xcconfig (xcconfig-file)
+  "Read APP_BUNDLE_ID from XCCONFIG-FILE."
+  (condition-case nil
+      (with-temp-buffer
+        (insert-file-contents xcconfig-file)
+        (goto-char (point-min))
+        (when (re-search-forward "^APP_BUNDLE_ID\\s-*=\\s-*\\(.+\\)$" nil t)
+          (let ((id (string-trim (match-string 1))))
+            (unless (or (string-match-p "\\$(" id) (string-empty-p id))
+              id))))
+    (error nil)))
+
+(defun xcode-project--get-bundle-id-from-pbxproj (project-root)
+  "Try to get bundle identifier from pbxproj file in PROJECT-ROOT.
+Note: This is not scheme-aware and will return the first match found."
+  (let ((pbxproj-files (directory-files project-root t "\\.xcodeproj$")))
+    (cl-loop for proj-dir in pbxproj-files
+             for pbxproj = (expand-file-name "project.pbxproj" proj-dir)
+             when (file-exists-p pbxproj)
+             return (xcode-project--read-bundle-id-from-pbxproj pbxproj))))
+
+(defun xcode-project--read-bundle-id-from-pbxproj (pbxproj-file)
+  "Read PRODUCT_BUNDLE_IDENTIFIER from PBXPROJ-FILE."
+  (condition-case nil
+      (with-temp-buffer
+        (insert-file-contents pbxproj-file)
+        (goto-char (point-min))
+        ;; First, try to find APP_BUNDLE_ID (custom variable used by some projects)
+        (let ((found-id nil))
+          (when (re-search-forward "APP_BUNDLE_ID\\s-*=\\s-*\\([^;]+\\);" nil t)
+            (let ((id (string-trim (match-string 1))))
+              (unless (or (string-match-p "\\$(" id) (string-empty-p id))
+                (setq found-id id))))
+          ;; If not found, look for direct PRODUCT_BUNDLE_IDENTIFIER
+          (unless found-id
+            (goto-char (point-min))
+            (while (and (not found-id)
+                        (re-search-forward "PRODUCT_BUNDLE_IDENTIFIER\\s-*=\\s-*\"?\\([^;\"]+\\)\"?;" nil t))
+              (let ((id (string-trim (match-string 1))))
+                ;; Skip variables and test targets
+                (unless (or (string-match-p "\\$(" id)
+                            (string-match-p "Tests" id)
+                            (string-match-p "test" id))
+                  (setq found-id id)))))
+          found-id))
+    (error nil)))
+
+(defun xcode-project--read-bundle-id-from-plist (plist-file)
+  "Read CFBundleIdentifier from PLIST-FILE."
+  (when (file-exists-p plist-file)
+    (condition-case nil
+        (with-temp-buffer
+          (insert-file-contents plist-file)
+          (goto-char (point-min))
+          ;; Look for CFBundleIdentifier
+          (when (re-search-forward "<key>CFBundleIdentifier</key>\\s-*<string>\\([^<]+\\)</string>" nil t)
+            (let ((id (match-string 1)))
+              ;; Skip if it's a variable like $(PRODUCT_BUNDLE_IDENTIFIER)
+              (unless (string-match-p "\\$(" id)
+                id))))
+      (error nil))))
+
+(defun xcode-project-get-bundle-identifier-async (config callback)
+  "Get bundle identifier asynchronously using CONFIG.
+CALLBACK is called with the bundle identifier string."
+  (xcode-project-get-build-settings-json-async
+   (lambda (json)
+     (let ((bundle-id (xcode-project--extract-bundle-id-from-json json)))
+       (funcall callback (if (and bundle-id (not (string-empty-p bundle-id)))
+                             bundle-id
+                           "com.example.app"))))
+   :config config))
 
 (cl-defun xcode-project-build-menu (&key title list)
   "Builds a widget menu from (as TITLE as LIST)."
@@ -527,8 +776,51 @@ Returns a list of folder names, excluding hidden folders."
       nil)))
 
 
+(defun xcode-project--handle-scheme-selection (schemes)
+  "Handle selection from SCHEMES list.
+Sets `xcode-project--current-xcode-scheme' and loads settings."
+  (cond
+   ;; No schemes found at all
+   ((or (null schemes) (= (length schemes) 0))
+    (xcode-project-notify
+     :message (propertize "No shared schemes found! Please share schemes in Xcode." 'face 'error)
+     :seconds 5
+     :reset t)
+    nil)
+
+   ;; Exactly one scheme - use it automatically
+   ((= (length schemes) 1)
+    (let ((scheme (car schemes)))
+      (when scheme
+        (setq xcode-project--current-xcode-scheme scheme)
+        (when (fboundp 'swift-project-settings-load-for-scheme)
+          (swift-project-settings-load-for-scheme (xcode-project-project-root) scheme))
+        (xcode-project-notify
+         :message (format "Selected scheme: %s"
+                          (propertize (xcode-project--clean-display-name scheme) 'face 'success))
+         :seconds 2
+         :reset t))
+      scheme))
+
+   ;; Multiple schemes - prompt user
+   (t
+    (xcode-project-notify :message "Choose scheme...")
+    (let ((selected (xcode-project-build-menu :title "Choose scheme: " :list schemes)))
+      (when selected
+        (setq xcode-project--current-xcode-scheme selected)
+        (when (fboundp 'swift-project-settings-load-for-scheme)
+          (swift-project-settings-load-for-scheme (xcode-project-project-root) selected))
+        (xcode-project-notify
+         :message (format "Selected scheme: %s"
+                          (propertize (xcode-project--clean-display-name selected) 'face 'success))
+         :seconds 2
+         :reset t))
+      selected))))
+
 (defun xcode-project-scheme ()
-  "Get the xcode scheme if set otherwise prompt user."
+  "Get the xcode scheme if set otherwise prompt user.
+This uses fast file-based detection. If no schemes found via files,
+use `xcode-project-fetch-schemes' to load them asynchronously."
   (unless xcode-project--current-xcode-scheme
     (when xcode-project-debug
       (message "xcode-project-scheme - Starting scheme detection..."))
@@ -536,51 +828,34 @@ Returns a list of folder names, excluding hidden folders."
     (let ((schemes (xcode-project-get-scheme-list)))
       (when xcode-project-debug
         (message "xcode-project-scheme - Found %d schemes: %s" (length schemes) schemes))
-      (cond
-       ;; No schemes found at all
-       ((or (null schemes) (= (length schemes) 0))
+      (if schemes
+          (xcode-project--handle-scheme-selection schemes)
+        ;; No schemes from files - suggest async fetch
         (xcode-project-notify
-         :message (propertize "No shared schemes found! Please share schemes in Xcode." 'face 'error)
-         :seconds 5
-         :reset t)
-        (error "No schemes found. In Xcode: Product > Scheme > Manage Schemes, check 'Shared' for your scheme"))
-
-       ;; Exactly one scheme - use it automatically
-       ((= (length schemes) 1)
-        (let ((scheme (car schemes)))
-          (when scheme  ; Double-check it's not nil
-            (setq xcode-project--current-xcode-scheme scheme)
-            ;; Load scheme-specific settings
-            (when (fboundp 'swift-project-settings-load-for-scheme)
-              (swift-project-settings-load-for-scheme (xcode-project-project-root) scheme))
-            (xcode-project-notify
-             :message (format "Selected scheme: %s"
-                              (propertize (xcode-project--clean-display-name scheme) 'face 'success))
-             :seconds 2
-             :reset t))))
-
-       ;; Multiple schemes - prompt user
-       (t
-        (xcode-project-notify :message "Choose scheme...")
-        (setq xcode-project--current-xcode-scheme
-              (xcode-project-build-menu :title "Choose scheme: " :list schemes))
-        ;; Only show notification if a scheme was actually selected
-        (when xcode-project--current-xcode-scheme
-          ;; Load scheme-specific settings
-          (when (fboundp 'swift-project-settings-load-for-scheme)
-            (swift-project-settings-load-for-scheme (xcode-project-project-root) xcode-project--current-xcode-scheme))
-          (xcode-project-notify
-           :message (format "Selected scheme: %s"
-                            (propertize (xcode-project--clean-display-name xcode-project--current-xcode-scheme) 'face 'success))
-           :seconds 2
-           :reset t))))
-
-      ;; NOTE: Settings are saved later after build-config and app-id are fetched
-      ;; See xcode-project-fetch-or-load-build-configuration and xcode-project-fetch-or-load-app-identifier
-      ))
+         :message "No scheme files found. Run M-x xcode-project-fetch-schemes"
+         :seconds 3
+         :reset t))))
   (if (not xcode-project--current-xcode-scheme)
-      (error "No scheme selected")
+      (error "No scheme selected. Run M-x xcode-project-fetch-schemes to load schemes")
     (shell-quote-argument xcode-project--current-xcode-scheme)))
+
+(defun xcode-project-fetch-schemes ()
+  "Fetch available schemes asynchronously and prompt for selection.
+Use this when scheme files are not found in the project."
+  (interactive)
+  (xcode-project-notify :message "Fetching schemes from xcodebuild...")
+  (xcode-project-get-scheme-list-async
+   (lambda (schemes)
+     (if schemes
+         (progn
+           (xcode-project--handle-scheme-selection schemes)
+           (when xcode-project--current-xcode-scheme
+             (message "Scheme set to: %s" xcode-project--current-xcode-scheme)))
+       (xcode-project-notify
+        :message (propertize "No schemes found! Share schemes in Xcode." 'face 'error)
+        :seconds 5
+        :reset t)
+       (message "No schemes found. In Xcode: Product > Scheme > Manage Schemes, check 'Shared'")))))
 
 (defun xcode-project-scheme-display-name ()
   "Get the scheme name for display purposes (without shell escaping).
@@ -675,71 +950,78 @@ This should be used for user-facing messages and UI, not for shell commands."
   xcode-project--current-app-identifier)
 
 (defun xcode-project-get-scheme-list ()
-  "Get list of project schemes from xcscheme files or xcodebuild -list as fallback."
+  "Get list of project schemes from xcscheme files.
+Does NOT fall back to xcodebuild -list to avoid blocking Emacs.
+Use `xcode-project-get-scheme-list-async' if you need xcodebuild fallback."
   (or (xcode-project-list-scheme-files)
-      ;; Fallback to xcodebuild -list if no scheme files found
+      ;; Don't use xcodebuild -list as it blocks Emacs
+      ;; Instead, return nil and let async functions handle the fallback
       (progn
         (when xcode-project-debug
-          (message "No scheme files found, trying xcodebuild -list..."))
-        (xcode-project-get-schemes-from-xcodebuild))))
+          (message "No scheme files found. Use xcode-project-fetch-schemes to load via xcodebuild."))
+        nil)))
+
+(defun xcode-project-get-scheme-list-async (callback)
+  "Get list of project schemes asynchronously.
+First tries xcscheme files (fast), then falls back to xcodebuild -list (async).
+CALLBACK is called with the list of schemes."
+  (let ((file-schemes (xcode-project-list-scheme-files)))
+    (if file-schemes
+        ;; Found schemes via file detection - call callback immediately
+        (funcall callback file-schemes)
+      ;; Fallback to xcodebuild -list async
+      (when xcode-project-debug
+        (message "No scheme files found, trying xcodebuild -list async..."))
+      (xcode-project-get-schemes-from-xcodebuild-async callback))))
 
 (cl-defun xcode-project-build-folder (&key (device-type :device))
-  "Get build folder directly from xcodebuild -showBuildSettings.
-This is more reliable than auto-detection via pattern matching."
+  "Get build folder using fast auto-detection (no xcodebuild blocking).
+Falls back to async xcodebuild fetch if auto-detection fails."
   (when (or (not xcode-project--current-build-folder)
             (not (eq device-type xcode-project--last-device-type)))
     (let* ((scheme (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme "")))
            (config (xcode-project-fetch-or-load-build-configuration))
            (target-suffix (if (eq device-type :simulator) "iphonesimulator" "iphoneos"))
            (cache-key (when (fboundp 'swift-cache-project-key)
-                       (swift-cache-project-key
-                        (xcode-project-project-root)
-                        (format "build-folder-%s-%s-%s" scheme config target-suffix)))))
+                        (swift-cache-project-key
+                         (xcode-project-project-root)
+                         (format "build-folder-%s-%s-%s" scheme config target-suffix)))))
 
       ;; Try cached result first
       (let ((cached-folder (when (and cache-key (fboundp 'swift-cache-get))
-                            (swift-cache-get cache-key))))
+                             (swift-cache-get cache-key))))
         (if (and cached-folder (file-exists-p cached-folder))
             (setq xcode-project--current-build-folder cached-folder)
+          ;; Try fast auto-detection first (no xcodebuild call)
+          (let ((base-build-products-dir (xcode-project-get-build-products-directory)))
+            (when base-build-products-dir
+              (let ((detected (xcode-project-auto-detect-build-folder
+                               :build-products-dir base-build-products-dir
+                               :scheme scheme
+                               :config config
+                               :device-type device-type
+                               :target-suffix target-suffix)))
+                (when detected
+                  (setq xcode-project--current-build-folder
+                        (if (file-name-absolute-p detected)
+                            detected
+                          (concat base-build-products-dir detected "/"))))))
+            ;; If auto-detection failed and we have no folder, try async fetch
+            (unless xcode-project--current-build-folder
+              (when xcode-project-debug
+                (message "Auto-detection failed, triggering async build settings fetch"))
+              ;; Trigger async fetch for next time
+              (xcode-project-build-folder-async
+               (lambda (folder)
+                 (when (and folder (not xcode-project--current-build-folder))
+                   (setq xcode-project--current-build-folder folder)
+                   (when xcode-project-debug
+                     (message "Async build folder fetch complete: %s" folder))))
+               :device-type device-type)))))
 
-          ;; Get build folder: use .build if exists, extract config folder from xcodebuild
-          (let* ((sdk (if (eq device-type :simulator) "iphonesimulator" "iphoneos"))
-                 (json (xcode-project-get-build-settings-json :config config :sdk sdk))
-                 (xcode-built-products-dir (when (and json (> (length json) 0))
-                                            (let-alist (seq-elt json 0)
-                                              .buildSettings.BUILT_PRODUCTS_DIR)))
-                 ;; Get base build products dir (prefers .build over DerivedData)
-                 (base-build-products-dir (xcode-project-get-build-products-directory)))
-
-            (setq xcode-project--current-build-folder
-                  (if base-build-products-dir
-                      ;; Extract just the configuration folder name from xcodebuild's path
-                      ;; e.g., "Debug (Production)-iphonesimulator" from full DerivedData path
-                      (let ((config-folder-name (when xcode-built-products-dir
-                                                  (file-name-nondirectory
-                                                   (directory-file-name xcode-built-products-dir)))))
-                        (if (and config-folder-name
-                                 (file-directory-p (concat base-build-products-dir config-folder-name)))
-                            ;; Use xcodebuild's config folder name with our .build base path
-                            (file-name-as-directory (concat base-build-products-dir config-folder-name))
-                          ;; Fallback to auto-detection if folder doesn't exist
-                          (let ((detected (xcode-project-auto-detect-build-folder
-                                          :build-products-dir base-build-products-dir
-                                          :scheme scheme
-                                          :config config
-                                          :device-type device-type
-                                          :target-suffix target-suffix)))
-                            (when detected
-                              (if (file-name-absolute-p detected)
-                                  detected
-                                (concat base-build-products-dir detected "/"))))))
-                    ;; Last resort: use xcodebuild's path directly (DerivedData)
-                    (when (and xcode-built-products-dir (file-directory-p xcode-built-products-dir))
-                      (file-name-as-directory xcode-built-products-dir)))))
-
-            ;; Cache the result
-            (when (and cache-key (fboundp 'swift-cache-set) xcode-project--current-build-folder)
-              (swift-cache-set cache-key xcode-project--current-build-folder 1800))))  ; Cache for 30 minutes
+      ;; Cache the result if we found something
+      (when (and cache-key (fboundp 'swift-cache-set) xcode-project--current-build-folder)
+        (swift-cache-set cache-key xcode-project--current-build-folder 1800))
 
       (setq xcode-project--last-device-type device-type)
 
@@ -761,6 +1043,52 @@ This is more reliable than auto-detection via pattern matching."
         (message "xcode-project-build-folder: scheme=%s config=%s device=%s folder=%s"
                  scheme config device-type xcode-project--current-build-folder))))
   xcode-project--current-build-folder)
+
+(cl-defun xcode-project-build-folder-async (callback &key (device-type :device))
+  "Get build folder asynchronously using xcodebuild.
+CALLBACK is called with the folder path when complete."
+  (let* ((scheme (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme "")))
+         (config (or xcode-project--current-build-configuration "Debug"))
+         (sdk (if (eq device-type :simulator) "iphonesimulator" "iphoneos"))
+         (target-suffix sdk))
+    (xcode-project-get-build-settings-json-async
+     (lambda (json)
+       (let* ((xcode-built-products-dir (when (and json (> (length json) 0))
+                                          (let-alist (seq-elt json 0)
+                                            .buildSettings.BUILT_PRODUCTS_DIR)))
+              (base-build-products-dir (xcode-project-get-build-products-directory))
+              (result-folder
+               (if base-build-products-dir
+                   (let ((config-folder-name (when xcode-built-products-dir
+                                               (file-name-nondirectory
+                                                (directory-file-name xcode-built-products-dir)))))
+                     (if (and config-folder-name
+                              (file-directory-p (concat base-build-products-dir config-folder-name)))
+                         (file-name-as-directory (concat base-build-products-dir config-folder-name))
+                       ;; Try auto-detect as fallback
+                       (let ((detected (xcode-project-auto-detect-build-folder
+                                       :build-products-dir base-build-products-dir
+                                       :scheme scheme
+                                       :config config
+                                       :device-type device-type
+                                       :target-suffix target-suffix)))
+                         (when detected
+                           (if (file-name-absolute-p detected)
+                               detected
+                             (concat base-build-products-dir detected "/"))))))
+                 ;; Use xcodebuild path directly
+                 (when (and xcode-built-products-dir (file-directory-p xcode-built-products-dir))
+                   (file-name-as-directory xcode-built-products-dir)))))
+         ;; Cache the result
+         (when result-folder
+           (let ((cache-key (when (fboundp 'swift-cache-project-key)
+                             (swift-cache-project-key
+                              (xcode-project-project-root)
+                              (format "build-folder-%s-%s-%s" scheme config target-suffix)))))
+             (when (and cache-key (fboundp 'swift-cache-set))
+               (swift-cache-set cache-key result-folder 1800))))
+         (funcall callback result-folder)))
+     :config config :sdk sdk)))
 
 (defun xcode-project-get-build-products-directory ()
   "Get the base build products directory path."
@@ -1125,7 +1453,7 @@ Shows that multi-project support is enabled via buffer-local variables."
            (or xcode-project--current-build-configuration "nil")
            (or xcode-project--current-app-identifier "nil")
            (or xcode-project--current-build-folder "nil")
-           (or (and xcode-project--device-choice "Physical Device") "Simulator")))
+           (or (and swift-development--device-choice "Physical Device") "Simulator")))
 
 (defun xcode-project-project-root ()
   "Get the project root as a path string."
@@ -1143,24 +1471,25 @@ Shows that multi-project support is enabled via buffer-local variables."
 (defun xcode-addition-ask-for-device-or-simulator ()
   "Show menu for running on simulator or device."
   (interactive)
-  (when (and (ios-device-connected-device-id) (not xcode-project--device-choice))
-    (setq xcode-project--device-choice
-          (xcode-project-device-or-simulator-menu :title "Run on simulator or device?"))
-    (setq current-run-on-device xcode-project--device-choice)))
+  (when (and (ios-device-connected-device-id) (not swift-development--device-choice))
+    (setq swift-development--device-choice
+          (xcode-project-device-or-simulator-menu :title "Run on simulator or device?"))))
 
 (defun xcode-project-run-in-simulator ()
   "Return t if app should run in simulator, nil for physical device."
-  (if (null xcode-project--device-choice)
+  (if (null swift-development--device-choice)
       t  ; Default to simulator if not set
-    (not xcode-project--device-choice)))
+    (not swift-development--device-choice)))
 
 ;;;###autoload
 (defun xcode-project-reset ()
   "Reset the current project root and device choice.
-Also clears all persistent cache files (.swift-development/)."
+Also clears all persistent cache files (.swift-development/).
+Prompts to choose scheme first, then simulator."
   (interactive)
+  ;; First, reset simulator state (but don't choose new one yet)
   (when (fboundp 'ios-simulator-reset)
-    (ios-simulator-reset))
+    (ios-simulator-reset nil))  ; Pass nil - don't choose yet
   (when (fboundp 'periphery-kill-buffer)
     (periphery-kill-buffer))
 
@@ -1175,7 +1504,7 @@ Also clears all persistent cache files (.swift-development/)."
     (swift-cache-invalidate-pattern "build-settings-")
     (swift-cache-invalidate-pattern "scheme-files"))
 
-  (setq current-run-on-device nil
+  (setq swift-development--device-choice nil
         xcode-project--current-local-device-id nil
         xcode-project--current-is-xcode-project nil
         xcode-project--current-build-folder nil
@@ -1186,7 +1515,7 @@ Also clears all persistent cache files (.swift-development/)."
         xcode-project--current-xcode-scheme nil
         xcode-project--current-buildconfiguration-json-data nil
         xcode-project--current-errors-or-warnings nil
-        xcode-project--device-choice nil
+        swift-development--device-choice nil
         xcode-project--last-device-type nil)  ; Reset device choice
 
   ;; NOTE: We intentionally DO NOT reset swift-development--last-build-succeeded here
@@ -1194,7 +1523,16 @@ Also clears all persistent cache files (.swift-development/)."
   ;; Use swift-development-reset-build-status to manually reset if needed.
   (swift-project-reset-root)
   (xcode-project-safe-mode-line-update :message "Resetting configuration")
-  (message "Xcode configuration reset - scheme cache cleared"))
+  (message "Xcode configuration reset - scheme cache cleared")
+
+  ;; Now prompt for scheme selection first
+  ;; This ensures scheme is set before simulator selection
+  (when (y-or-n-p "Choose a new scheme? ")
+    (xcode-project-scheme)
+    ;; After scheme is selected, prompt for simulator
+    (when (y-or-n-p "Choose a new simulator? ")
+      (when (fboundp 'ios-simulator-choose-simulator)
+        (ios-simulator-choose-simulator)))))
 
 ;;;###autoload
 (defun xcode-project-start-debugging ()
@@ -1219,58 +1557,140 @@ Automatically builds the app if sources have changed."
      (message "Please ensure a scheme is selected and the project is properly configured")
      (signal (car err) (cdr err)))))
 
-(defun xcode-project-setup-dape()
-  "Setup dape."
+(defun xcode-project-setup-dape ()
+  "Setup and start dape for iOS debugging.
+Automatically detects whether to debug on simulator or physical device
+based on `swift-development--device-choice'."
   (interactive)
   (require 'dape)
   ;; Ensure scheme and project root are loaded first
   (xcode-project-scheme)
   (xcode-project-project-root)
-  (add-to-list 'dape-configs
-               `(ios
-                 modes (swift-mode)
-                 command-cwd ,(or (project-root (project-current))
-                                  default-directory)
-                 command ,(file-name-concat dape-adapter-dir
-                                            "codelldb"
-                                            "extension"
-                                            "adapter"
-                                            "codelldb")
-                 command-args ("--port" :autoport
-                               "--settings" "{\"sourceLanguages\":[\"swift\"]}"
-                               "--liblldb" "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Versions/A/LLDB")
-                 port :autoport
-                 simulator-id ,(or (ignore-errors (ios-simulator-simulator-identifier))
-                                   (error "Failed to get simulator ID"))
-                 app-bundle-id ,(or (xcode-project-fetch-or-load-app-identifier)
-                                    (error "Failed to get app bundle identifier"))
-                 fn (dape-config-autoport
-                     ,(lambda (config)
-                        (with-temp-buffer
-                          (let* ((command
-                                  (format "xcrun simctl launch --wait-for-debugger --terminate-running-process %S %S --console-pty"
-                                          (plist-get config 'simulator-id)
-                                          (plist-get config 'app-bundle-id)))
-                                 (code (call-process-shell-command command nil (current-buffer))))
-                            (dape--message (format "* Running: %S *" command))
-                            (dape--message (buffer-string))
-                            (save-match-data
-                              (if (and (zerop code)
-                                       (progn (goto-char (point-min))
-                                              (search-forward-regexp "[[:digit:]]+" nil t)))
-                                  (plist-put config :pid (string-to-number (match-string 0)))
-                                (dape--message (format "* Running: %S *" command))
-                                (dape--message (format "Failed to start simulator:\n%s" (buffer-string)))
-                                (user-error "Failed to start simulator")))))
-                        config))
-                 :type "lldb"
-                 :request "attach"
-                 :cwd "."))
-  ;; Start dape directly with the ios configuration
-  (let ((config (copy-tree (cdr (assq 'ios dape-configs)))))
-    (if config
-        (dape config)
-      (error "Failed to setup dape configuration"))))
+
+  (let* ((is-device swift-development--device-choice)
+         (app-bundle-id (or (xcode-project-fetch-or-load-app-identifier)
+                            (error "Failed to get app bundle identifier")))
+         (project-cwd (or (project-root (project-current))
+                          default-directory))
+         (codelldb-path (file-name-concat dape-adapter-dir
+                                          "codelldb"
+                                          "extension"
+                                          "adapter"
+                                          "codelldb"))
+         (lldb-path "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Versions/A/LLDB"))
+
+    (if is-device
+        ;; Physical device debugging
+        (xcode-project-setup-dape-device app-bundle-id project-cwd codelldb-path lldb-path)
+      ;; Simulator debugging
+      (xcode-project-setup-dape-simulator app-bundle-id project-cwd codelldb-path lldb-path))))
+
+(defun xcode-project-setup-dape-simulator (app-bundle-id project-cwd codelldb-path lldb-path)
+  "Setup dape for simulator debugging.
+APP-BUNDLE-ID is the app's bundle identifier.
+PROJECT-CWD is the project working directory.
+CODELLDB-PATH is path to the CodeLLDB adapter.
+LLDB-PATH is path to LLDB framework."
+  (let ((simulator-id (or (ignore-errors (ios-simulator-simulator-identifier))
+                          (error "Failed to get simulator ID"))))
+    (add-to-list 'dape-configs
+                 `(ios-simulator
+                   modes (swift-mode swift-ts-mode)
+                   command-cwd ,project-cwd
+                   command ,codelldb-path
+                   command-args ("--port" :autoport
+                                 "--settings" "{\"sourceLanguages\":[\"swift\"]}"
+                                 "--liblldb" ,lldb-path)
+                   port :autoport
+                   simulator-id ,simulator-id
+                   app-bundle-id ,app-bundle-id
+                   fn (dape-config-autoport
+                       ,(lambda (config)
+                          (with-temp-buffer
+                            (let* ((command
+                                    (format "xcrun simctl launch --wait-for-debugger --terminate-running-process %S %S --console-pty"
+                                            (plist-get config 'simulator-id)
+                                            (plist-get config 'app-bundle-id)))
+                                   (code (call-process-shell-command command nil (current-buffer))))
+                              (dape--message (format "* Running: %S *" command))
+                              (dape--message (buffer-string))
+                              (save-match-data
+                                (if (and (zerop code)
+                                         (progn (goto-char (point-min))
+                                                (search-forward-regexp "[[:digit:]]+" nil t)))
+                                    (plist-put config :pid (string-to-number (match-string 0)))
+                                  (dape--message (format "* Running: %S *" command))
+                                  (dape--message (format "Failed to start simulator:\n%s" (buffer-string)))
+                                  (user-error "Failed to start simulator")))))
+                          config))
+                   :type "lldb"
+                   :request "attach"
+                   :cwd "."))
+    ;; Start dape with simulator configuration
+    (message "Starting debugger on simulator: %s" simulator-id)
+    (let ((config (copy-tree (cdr (assq 'ios-simulator dape-configs)))))
+      (if config
+          (dape config)
+        (error "Failed to setup simulator dape configuration")))))
+
+(defun xcode-project-setup-dape-device (app-bundle-id project-cwd codelldb-path lldb-path)
+  "Setup dape for physical device debugging.
+APP-BUNDLE-ID is the app's bundle identifier.
+PROJECT-CWD is the project working directory.
+CODELLDB-PATH is path to the CodeLLDB adapter (unused for device, kept for signature).
+LLDB-PATH is path to LLDB framework (unused for device, kept for signature)."
+  (require 'ios-device)
+  (let* ((device-id (or ios-device--current-device-id
+                        (ios-device-identifier)
+                        (error "Failed to get device ID")))
+         (device-name (or (ios-device-get-device-name device-id) "Unknown Device"))
+         ;; Use Xcode's lldb-dap for device debugging (requires Xcode 16+)
+         (lldb-dap-path "/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-dap"))
+
+    ;; Check if lldb-dap exists
+    (unless (file-executable-p lldb-dap-path)
+      (error "lldb-dap not found at %s. Device debugging requires Xcode 16+" lldb-dap-path))
+
+    ;; First, terminate any existing instance
+    (message "Terminating any existing app instance on %s..." device-name)
+    (shell-command-to-string
+     (format "xcrun devicectl device process terminate --device %s %s 2>/dev/null"
+             (shell-quote-argument device-id)
+             (shell-quote-argument app-bundle-id)))
+
+    ;; Launch app in stopped state and get PID
+    (message "Launching app on %s for debugging..." device-name)
+    (let ((pid (ios-device-launch-for-debug :device-id device-id
+                                            :app-identifier app-bundle-id)))
+      (unless pid
+        (error "Failed to launch app on device. Make sure the app is installed"))
+
+      (message "App launched with PID %s, attaching debugger via lldb-dap..." pid)
+
+      ;; Setup dape config for device using lldb-dap with device commands
+      ;; lldb-dap is Xcode's native DAP server that supports device debugging
+      ;; For iOS 17+ we need:
+      ;; 1. platform select remote-ios (in initCommands)
+      ;; 2. device select <uuid> (in attachCommands)
+      ;; 3. device process attach -c --pid <pid> (in attachCommands)
+      ;; The -c flag continues execution after attach
+      (add-to-list 'dape-configs
+                   `(ios-device
+                     modes (swift-mode swift-ts-mode)
+                     command-cwd ,project-cwd
+                     command ,lldb-dap-path
+                     :type "lldb"
+                     :request "attach"
+                     :initCommands ["platform select remote-ios"]
+                     :attachCommands [,(format "device select %s" device-id)
+                                      ,(format "device process attach -c --pid %d" pid)]
+                     :cwd ,project-cwd))
+
+      ;; Start dape with device configuration
+      (let ((config (copy-tree (cdr (assq 'ios-device dape-configs)))))
+        (if config
+            (dape config)
+          (error "Failed to setup device dape configuration"))))))
 
 
 (defun xcode-project-clean-build-folder ()
@@ -1358,18 +1778,25 @@ IGNORE-LIST is a list of folder names to ignore during cleaning."
              `(lambda ()
                 ,(async-inject-variables "default-directory")
                 (defun delete-directory-contents (directory ignore-list)
-                  "Delete contents of DIRECTORY, ignoring folders in IGNORE-LIST."
-                  (dolist (file (directory-files directory t))
-                    (let ((file-name (file-name-nondirectory file)))
-                      (unless (or (member file-name '("." ".."))
-                                  (member file-name ignore-list))
-                        (if (file-directory-p file)
-                            (progn
-                              (delete-directory file t t))
-                          (delete-file file t))))))
+                  "Delete contents of DIRECTORY, ignoring folders in IGNORE-LIST.
+Returns a list of errors encountered during deletion."
+                  (let ((errors nil))
+                    (dolist (file (directory-files directory t))
+                      (let ((file-name (file-name-nondirectory file)))
+                        (unless (or (member file-name '("." ".."))
+                                    (member file-name ignore-list))
+                          (condition-case err
+                              (if (file-directory-p file)
+                                  (delete-directory file t)
+                                (delete-file file))
+                            (file-error
+                             (push (format "%s: %s" file (error-message-string err)) errors))))))
+                    errors))
                 (condition-case err
-                    (progn
-                      (delete-directory-contents ,default-directory ',ignore-list) "successfully")
+                    (let ((deletion-errors (delete-directory-contents ,default-directory ',ignore-list)))
+                      (if deletion-errors
+                          (format "completed with %d errors" (length deletion-errors))
+                        "successfully"))
                   (error (format "Error during cleaning: %s" (error-message-string err)))))
              `(lambda (result)
                 (xcode-project-safe-mode-line-notification
@@ -1613,12 +2040,8 @@ CONFIGURATION is the build configuration (Debug/Release)."
             (dired default-directory)
           (message "No build folder found"))))
 
-(defun xcode-project-toggle-device-choice ()
-  "Toggle between simulator and physical device."
-  (interactive)
-  (setq xcode-project--device-choice (not xcode-project--device-choice))
-  (setq current-run-on-device xcode-project--device-choice)
-  (message "Now running on %s" (if xcode-project--device-choice "physical device" "simulator")))
+;; Note: xcode-project-toggle-device-choice is now defined in swift-development.el
+;; with a defalias for backwards compatibility
 
 (defun xcode-project-show-current-configuration ()
   "Display the current Xcode project configuration."
@@ -1638,7 +2061,7 @@ Debug Mode: %s"
                  xcode-project--current-build-configuration
                  xcode-project--current-app-identifier
                  xcode-project--current-build-folder
-                 (if xcode-project--device-choice "Physical Device" "Simulator")
+                 (if swift-development--device-choice "Physical Device" "Simulator")
                  (ios-simulator-simulator-identifier)
                  (if xcode-project-debug "Enabled" "Disabled"))))
     (with-current-buffer (get-buffer-create "*Xcode Configuration*")
