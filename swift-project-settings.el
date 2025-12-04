@@ -439,11 +439,11 @@ IMPORTANT: Device-specific settings are ONLY saved to scheme-specific files."
                  current-simulator-id)
         (setq settings (plist-put settings :device-id current-simulator-id)))
 
-      (when swift-development--device-choice
-        (setq settings (plist-put settings :platform
-                                  (if swift-development--device-choice
-                                      "Physical Device"
-                                    "iOS Simulator"))))
+      ;; Always save platform - not just when device-choice is t
+      (setq settings (plist-put settings :platform
+                                (if swift-development--device-choice
+                                    "Physical Device"
+                                  "iOS Simulator")))
 
       (when xcode-project--current-build-configuration
         (setq settings (plist-put settings :build-config xcode-project--current-build-configuration)))

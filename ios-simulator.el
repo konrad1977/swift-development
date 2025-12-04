@@ -1549,6 +1549,469 @@ Useful when the saved simulator no longer exists."
         ios-simulator--current-simulator-name nil)
   (message "Simulator selection cleared. You will be prompted to choose a new one on next build."))
 
+;;; ============================================================================
+;;; Simulator Control Functions
+;;; ============================================================================
+
+(defun ios-simulator-restart ()
+  "Restart the Simulator.app completely.
+This kills the Simulator app and restarts it with the current simulator."
+  (interactive)
+  (let ((sim-id (or current-simulator-id (ios-simulator-simulator-identifier))))
+    (message "Restarting Simulator.app...")
+    ;; Kill Simulator.app
+    (call-process "killall" nil nil nil "Simulator")
+    ;; Wait a moment for it to fully quit
+    (run-with-timer 1.0 nil
+                    (lambda ()
+                      (when sim-id
+                        (ios-simulator-boot-simulator-with-id sim-id))
+                      (message "Simulator restarted")))))
+
+(defun ios-simulator-shutdown ()
+  "Shutdown the current simulator."
+  (interactive)
+  (let ((sim-id (or current-simulator-id "booted")))
+    (message "Shutting down simulator...")
+    (call-process-shell-command (format "xcrun simctl shutdown %s" sim-id))
+    (message "Simulator shut down")))
+
+(defun ios-simulator-erase ()
+  "Erase all content and settings from the current simulator.
+This is like a factory reset - removes all apps, data, and settings."
+  (interactive)
+  (let ((sim-id (or current-simulator-id (ios-simulator-simulator-identifier)))
+        (sim-name (or ios-simulator--current-simulator-name "current simulator")))
+    (when (yes-or-no-p (format "Erase ALL content from %s? This cannot be undone. " sim-name))
+      (message "Erasing simulator...")
+      ;; Must shutdown first
+      (call-process-shell-command (format "xcrun simctl shutdown %s 2>/dev/null" sim-id))
+      (sit-for 0.5)
+      (call-process-shell-command (format "xcrun simctl erase %s" sim-id))
+      (message "Simulator erased. Rebooting...")
+      (ios-simulator-boot-simulator-with-id sim-id))))
+
+(defun ios-simulator-open-url (url)
+  "Open URL in the current simulator's default browser."
+  (interactive "sURL to open: ")
+  (let ((sim-id (or current-simulator-id "booted")))
+    (call-process-shell-command
+     (format "xcrun simctl openurl %s '%s'" sim-id url))
+    (message "Opened %s in simulator" url)))
+
+(defun ios-simulator-open-url-in-app (url)
+  "Open URL in the current app (for deep links/universal links)."
+  (interactive "sDeep link URL: ")
+  (let ((sim-id (or current-simulator-id "booted")))
+    (call-process-shell-command
+     (format "xcrun simctl openurl %s '%s'" sim-id url))
+    (message "Opened deep link: %s" url)))
+
+;;; ============================================================================
+;;; Screenshot and Video Recording
+;;; ============================================================================
+
+(defcustom ios-simulator-screenshot-directory "~/Desktop"
+  "Default directory for simulator screenshots."
+  :type 'directory
+  :group 'ios-simulator)
+
+(defcustom ios-simulator-video-directory "~/Desktop"
+  "Default directory for simulator video recordings."
+  :type 'directory
+  :group 'ios-simulator)
+
+(defvar ios-simulator--recording-process nil
+  "Current video recording process.")
+
+(defun ios-simulator-screenshot (&optional filename)
+  "Take a screenshot of the current simulator.
+If FILENAME is nil, generates a timestamped filename on Desktop."
+  (interactive)
+  (let* ((sim-id (or current-simulator-id "booted"))
+         (default-name (format "simulator-%s.png"
+                               (format-time-string "%Y%m%d-%H%M%S")))
+         (file (or filename
+                   (expand-file-name default-name ios-simulator-screenshot-directory))))
+    (call-process-shell-command
+     (format "xcrun simctl io %s screenshot '%s'" sim-id file))
+    (message "Screenshot saved to %s" file)
+    file))
+
+(defun ios-simulator-screenshot-to-clipboard ()
+  "Take a screenshot and copy it to clipboard."
+  (interactive)
+  (let* ((temp-file (make-temp-file "sim-screenshot" nil ".png")))
+    (ios-simulator-screenshot temp-file)
+    (call-process-shell-command
+     (format "osascript -e 'set the clipboard to (read (POSIX file \"%s\") as TIFF picture)'" temp-file))
+    (delete-file temp-file)
+    (message "Screenshot copied to clipboard")))
+
+(defun ios-simulator-start-recording (&optional filename)
+  "Start recording video from the current simulator.
+If FILENAME is nil, generates a timestamped filename."
+  (interactive)
+  (if ios-simulator--recording-process
+      (message "Already recording! Use ios-simulator-stop-recording to stop.")
+    (let* ((sim-id (or current-simulator-id "booted"))
+           (default-name (format "simulator-%s.mp4"
+                                 (format-time-string "%Y%m%d-%H%M%S")))
+           (file (or filename
+                     (expand-file-name default-name ios-simulator-video-directory))))
+      (setq ios-simulator--recording-process
+            (start-process "simctl-record" nil
+                           "xcrun" "simctl" "io" sim-id "recordVideo" file))
+      (set-process-query-on-exit-flag ios-simulator--recording-process nil)
+      (message "Recording started... Use ios-simulator-stop-recording to stop (saving to %s)" file))))
+
+(defun ios-simulator-stop-recording ()
+  "Stop the current video recording."
+  (interactive)
+  (if ios-simulator--recording-process
+      (progn
+        (interrupt-process ios-simulator--recording-process)
+        (setq ios-simulator--recording-process nil)
+        (message "Recording stopped and saved"))
+    (message "No recording in progress")))
+
+(defun ios-simulator-toggle-recording ()
+  "Toggle video recording on/off."
+  (interactive)
+  (if ios-simulator--recording-process
+      (ios-simulator-stop-recording)
+    (ios-simulator-start-recording)))
+
+;;; ============================================================================
+;;; Location Simulation
+;;; ============================================================================
+
+(defvar ios-simulator-preset-locations
+  '(("San Francisco" . (37.7749 . -122.4194))
+    ("New York" . (40.7128 . -74.0060))
+    ("London" . (51.5074 . -0.1278))
+    ("Tokyo" . (35.6762 . 139.6503))
+    ("Sydney" . (-33.8688 . 151.2093))
+    ("Paris" . (48.8566 . 2.3522))
+    ("Berlin" . (52.5200 . 13.4050))
+    ("Stockholm" . (59.3293 . 18.0686))
+    ("Apple Park" . (37.3349 . -122.0090))
+    ("Googleplex" . (37.4220 . -122.0841)))
+  "Preset locations for simulator GPS.")
+
+(defun ios-simulator-set-location (latitude longitude)
+  "Set simulator GPS location to LATITUDE and LONGITUDE."
+  (interactive "nLatitude: \nnLongitude: ")
+  (let ((sim-id (or current-simulator-id "booted")))
+    (call-process-shell-command
+     (format "xcrun simctl location %s set %f,%f" sim-id latitude longitude))
+    (message "Location set to %f, %f" latitude longitude)))
+
+(defun ios-simulator-set-location-preset ()
+  "Set simulator location from a list of preset locations."
+  (interactive)
+  (let* ((choices (mapcar #'car ios-simulator-preset-locations))
+         (choice (completing-read "Select location: " choices nil t))
+         (coords (cdr (assoc choice ios-simulator-preset-locations))))
+    (when coords
+      (ios-simulator-set-location (car coords) (cdr coords))
+      (message "Location set to %s" choice))))
+
+(defun ios-simulator-clear-location ()
+  "Clear/reset the simulated location."
+  (interactive)
+  (let ((sim-id (or current-simulator-id "booted")))
+    (call-process-shell-command
+     (format "xcrun simctl location %s clear" sim-id))
+    (message "Location simulation cleared")))
+
+;;; ============================================================================
+;;; Status Bar Customization
+;;; ============================================================================
+
+(defun ios-simulator-status-bar-override (&optional time battery wifi cellular)
+  "Override status bar appearance for clean screenshots.
+TIME: time string (e.g., \"9:41\")
+BATTERY: battery level 0-100 or \"charging\"
+WIFI: wifi bars 0-3
+CELLULAR: cellular bars 0-4"
+  (interactive)
+  (let* ((sim-id (or current-simulator-id "booted"))
+         (time-str (or time "9:41"))
+         (battery-level (or battery 100))
+         (wifi-bars (or wifi 3))
+         (cellular-bars (or cellular 4))
+         (cmd (format "xcrun simctl status_bar %s override --time '%s' --batteryLevel %d --wifiBars %d --cellularBars %d"
+                      sim-id time-str battery-level wifi-bars cellular-bars)))
+    (call-process-shell-command cmd)
+    (message "Status bar overridden")))
+
+(defun ios-simulator-status-bar-apple-style ()
+  "Set status bar to Apple's marketing style (9:41, full bars)."
+  (interactive)
+  (ios-simulator-status-bar-override "9:41" 100 3 4))
+
+(defun ios-simulator-status-bar-clear ()
+  "Clear status bar overrides and restore normal behavior."
+  (interactive)
+  (let ((sim-id (or current-simulator-id "booted")))
+    (call-process-shell-command
+     (format "xcrun simctl status_bar %s clear" sim-id))
+    (message "Status bar restored to normal")))
+
+;;; ============================================================================
+;;; App Management
+;;; ============================================================================
+
+(defun ios-simulator-list-apps ()
+  "List all apps installed on the current simulator."
+  (interactive)
+  (let* ((sim-id (or current-simulator-id "booted"))
+         (output (shell-command-to-string
+                  (format "xcrun simctl listapps %s 2>/dev/null" sim-id)))
+         (buffer (get-buffer-create "*Simulator Apps*")))
+    (with-current-buffer buffer
+      (erase-buffer)
+      (insert "Installed Apps on Simulator\n")
+      (insert "===========================\n\n")
+      ;; Parse the plist output to show app names and bundle IDs
+      (let ((apps '()))
+        (with-temp-buffer
+          (insert output)
+          (goto-char (point-min))
+          (while (re-search-forward "CFBundleIdentifier.*?=.*?\"\\([^\"]+\\)\"" nil t)
+            (push (match-string 1) apps)))
+        (dolist (app (nreverse apps))
+          (insert (format "  • %s\n" app)))))
+    (display-buffer buffer)
+    (message "Found %d apps" (with-current-buffer buffer
+                               (count-lines (point-min) (point-max))))))
+
+(defun ios-simulator-uninstall-app (bundle-id)
+  "Uninstall app with BUNDLE-ID from the current simulator."
+  (interactive
+   (list (read-string "Bundle ID to uninstall: "
+                      xcode-project--current-app-identifier)))
+  (let ((sim-id (or current-simulator-id "booted")))
+    (when (yes-or-no-p (format "Uninstall %s? " bundle-id))
+      (call-process-shell-command
+       (format "xcrun simctl uninstall %s %s" sim-id bundle-id))
+      (message "Uninstalled %s" bundle-id))))
+
+(defun ios-simulator-uninstall-current-app ()
+  "Uninstall the current project's app from the simulator."
+  (interactive)
+  (if xcode-project--current-app-identifier
+      (ios-simulator-uninstall-app xcode-project--current-app-identifier)
+    (message "No current app identifier set")))
+
+(defun ios-simulator-app-container (bundle-id &optional container-type)
+  "Get the container path for BUNDLE-ID.
+CONTAINER-TYPE can be: app, data, groups, or a specific group identifier."
+  (interactive
+   (list (read-string "Bundle ID: " xcode-project--current-app-identifier)
+         (completing-read "Container type: " '("app" "data" "groups") nil t "data")))
+  (let* ((sim-id (or current-simulator-id "booted"))
+         (type (or container-type "data"))
+         (path (string-trim
+                (shell-command-to-string
+                 (format "xcrun simctl get_app_container %s %s %s 2>/dev/null"
+                         sim-id bundle-id type)))))
+    (if (and path (not (string-empty-p path)) (file-exists-p path))
+        (progn
+          (message "Container path: %s" path)
+          (when (called-interactively-p 'any)
+            (kill-new path)
+            (message "Path copied to clipboard: %s" path))
+          path)
+      (message "Could not find container for %s" bundle-id)
+      nil)))
+
+(defun ios-simulator-open-app-data ()
+  "Open the current app's data container in Finder."
+  (interactive)
+  (when-let ((path (ios-simulator-app-container
+                    xcode-project--current-app-identifier "data")))
+    (call-process "open" nil nil nil path)))
+
+(defun ios-simulator-open-app-bundle ()
+  "Open the current app's bundle container in Finder."
+  (interactive)
+  (when-let ((path (ios-simulator-app-container
+                    xcode-project--current-app-identifier "app")))
+    (call-process "open" nil nil nil path)))
+
+;;; ============================================================================
+;;; Privacy & Permissions
+;;; ============================================================================
+
+(defvar ios-simulator-privacy-services
+  '("all" "calendar" "contacts" "location" "location-always"
+    "photos" "photos-add" "media-library" "microphone" "camera"
+    "reminders" "siri" "speech-recognition" "health" "homekit"
+    "motion" "bluetooth" "keychain" "focus")
+  "Available privacy services for simctl privacy command.")
+
+(defun ios-simulator-privacy-grant (service &optional bundle-id)
+  "Grant privacy permission for SERVICE to BUNDLE-ID."
+  (interactive
+   (list (completing-read "Service: " ios-simulator-privacy-services nil t)
+         (read-string "Bundle ID: " xcode-project--current-app-identifier)))
+  (let ((sim-id (or current-simulator-id "booted"))
+        (app-id (or bundle-id xcode-project--current-app-identifier)))
+    (call-process-shell-command
+     (format "xcrun simctl privacy %s grant %s %s" sim-id service app-id))
+    (message "Granted %s permission to %s" service app-id)))
+
+(defun ios-simulator-privacy-revoke (service &optional bundle-id)
+  "Revoke privacy permission for SERVICE from BUNDLE-ID."
+  (interactive
+   (list (completing-read "Service: " ios-simulator-privacy-services nil t)
+         (read-string "Bundle ID: " xcode-project--current-app-identifier)))
+  (let ((sim-id (or current-simulator-id "booted"))
+        (app-id (or bundle-id xcode-project--current-app-identifier)))
+    (call-process-shell-command
+     (format "xcrun simctl privacy %s revoke %s %s" sim-id service app-id))
+    (message "Revoked %s permission from %s" service app-id)))
+
+(defun ios-simulator-privacy-reset (service &optional bundle-id)
+  "Reset privacy permission for SERVICE (will ask again)."
+  (interactive
+   (list (completing-read "Service: " ios-simulator-privacy-services nil t)
+         (read-string "Bundle ID (empty for all apps): " "")))
+  (let ((sim-id (or current-simulator-id "booted")))
+    (if (and bundle-id (not (string-empty-p bundle-id)))
+        (call-process-shell-command
+         (format "xcrun simctl privacy %s reset %s %s" sim-id service bundle-id))
+      (call-process-shell-command
+       (format "xcrun simctl privacy %s reset %s" sim-id service)))
+    (message "Reset %s permission" service)))
+
+(defun ios-simulator-privacy-grant-all ()
+  "Grant all privacy permissions to the current app."
+  (interactive)
+  (ios-simulator-privacy-grant "all" xcode-project--current-app-identifier))
+
+;;; ============================================================================
+;;; Clipboard Sync
+;;; ============================================================================
+
+(defun ios-simulator-paste-to-simulator (text)
+  "Paste TEXT to the simulator's clipboard."
+  (interactive "sText to paste to simulator: ")
+  (let ((sim-id (or current-simulator-id "booted")))
+    (with-temp-buffer
+      (insert text)
+      (call-process-region (point-min) (point-max)
+                           "xcrun" nil nil nil
+                           "simctl" "pbcopy" sim-id))
+    (message "Text copied to simulator clipboard")))
+
+(defun ios-simulator-paste-from-kill-ring ()
+  "Paste the current kill-ring entry to simulator clipboard."
+  (interactive)
+  (ios-simulator-paste-to-simulator (current-kill 0)))
+
+(defun ios-simulator-copy-from-simulator ()
+  "Copy the simulator's clipboard to Emacs kill-ring."
+  (interactive)
+  (let* ((sim-id (or current-simulator-id "booted"))
+         (text (shell-command-to-string
+                (format "xcrun simctl pbpaste %s" sim-id))))
+    (kill-new text)
+    (message "Copied from simulator: %s" (truncate-string-to-width text 50))))
+
+;;; ============================================================================
+;;; Keymap and Menu
+;;; ============================================================================
+
+(defvar ios-simulator-command-map
+  (let ((map (make-sparse-keymap)))
+    ;; Simulator control
+    (define-key map (kbd "r") #'ios-simulator-restart)
+    (define-key map (kbd "q") #'ios-simulator-shutdown)
+    (define-key map (kbd "e") #'ios-simulator-erase)
+    (define-key map (kbd "c") #'ios-simulator-choose-simulator)
+    ;; Screenshots/Recording
+    (define-key map (kbd "s") #'ios-simulator-screenshot)
+    (define-key map (kbd "S") #'ios-simulator-screenshot-to-clipboard)
+    (define-key map (kbd "v") #'ios-simulator-toggle-recording)
+    ;; Location
+    (define-key map (kbd "l") #'ios-simulator-set-location-preset)
+    (define-key map (kbd "L") #'ios-simulator-clear-location)
+    ;; Status bar
+    (define-key map (kbd "b") #'ios-simulator-status-bar-apple-style)
+    (define-key map (kbd "B") #'ios-simulator-status-bar-clear)
+    ;; Apps
+    (define-key map (kbd "a") #'ios-simulator-list-apps)
+    (define-key map (kbd "u") #'ios-simulator-uninstall-current-app)
+    (define-key map (kbd "d") #'ios-simulator-open-app-data)
+    ;; URLs
+    (define-key map (kbd "o") #'ios-simulator-open-url)
+    ;; Privacy
+    (define-key map (kbd "p") #'ios-simulator-privacy-grant)
+    (define-key map (kbd "P") #'ios-simulator-privacy-revoke)
+    ;; Clipboard
+    (define-key map (kbd "y") #'ios-simulator-paste-from-kill-ring)
+    (define-key map (kbd "Y") #'ios-simulator-copy-from-simulator)
+    ;; Push notification
+    (define-key map (kbd "n") #'ios-simulator-send-notification)
+    map)
+  "Keymap for iOS Simulator commands.")
+
+(defun ios-simulator-menu ()
+  "Show an interactive menu of simulator commands."
+  (interactive)
+  (let ((choice (completing-read
+                 "Simulator command: "
+                 '(("restart - Restart Simulator.app" . ios-simulator-restart)
+                   ("shutdown - Shutdown current simulator" . ios-simulator-shutdown)
+                   ("erase - Factory reset simulator" . ios-simulator-erase)
+                   ("choose - Select a different simulator" . ios-simulator-choose-simulator)
+                   ("screenshot - Take screenshot" . ios-simulator-screenshot)
+                   ("screenshot-clipboard - Screenshot to clipboard" . ios-simulator-screenshot-to-clipboard)
+                   ("record-toggle - Start/stop video recording" . ios-simulator-toggle-recording)
+                   ("location - Set GPS location" . ios-simulator-set-location-preset)
+                   ("location-clear - Clear GPS simulation" . ios-simulator-clear-location)
+                   ("statusbar-clean - Apple marketing style" . ios-simulator-status-bar-apple-style)
+                   ("statusbar-clear - Restore normal status bar" . ios-simulator-status-bar-clear)
+                   ("apps - List installed apps" . ios-simulator-list-apps)
+                   ("uninstall - Uninstall current app" . ios-simulator-uninstall-current-app)
+                   ("app-data - Open app data folder" . ios-simulator-open-app-data)
+                   ("open-url - Open URL in simulator" . ios-simulator-open-url)
+                   ("privacy-grant - Grant permission" . ios-simulator-privacy-grant)
+                   ("privacy-revoke - Revoke permission" . ios-simulator-privacy-revoke)
+                   ("privacy-grant-all - Grant all permissions" . ios-simulator-privacy-grant-all)
+                   ("clipboard-paste - Paste to simulator" . ios-simulator-paste-from-kill-ring)
+                   ("clipboard-copy - Copy from simulator" . ios-simulator-copy-from-simulator)
+                   ("notification - Send push notification" . ios-simulator-send-notification))
+                 nil t)))
+    (when choice
+      (let ((cmd (cdr (assoc choice
+                             '(("restart - Restart Simulator.app" . ios-simulator-restart)
+                               ("shutdown - Shutdown current simulator" . ios-simulator-shutdown)
+                               ("erase - Factory reset simulator" . ios-simulator-erase)
+                               ("choose - Select a different simulator" . ios-simulator-choose-simulator)
+                               ("screenshot - Take screenshot" . ios-simulator-screenshot)
+                               ("screenshot-clipboard - Screenshot to clipboard" . ios-simulator-screenshot-to-clipboard)
+                               ("record-toggle - Start/stop video recording" . ios-simulator-toggle-recording)
+                               ("location - Set GPS location" . ios-simulator-set-location-preset)
+                               ("location-clear - Clear GPS simulation" . ios-simulator-clear-location)
+                               ("statusbar-clean - Apple marketing style" . ios-simulator-status-bar-apple-style)
+                               ("statusbar-clear - Restore normal status bar" . ios-simulator-status-bar-clear)
+                               ("apps - List installed apps" . ios-simulator-list-apps)
+                               ("uninstall - Uninstall current app" . ios-simulator-uninstall-current-app)
+                               ("app-data - Open app data folder" . ios-simulator-open-app-data)
+                               ("open-url - Open URL in simulator" . ios-simulator-open-url)
+                               ("privacy-grant - Grant permission" . ios-simulator-privacy-grant)
+                               ("privacy-revoke - Revoke permission" . ios-simulator-privacy-revoke)
+                               ("privacy-grant-all - Grant all permissions" . ios-simulator-privacy-grant-all)
+                               ("clipboard-paste - Paste to simulator" . ios-simulator-paste-from-kill-ring)
+                               ("clipboard-copy - Copy from simulator" . ios-simulator-copy-from-simulator)
+                               ("notification - Send push notification" . ios-simulator-send-notification))))))
+        (when cmd
+          (call-interactively cmd))))))
+
 (provide 'ios-simulator)
 
 ;;; ios-simulator.el ends here
