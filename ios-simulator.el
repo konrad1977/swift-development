@@ -125,6 +125,11 @@
   "Face for version numbers in simulator output."
   :group 'ios-simulator)
 
+(defface ios-simulator-filepath-face
+  '((t (:inherit font-lock-string-face :underline t)))
+  "Face for file paths in simulator output."
+  :group 'ios-simulator)
+
 (defcustom ios-simulator-colorize-output t
   "Whether to colorize simulator log output.
 When non-nil, apply syntax highlighting to log messages."
@@ -140,6 +145,10 @@ When non-nil, apply syntax highlighting to log messages."
     ;; Objective-C runtime errors: *** -[ClassName method]: message
     ("^.*\\*\\*\\* -\\[.+\\]:.*$" . 'ios-simulator-objc-error-face)
     ("^.*\\*\\*\\* +\\[.+\\]:.*$" . 'ios-simulator-objc-error-face)
+    ;; NSError/Cocoa errors: Error Domain=NSCocoaErrorDomain Code=N
+    ("Error Domain=\\w+ Code=[0-9]+" . 'ios-simulator-error-face)
+    ("NSUnderlyingError" . 'ios-simulator-error-face)
+    ("NSPOSIXErrorDomain" . 'ios-simulator-error-face)
     ;; Generic ERROR/WARNING patterns
     ("^.*\\bERROR[:.].*$" . 'ios-simulator-error-face)
     ("^==\\([0-9]+\\)==ERROR:.*$" . 'ios-simulator-error-face)
@@ -180,7 +189,12 @@ When non-nil, apply syntax highlighting to log messages."
     ;; SDK/library update notices
     ("New version.+available:.*$" . 'ios-simulator-update-face)
     ;; Version numbers (e.g., 9.2.0.0, 10.6.0.0)
-    ("\\b[0-9]+\\.[0-9]+\\.[0-9]+\\(\\.[0-9]+\\)?\\b" . 'ios-simulator-version-face))
+    ("\\b[0-9]+\\.[0-9]+\\.[0-9]+\\(\\.[0-9]+\\)?\\b" . 'ios-simulator-version-face)
+    ;; File paths (absolute paths starting with / or ~)
+    ("\\(?:NSFilePath=\\|NSURL=\\)?\\(\\(?:file://\\)?\\(?:/[^ \t\n,}]+\\|~/[^ \t\n,}]+\\)\\)" 1 'ios-simulator-filepath-face)
+    ;; Common iOS/macOS paths
+    ("/Users/[^/ \t\n,}]+/Library/Developer/[^ \t\n,}]+" . 'ios-simulator-filepath-face)
+    ("/Applications/[^ \t\n,}]+\\.app[^ \t\n,}]*" . 'ios-simulator-filepath-face))
   "Font lock keywords for iOS simulator log output.")
 
 (defconst ios-simulator-buffer-name "*iOS Simulator*"

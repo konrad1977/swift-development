@@ -706,10 +706,12 @@ Note: This is not scheme-aware and will return the first match found."
             (while (and (not found-id)
                         (re-search-forward "PRODUCT_BUNDLE_IDENTIFIER\\s-*=\\s-*\"?\\([^;\"]+\\)\"?;" nil t))
               (let ((id (string-trim (match-string 1))))
-                ;; Skip variables and test targets
+                ;; Skip variables and explicit test target bundle IDs
+                ;; Note: Only skip IDs ending with Tests/Test, not containing "test" anywhere
                 (unless (or (string-match-p "\\$(" id)
-                            (string-match-p "Tests" id)
-                            (string-match-p "test" id))
+                            (string-match-p "Tests$" id)
+                            (string-match-p "\\.Tests\\." id)
+                            (string-match-p "UITests$" id))
                   (setq found-id id)))))
           found-id))
     (error nil)))
@@ -820,23 +822,32 @@ Sets `xcode-project--current-xcode-scheme' and loads settings."
 (defun xcode-project-scheme ()
   "Get the xcode scheme if set otherwise prompt user.
 This uses fast file-based detection. If no schemes found via files,
-use `xcode-project-fetch-schemes' to load them asynchronously."
+automatically falls back to `xcodebuild -list` to find auto-generated schemes."
   (unless xcode-project--current-xcode-scheme
     (when xcode-project-debug
       (message "xcode-project-scheme - Starting scheme detection..."))
     (xcode-project-notify :message "Loading schemes...")
     (let ((schemes (xcode-project-get-scheme-list)))
       (when xcode-project-debug
-        (message "xcode-project-scheme - Found %d schemes: %s" (length schemes) schemes))
+        (message "xcode-project-scheme - Found %d schemes from files: %s" (length schemes) schemes))
       (if schemes
           (xcode-project--handle-scheme-selection schemes)
-        ;; No schemes from files - suggest async fetch
-        (xcode-project-notify
-         :message "No scheme files found. Run M-x xcode-project-fetch-schemes"
-         :seconds 3
-         :reset t))))
+        ;; No schemes from files - try xcodebuild -list as fallback
+        (when xcode-project-debug
+          (message "No scheme files found, falling back to xcodebuild -list..."))
+        (xcode-project-notify :message "Fetching schemes from xcodebuild...")
+        (let ((xcodebuild-schemes (xcode-project-get-schemes-from-xcodebuild)))
+          (when xcode-project-debug
+            (message "xcode-project-scheme - Found %d schemes from xcodebuild: %s"
+                     (length xcodebuild-schemes) xcodebuild-schemes))
+          (if xcodebuild-schemes
+              (xcode-project--handle-scheme-selection xcodebuild-schemes)
+            (xcode-project-notify
+             :message (propertize "No schemes found! Share schemes in Xcode." 'face 'error)
+             :seconds 3
+             :reset t))))))
   (if (not xcode-project--current-xcode-scheme)
-      (error "No scheme selected. Run M-x xcode-project-fetch-schemes to load schemes")
+      (error "No scheme selected. Check Xcode: Product > Scheme > Manage Schemes")
     (shell-quote-argument xcode-project--current-xcode-scheme)))
 
 (defun xcode-project-fetch-schemes ()

@@ -151,6 +151,29 @@ Examples: 1.0 = @1x, 2.0 = @2x (Retina), 3.0 = @3x (iPhone Pro)"
                  (number :tag "Custom scale (1.0-3.0)"))
   :group 'swiftui-preview)
 
+(defcustom swiftui-preview-fit-to-window t
+  "If non-nil, scale preview image to fit the window.
+When enabled, the image is scaled to fit within the preview window's
+dimensions while maintaining aspect ratio."
+  :type 'boolean
+  :group 'swiftui-preview)
+
+(defcustom swiftui-preview-max-width nil
+  "Maximum width for preview image in pixels.
+If nil and `swiftui-preview-fit-to-window' is t, uses window width.
+If nil and `swiftui-preview-fit-to-window' is nil, uses 1000 pixels."
+  :type '(choice (const :tag "Auto (fit to window)" nil)
+                 (integer :tag "Max width in pixels"))
+  :group 'swiftui-preview)
+
+(defcustom swiftui-preview-max-height nil
+  "Maximum height for preview image in pixels.
+If nil and `swiftui-preview-fit-to-window' is t, uses window height.
+If nil and `swiftui-preview-fit-to-window' is nil, no height limit."
+  :type '(choice (const :tag "Auto (fit to window)" nil)
+                 (integer :tag "Max height in pixels"))
+  :group 'swiftui-preview)
+
 
 
 (defvar swiftui-preview--poll-timer nil
@@ -583,6 +606,27 @@ func registerAllViewsForPreview() {
       (when swiftui-preview-debug
         (message "[SwiftUI Preview] Polling... %.1fs elapsed" elapsed))))))
 
+(defun swiftui-preview--create-scaled-image (image-path &optional window)
+  "Create an image from IMAGE-PATH scaled to fit WINDOW.
+Uses `swiftui-preview-fit-to-window', `swiftui-preview-max-width',
+and `swiftui-preview-max-height' to determine scaling."
+  (let* ((win (or window (selected-window)))
+         (win-width (when (window-live-p win)
+                      (- (window-body-width win t) 20)))  ; pixels, with margin
+         (win-height (when (window-live-p win)
+                       (- (window-body-height win t) 20)))
+         (max-w (cond
+                 (swiftui-preview-max-width swiftui-preview-max-width)
+                 (swiftui-preview-fit-to-window (or win-width 400))
+                 (t 1000)))
+         (max-h (cond
+                 (swiftui-preview-max-height swiftui-preview-max-height)
+                 (swiftui-preview-fit-to-window (or win-height 800))
+                 (t nil))))
+    (if max-h
+        (create-image image-path nil nil :max-width max-w :max-height max-h)
+      (create-image image-path nil nil :max-width max-w))))
+
 (defun swiftui-preview--display-image (image-path)
   "Display preview IMAGE-PATH in Emacs.
 Updates the current preview path to track which preview is being shown."
@@ -596,35 +640,70 @@ Updates the current preview path to track which preview is being shown."
     ;; Record display time for debouncing
     (setq swiftui-preview--last-display-time (current-time))
 
-    (with-current-buffer buffer
-      (let ((inhibit-read-only t))
-        (erase-buffer)
-        ;; Clear image cache to force reload
-        (clear-image-cache t)
-        (insert-image (create-image image-path nil nil :max-width 1000))
-        (image-mode)
-        (setq-local swiftui-preview--last-mtime mtime)
-        (setq-local revert-buffer-function
-                   (lambda (&rest _)
-                     (let ((inhibit-read-only t))
-                       (erase-buffer)
-                       ;; Clear image cache to force reload
-                       (clear-image-cache t)
-                       (insert-image (create-image image-path nil nil :max-width 1000))
-                       (image-mode)
-                       (setq-local swiftui-preview--last-mtime
-                                 (file-attribute-modification-time
-                                  (file-attributes image-path))))))
-        ;; Set up keybinding for regenerating preview
-        (local-set-key (kbd "g") 'swiftui-preview-generate)))
-
-    ;; Display buffer in side window
+    ;; Display buffer first to get correct window dimensions
     (display-buffer buffer
                    `(display-buffer-in-side-window
                      (side . right)
                      (slot . 0)
                      (window-width . ,swiftui-preview-window-width)
-                     (preserve-size . (t . nil))))))
+                     (preserve-size . (t . nil))))
+
+    ;; Now populate buffer with correctly scaled image
+    (let ((preview-window (get-buffer-window buffer)))
+      (with-current-buffer buffer
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          ;; Clear image cache to force reload
+          (clear-image-cache t)
+          (insert-image (swiftui-preview--create-scaled-image image-path preview-window))
+          ;; Use special-mode as base instead of image-mode to avoid resize conflicts
+          (special-mode)
+          (setq-local swiftui-preview--image-path image-path)
+          (setq-local swiftui-preview--last-mtime mtime)
+          (setq-local revert-buffer-function #'swiftui-preview--revert-buffer)
+          ;; Set up keybindings
+          (local-set-key (kbd "g") 'swiftui-preview-generate)
+          (local-set-key (kbd "r") 'swiftui-preview--refresh-current)
+          (local-set-key (kbd "q") 'quit-window)))))
+
+  ;; Set up window resize hook for this buffer
+  (add-hook 'window-size-change-functions #'swiftui-preview--on-window-resize))
+
+(defun swiftui-preview--revert-buffer (&rest _)
+  "Revert the preview buffer by reloading the image."
+  (when-let ((image-path (buffer-local-value 'swiftui-preview--image-path (current-buffer))))
+    (let ((inhibit-read-only t)
+          (win (get-buffer-window (current-buffer))))
+      (erase-buffer)
+      (clear-image-cache t)
+      (insert-image (swiftui-preview--create-scaled-image image-path win))
+      (setq-local swiftui-preview--last-mtime
+                  (file-attribute-modification-time
+                   (file-attributes image-path))))))
+
+(defun swiftui-preview--refresh-current ()
+  "Refresh the current preview image to fit window."
+  (interactive)
+  (revert-buffer))
+
+(defvar swiftui-preview--resize-timer nil
+  "Timer for debouncing window resize.")
+
+(defun swiftui-preview--on-window-resize (frame)
+  "Handle window resize for FRAME by refreshing preview if visible."
+  (when-let ((buffer (get-buffer swiftui-preview-buffer-name)))
+    (when (get-buffer-window buffer frame)
+      ;; Debounce resize events
+      (when swiftui-preview--resize-timer
+        (cancel-timer swiftui-preview--resize-timer))
+      (setq swiftui-preview--resize-timer
+            (run-with-idle-timer
+             0.3 nil
+             (lambda ()
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (when (bound-and-true-p swiftui-preview--image-path)
+                     (swiftui-preview--revert-buffer))))))))))
 
 
 (defun swiftui-preview--cleanup ()

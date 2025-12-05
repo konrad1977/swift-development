@@ -737,6 +737,7 @@ The simulator output buffer features syntax highlighting for easier log analysis
 
 **Error Detection (Red):**
 - Objective-C runtime errors: `*** -[NSMutableArray addObjectsFromArray:]: array argument is not an NSArray`
+- NSError/Cocoa errors: `Error Domain=NSCocoaErrorDomain Code=4`, `NSUnderlyingError`, `NSPOSIXErrorDomain`
 - ThreadSanitizer/AddressSanitizer: `WARNING: ThreadSanitizer: race on NSMutableArray`
 - Fatal signals: `DEADLYSIGNAL`, `SEGV`, `SIGABRT`
 - Generic errors: Lines containing `ERROR:` or `ERROR -`
@@ -748,8 +749,9 @@ The simulator output buffer features syntax highlighting for easier log analysis
 
 **Informational:**
 - Timestamps: `2025-12-05 10:58:48.588` (dimmed)
-- Categories: `[Intercom]`, `[CoreData]` (highlighted)
+- Categories: `[Intercom]`, `[CoreData]`, `[SegmentedControl]` (highlighted)
 - URLs: `https://api.example.com/endpoint` (link style, clickable)
+- File paths: `/Users/.../Documents/file.txt`, `NSFilePath=...`, `NSURL=file://...` (underlined)
 - HTTP success codes: `200`, `201` (green)
 - Version numbers: `9.2.0.0`, `10.6.0.0`
 - Update notices: `New version of Google Maps SDK available: 10.6.0.0`
@@ -771,6 +773,7 @@ The simulator output buffer features syntax highlighting for easier log analysis
 - `ios-simulator-debug-face` - Debug messages
 - `ios-simulator-info-face` - Info/categories
 - `ios-simulator-url-face` - URLs (inherits from `link`)
+- `ios-simulator-filepath-face` - File paths (underlined string color)
 - `ios-simulator-http-error-face` - HTTP 4xx/5xx codes
 - `ios-simulator-http-success-face` - HTTP 2xx codes
 - `ios-simulator-objc-error-face` - ObjC runtime errors
@@ -1750,9 +1753,11 @@ Developed for efficient iOS/macOS development in Emacs.
 
 #### 🎨 Colorized Simulator Console Output
 - **Syntax highlighting for simulator logs**
-  - Errors highlighted in red (ObjC runtime errors, ThreadSanitizer, fatal signals)
-  - Warnings highlighted in yellow
+  - Errors highlighted in red (ObjC runtime errors, NSError/Cocoa errors, ThreadSanitizer, fatal signals)
+  - NSError patterns: `Error Domain=`, `NSUnderlyingError`, `NSPOSIXErrorDomain`
+  - Warnings highlighted in yellow (including `[lvl=N]` log levels)
   - URLs displayed as clickable links
+  - File paths underlined (`/Users/...`, `NSFilePath=`, `NSURL=file://...`)
   - HTTP status codes color-coded (4xx/5xx red, 2xx green)
   - Version numbers, timestamps, and categories highlighted
   - Stack traces with colored frame numbers and memory addresses
