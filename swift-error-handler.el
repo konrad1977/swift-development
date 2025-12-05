@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2025 Mikael Konradsson
 ;; Author: Mikael Konradsson
-;; Version: 1.0
+;; Version: 0.5.1
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: swift, errors
 
