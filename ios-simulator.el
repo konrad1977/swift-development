@@ -15,6 +15,7 @@
 (require 'nerd-icons nil t)
 (require 'json)
 (require 'cl-lib)
+(require 'ansi-color)
 (require 'swift-cache nil t)
 
 (with-eval-after-load 'periphery-helper
@@ -47,6 +48,140 @@
   `((t (:inherit default :height 150)))
   "Buffer background color."
   :group 'ios-simulator)
+
+;; Log output faces
+(defface ios-simulator-error-face
+  '((t (:inherit error :weight bold)))
+  "Face for error messages in simulator output."
+  :group 'ios-simulator)
+
+(defface ios-simulator-warning-face
+  '((t (:inherit warning :weight bold)))
+  "Face for warning messages in simulator output."
+  :group 'ios-simulator)
+
+(defface ios-simulator-debug-face
+  '((t (:inherit font-lock-comment-face)))
+  "Face for debug messages in simulator output."
+  :group 'ios-simulator)
+
+(defface ios-simulator-info-face
+  '((t (:inherit font-lock-function-name-face)))
+  "Face for info messages in simulator output."
+  :group 'ios-simulator)
+
+(defface ios-simulator-thread-face
+  '((t (:inherit font-lock-constant-face)))
+  "Face for thread identifiers in simulator output."
+  :group 'ios-simulator)
+
+(defface ios-simulator-address-face
+  '((t (:inherit font-lock-string-face)))
+  "Face for memory addresses in simulator output."
+  :group 'ios-simulator)
+
+(defface ios-simulator-stackframe-face
+  '((t (:inherit font-lock-builtin-face)))
+  "Face for stack frame numbers in simulator output."
+  :group 'ios-simulator)
+
+(defface ios-simulator-summary-face
+  '((t (:inherit font-lock-warning-face :weight bold)))
+  "Face for summary lines in simulator output."
+  :group 'ios-simulator)
+
+(defface ios-simulator-separator-face
+  '((t (:inherit font-lock-comment-face :weight bold)))
+  "Face for separator lines in simulator output."
+  :group 'ios-simulator)
+
+(defface ios-simulator-url-face
+  '((t (:inherit link)))
+  "Face for URLs in simulator output."
+  :group 'ios-simulator)
+
+(defface ios-simulator-http-error-face
+  '((t (:inherit error)))
+  "Face for HTTP error status codes (4xx, 5xx) in simulator output."
+  :group 'ios-simulator)
+
+(defface ios-simulator-http-success-face
+  '((t (:inherit success)))
+  "Face for HTTP success status codes (2xx) in simulator output."
+  :group 'ios-simulator)
+
+(defface ios-simulator-objc-error-face
+  '((t (:inherit error)))
+  "Face for Objective-C runtime errors in simulator output."
+  :group 'ios-simulator)
+
+(defface ios-simulator-update-face
+  '((t (:inherit font-lock-doc-face)))
+  "Face for SDK update notices in simulator output."
+  :group 'ios-simulator)
+
+(defface ios-simulator-version-face
+  '((t (:inherit font-lock-constant-face)))
+  "Face for version numbers in simulator output."
+  :group 'ios-simulator)
+
+(defcustom ios-simulator-colorize-output t
+  "Whether to colorize simulator log output.
+When non-nil, apply syntax highlighting to log messages."
+  :type 'boolean
+  :group 'ios-simulator)
+
+(defvar ios-simulator-log-font-lock-keywords
+  `(;; Fatal errors and signals
+    ("DEADLYSIGNAL\\|SEGV\\|SIGABRT\\|SIGKILL\\|SIGSEGV" . 'ios-simulator-error-face)
+    ;; iOS log format: 2025-12-05 10:58:48.588 App[pid:tid] [Category] ERROR - message
+    ("^[0-9-]+ [0-9:.]+.*\\[.*\\] ERROR +-.*$" . 'ios-simulator-error-face)
+    ("^[0-9-]+ [0-9:.]+.*\\[.*\\] WARNING +-.*$" . 'ios-simulator-warning-face)
+    ;; Objective-C runtime errors: *** -[ClassName method]: message
+    ("^.*\\*\\*\\* -\\[.+\\]:.*$" . 'ios-simulator-objc-error-face)
+    ("^.*\\*\\*\\* +\\[.+\\]:.*$" . 'ios-simulator-objc-error-face)
+    ;; Generic ERROR/WARNING patterns
+    ("^.*\\bERROR[:.].*$" . 'ios-simulator-error-face)
+    ("^==\\([0-9]+\\)==ERROR:.*$" . 'ios-simulator-error-face)
+    ;; ThreadSanitizer/AddressSanitizer headers
+    ("^\\(WARNING\\|ERROR\\): \\(ThreadSanitizer\\|AddressSanitizer\\|LeakSanitizer\\):.*$"
+     . 'ios-simulator-error-face)
+    ;; Warning patterns
+    ("^.*\\bWARNING[:.].*$" . 'ios-simulator-warning-face)
+    ;; Summary lines
+    ("^SUMMARY:.*$" . 'ios-simulator-summary-face)
+    ;; Separator lines (multiple = signs)
+    ("^=+$" . 'ios-simulator-separator-face)
+    ;; iOS log timestamp and process info (highlight the category in brackets)
+    ("^\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\} [0-9:.]+\\)" 1 'font-lock-comment-face)
+    ("\\[\\([A-Za-z0-9_]+\\)\\]" 1 'ios-simulator-info-face)
+    ;; Debug info from system frameworks
+    ("^CoreData:.*$" . 'ios-simulator-debug-face)
+    ("^\\w+: debug:.*$" . 'ios-simulator-debug-face)
+    ;; Stack frame numbers
+    ("^[[:space:]]*#[0-9]+" . 'ios-simulator-stackframe-face)
+    ;; Thread identifiers
+    ("\\b\\(Thread\\|thread\\) T?[0-9]+" . 'ios-simulator-thread-face)
+    ("\\btid=[0-9]+" . 'ios-simulator-thread-face)
+    ;; Memory addresses
+    ("0x[0-9a-fA-F]+" . 'ios-simulator-address-face)
+    ;; Process IDs
+    ("\\bpid=[0-9]+" . 'ios-simulator-thread-face)
+    ;; Location info (file:line patterns in stack traces)
+    ("<null> ([^)]+:[^)]+)" . 'font-lock-type-face)
+    ;; URLs (http/https)
+    ("https?://[^ \t\n\r\"'>)]*" . 'ios-simulator-url-face)
+    ;; HTTP status codes - errors (4xx, 5xx)
+    ("\\b[45][0-9][0-9]\\b" . 'ios-simulator-http-error-face)
+    ;; HTTP status codes - success (2xx)
+    ("\\b2[0-9][0-9]\\b" . 'ios-simulator-http-success-face)
+    ;; Log levels [lvl=N]
+    ("\\[lvl=[0-9]+\\]" . 'ios-simulator-warning-face)
+    ;; SDK/library update notices
+    ("New version.+available:.*$" . 'ios-simulator-update-face)
+    ;; Version numbers (e.g., 9.2.0.0, 10.6.0.0)
+    ("\\b[0-9]+\\.[0-9]+\\.[0-9]+\\(\\.[0-9]+\\)?\\b" . 'ios-simulator-version-face))
+  "Font lock keywords for iOS simulator log output.")
 
 (defconst ios-simulator-buffer-name "*iOS Simulator*"
   "Name of the buffer.")
@@ -959,6 +1094,10 @@ If TERMINATE-RUNNING is non-nil, terminate any running instance before launching
       (buffer-face-mode 1)
       (read-only-mode -1)
       (visual-line-mode 1)
+      ;; Enable syntax highlighting for log output
+      (when ios-simulator-colorize-output
+        (setq-local font-lock-defaults '(ios-simulator-log-font-lock-keywords t))
+        (font-lock-mode 1))
       ;; Enable ios-simulator-mode for the buffer
       (ios-simulator-mode 1))
 
@@ -973,10 +1112,18 @@ If TERMINATE-RUNNING is non-nil, terminate any running instance before launching
                              (when (buffer-live-p (process-buffer proc))
                                (with-current-buffer (process-buffer proc)
                                  (let ((inhibit-read-only t)
-                                       (at-end (= (point) (point-max))))
+                                       (at-end (= (point) (point-max)))
+                                       (start-pos (point-max)))
                                    (save-excursion
                                      (goto-char (point-max))
-                                     (insert (ios-simulator-remove-control-m string)))
+                                     ;; Apply ANSI color codes and remove control-M
+                                     (let ((cleaned-string (ios-simulator-remove-control-m string)))
+                                       (insert (if ios-simulator-colorize-output
+                                                   (ansi-color-apply cleaned-string)
+                                                 cleaned-string)))
+                                     ;; Re-fontify the newly inserted region
+                                     (when (and ios-simulator-colorize-output font-lock-mode)
+                                       (font-lock-ensure start-pos (point-max))))
                                    (when at-end
                                      (goto-char (point-max))
                                      (dolist (window (get-buffer-window-list (current-buffer) nil t))

@@ -724,12 +724,60 @@ brew install xcode-build-server
 The package automatically runs `xcode-build-server config` when you open a project, creating the necessary configuration file. After building your project, the build output is parsed and fed to `xcode-build-server parse` to keep the LSP server synchronized with your build state.
 
 ### ios-simulator.el
-iOS Simulator control and log viewing.
+iOS Simulator control and log viewing with syntax-highlighted console output.
 
 **Key functions:**
 - `ios-simulator:run` - Launch app in simulator
 - `ios-simulator:view-logs` - View simulator logs
 - `ios-simulator:reset` - Reset simulator state
+
+#### Colorized Console Output
+
+The simulator output buffer features syntax highlighting for easier log analysis:
+
+**Error Detection (Red):**
+- Objective-C runtime errors: `*** -[NSMutableArray addObjectsFromArray:]: array argument is not an NSArray`
+- ThreadSanitizer/AddressSanitizer: `WARNING: ThreadSanitizer: race on NSMutableArray`
+- Fatal signals: `DEADLYSIGNAL`, `SEGV`, `SIGABRT`
+- Generic errors: Lines containing `ERROR:` or `ERROR -`
+- HTTP error codes: `404`, `500`, `503` (4xx/5xx status codes)
+
+**Warning Detection (Yellow):**
+- Warning messages: Lines containing `WARNING:` or `WARNING -`
+- Log levels: `[lvl=3]` and similar patterns
+
+**Informational:**
+- Timestamps: `2025-12-05 10:58:48.588` (dimmed)
+- Categories: `[Intercom]`, `[CoreData]` (highlighted)
+- URLs: `https://api.example.com/endpoint` (link style, clickable)
+- HTTP success codes: `200`, `201` (green)
+- Version numbers: `9.2.0.0`, `10.6.0.0`
+- Update notices: `New version of Google Maps SDK available: 10.6.0.0`
+
+**Stack Traces:**
+- Frame numbers: `#0`, `#1`, `#2` (highlighted)
+- Memory addresses: `0x16b617000` (string color)
+- Thread identifiers: `Thread T123`, `tid=117645`
+
+**Configuration:**
+```elisp
+;; Disable colorized output (default: t)
+(setq ios-simulator-colorize-output nil)
+```
+
+**Customizable Faces:**
+- `ios-simulator-error-face` - Errors (inherits from `error`)
+- `ios-simulator-warning-face` - Warnings (inherits from `warning`)
+- `ios-simulator-debug-face` - Debug messages
+- `ios-simulator-info-face` - Info/categories
+- `ios-simulator-url-face` - URLs (inherits from `link`)
+- `ios-simulator-http-error-face` - HTTP 4xx/5xx codes
+- `ios-simulator-http-success-face` - HTTP 2xx codes
+- `ios-simulator-objc-error-face` - ObjC runtime errors
+- `ios-simulator-version-face` - Version numbers
+- `ios-simulator-thread-face` - Thread identifiers
+- `ios-simulator-address-face` - Memory addresses
+- `ios-simulator-stackframe-face` - Stack frame numbers
 
 ### ios-device.el
 Physical device deployment and debugging.
@@ -1698,7 +1746,21 @@ Developed for efficient iOS/macOS development in Emacs.
 
 ## Changelog
 
-### Latest Updates (2025-10-31)
+### Latest Updates (2025-12-05)
+
+#### 🎨 Colorized Simulator Console Output
+- **Syntax highlighting for simulator logs**
+  - Errors highlighted in red (ObjC runtime errors, ThreadSanitizer, fatal signals)
+  - Warnings highlighted in yellow
+  - URLs displayed as clickable links
+  - HTTP status codes color-coded (4xx/5xx red, 2xx green)
+  - Version numbers, timestamps, and categories highlighted
+  - Stack traces with colored frame numbers and memory addresses
+  - ANSI escape code support for colored output from the simulator
+  - Configurable via `ios-simulator-colorize-output` (default: enabled)
+  - Customizable faces for all log categories
+
+### Updates (2025-10-31)
 
 #### 🔄 Multi-Project Support
 - **Buffer-local project state**
