@@ -13,6 +13,7 @@
 ;;; Code:
 
 (require 'project)
+(require 'transient)
 (require 'xcodebuildserver)
 (require 'swift-project)
 (require 'xcode-build-config)
@@ -2296,6 +2297,27 @@ Returns the number of processes killed."
           (message "No active build process (buffer exists but no process)"))))
      
      (t (message "No active build process")))))
+
+;;; Transient Menu
+
+;;;###autoload
+(transient-define-prefix xcode-project-transient ()
+  "Xcode Project actions."
+  ["Project Info"
+   [("i" "Show project info" xcode-project-show-project-info)
+    ("D" "Debug build folder" xcode-project-debug-build-folder-detection)
+    ("s" "Build status" xcode-project-build-status)]]
+  ["Build Control"
+   [("k" "Interrupt build" xcode-project-interrupt-build)
+    ("K" "Kill all xcodebuild" xcode-project-kill-all-xcodebuild-processes)
+    ("l" "Check compile lock" xcode-project-check-compile-lock-error)]
+   [("d" "Start debugging" xcode-project-start-debugging)
+    ("g" "Toggle debug mode" xcode-project-toggle-debug)]]
+  ["Cache Management"
+   [("c" "Clear build folder cache" xcode-project-clear-build-folder-cache)
+    ("C" "Cache diagnostics" xcode-project-cache-diagnostics)]
+   [("r" "Reset project state" xcode-project-reset)]]
+  [("q" "Quit" transient-quit-one)])
 
 (provide 'xcode-project)
 ;;; xcode-project.el ends here

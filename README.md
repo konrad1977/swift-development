@@ -196,6 +196,8 @@ swift/
 ├── xcodebuildserver.el            # Build server configuration
 ├── ios-simulator.el               # iOS Simulator integration
 ├── ios-device.el                  # Physical device management
+├── swift-package-manager.el       # SPM dependency UI
+├── xcode-instruments.el           # Instruments profiling integration
 ├── localizeable-mode.el           # Localization file editing
 ├── apple-docs-query.el            # Apple documentation lookup
 ├── hacking-with-swift.el          # Hacking with Swift integration
@@ -210,9 +212,18 @@ Main entry point with build orchestration, app running, and cache warming.
 
 **Key functions:**
 - `swift-development-compile-app` - Build the current project
-- `swift-development-run-app` - Run app in simulator
+- `swift-development-compile-and-run` - Build and run in one command
+- `swift-development-quick-rebuild` - Fast rebuild with all optimizations
 - `swift-development-warm-build-cache` - Precompile system frameworks
-- `swift-development-toggle-analysis-mode` - Adjust compilation performance
+- `swift-development-build-status` - Show current build status
+- `swift-development-show-last-build-errors` - Display recent build errors
+- `swift-development-toggle-analysis-mode` - Cycle through analysis modes
+- `swift-development-enable-turbo-mode` - Maximum build speed
+- `swift-development-enable-balanced-mode` - Balanced speed/debugging
+- `swift-development-clear-derived-data` - Clear Xcode's DerivedData
+- `swift-development-reset` - Reset all build settings
+
+**Transient menu:** `M-x swift-development-transient`
 
 ### xcode-project.el
 Xcode project and scheme management, build folders, and debugging. Uses buffer-local variables for multi-project support.
@@ -224,6 +235,11 @@ Xcode project and scheme management, build folders, and debugging. Uses buffer-l
 - `xcode-project-cache-diagnostics` - View cache status
 - `xcode-project-toggle-device-choice` - Switch between simulator/device
 - `xcode-project-start-debugging` - Launch debugger (requires dape)
+- `xcode-project-interrupt-build` - Stop current build
+- `xcode-project-kill-all-xcodebuild-processes` - Kill all xcodebuild processes
+- `xcode-project-clear-build-folder-cache` - Clear cached build folder
+
+**Transient menu:** `M-x xcode-project-transient`
 
 ### swift-project-settings.el
 Persistent project settings that survive Emacs restarts. Settings are stored per-project and automatically loaded into buffer-local variables when you open a Swift file, enabling seamless multi-project workflows.
@@ -310,6 +326,8 @@ The LSP configuration automatically:
 
 ### swiftui-preview.el
 **Fully automatic SwiftUI preview generation and display within Emacs** - with intelligent view routing, automatic #Preview macro support, and zero-config setup.
+
+**Transient menu:** `M-x swiftui-preview-transient`
 
 #### What's New (2025-10-30)
 
@@ -727,9 +745,19 @@ The package automatically runs `xcode-build-server config` when you open a proje
 iOS Simulator control and log viewing with syntax-highlighted console output.
 
 **Key functions:**
-- `ios-simulator:run` - Launch app in simulator
-- `ios-simulator:view-logs` - View simulator logs
-- `ios-simulator:reset` - Reset simulator state
+- `ios-simulator-choose-simulator` - Select a simulator interactively
+- `ios-simulator-boot` - Boot the selected simulator
+- `ios-simulator-shutdown-simulator` - Shutdown a specific simulator
+- `ios-simulator-shut-down-all` - Shutdown all running simulators
+- `ios-simulator-screenshot` - Take a screenshot
+- `ios-simulator-toggle-recording` - Start/stop video recording
+- `ios-simulator-send-notification` - Send push notification to app
+- `ios-simulator-change-language` - Change simulator language
+- `ios-simulator-set-location-preset` - Set GPS location
+- `ios-simulator-privacy-grant` - Grant privacy permissions
+- `ios-simulator-paste-from-kill-ring` - Paste text to simulator
+
+**Transient menu:** `M-x ios-simulator-transient`
 
 #### Colorized Console Output
 
@@ -786,8 +814,51 @@ The simulator output buffer features syntax highlighting for easier log analysis
 Physical device deployment and debugging.
 
 **Key functions:**
-- `ios-device:choose-device` - Select a connected device
-- `ios-device:reset-privacy` - Reset app privacy settings on device
+- `ios-device-choose-device` - Select a connected device
+- `ios-device-start-logging` - Stream logs from physical device
+- `ios-device-screenshot` - Take screenshot from device
+- `ios-device-reset` - Reset device selection
+
+**Transient menu:** `M-x ios-device-transient`
+
+### swift-package-manager.el
+Interactive UI for managing Swift Package Manager dependencies.
+
+**Key functions:**
+- `spm-list-dependencies` - Show all dependencies in a dedicated buffer with versions and sources
+- `spm-add-package` - Add a new Swift package (supports GitHub shorthand: `user/repo`)
+- `spm-remove-package` - Remove a package interactively
+- `spm-update-package` - Update a specific package
+- `spm-update-all` - Update all packages to latest compatible versions
+- `spm-resolve` - Resolve package dependencies
+- `spm-dependency-graph` - Generate DOT-format dependency graph
+- `spm-clean-cache` - Clean SPM cache directories
+- `spm-describe-package` - Show package description
+
+**Features:**
+- Parses `Package.resolved` for accurate version information
+- Supports both SPM packages and Xcode workspace packages
+- Interactive completion for package selection
+- Colorized dependency list with package names, versions, and sources
+
+**Transient menu:** `M-x spm-transient`
+
+### xcode-instruments.el
+Xcode Instruments integration for profiling iOS apps.
+
+**Key functions:**
+- `xcode-instruments-run` - Run Instruments with a selected template
+- `xcode-instruments-open-trace` - Open the most recent trace file
+- `xcode-instruments-list-templates` - List available Instruments templates
+
+**Available templates:**
+- Time Profiler - CPU usage and performance analysis
+- Allocations - Memory allocation tracking
+- Leaks - Memory leak detection
+- Network - Network activity monitoring
+- Energy Log - Battery usage analysis
+
+**Transient menu:** `M-x xcode-instruments-transient`
 
 ### swift-refactor.el
 Code refactoring utilities.
@@ -1749,7 +1820,55 @@ Developed for efficient iOS/macOS development in Emacs.
 
 ## Changelog
 
-### Latest Updates (2025-12-05)
+### Latest Updates (2025-12-06)
+
+#### 🎛️ Comprehensive Transient Menus
+- **Main transient menu** (`swift-development-transient`)
+  - Shows current status: scheme, selected simulator, booted simulators
+  - Build & Run: compile, compile & run, quick rebuild, build SPM package
+  - Build Modes: turbo mode, balanced mode, fast analysis, minimal analysis
+  - Cache & Status: warm cache, build status, show errors, clear caches, reset
+  - Packages: resolve, list dependencies, update all (integrated with SPM UI)
+  - Sub-Menus: quick access to all specialized transient menus
+  - Settings: toggle debug, analysis mode, device/sim choice, build output
+
+- **iOS Simulator transient** (`ios-simulator-transient`)
+  - Selection: choose simulator, reset, list booted
+  - Control: boot, shutdown, shutdown all, change language, terminate app
+  - Screenshots & Recording: screenshot, screenshot to clipboard, toggle recording
+  - Location: set GPS preset, clear location
+  - Status Bar: Apple style, clear
+  - Apps & Data: list apps, uninstall, open app data, open URL
+  - Privacy: grant/revoke permissions
+  - Clipboard & Notifications: paste, copy, send notification
+
+- **iOS Device transient** (`ios-device-transient`)
+  - Device selection and logging control
+  - Screenshot support for physical devices
+
+- **SPM transient** (`spm-transient`)
+  - List dependencies with version info
+  - Add, update, remove packages
+  - Resolve dependencies, clean cache
+  - Dependency graph visualization
+
+- **SwiftUI Preview transient** (`swiftui-preview-transient`)
+  - Generate preview, hot-reload support
+  - View existing previews, refresh, open directory
+  - Cleanup and debug options
+
+- **Xcode Project transient** (`xcode-project-transient`)
+  - Project info, build folder detection, build status
+  - Interrupt build, kill processes, check compile lock
+  - Start debugging, toggle debug mode
+  - Clear cache, cache diagnostics, reset
+
+- **Xcode Instruments transient** (`xcode-instruments-transient`)
+  - Time Profiler, Allocations, Leaks profiling
+  - Network and Energy Log analysis
+  - Open recent trace files
+
+### Updates (2025-12-05)
 
 #### 🎨 Colorized Simulator Console Output
 - **Syntax highlighting for simulator logs**
@@ -1910,6 +2029,27 @@ The mode automatically activates for:
 ### Unified Hook System
 
 All Swift-related setup functions (auto-warm cache, auto-show preview, etc.) use `swift-development-mode-hook` for consistent initialization across both traditional `swift-mode` and tree-sitter `swift-ts-mode`. This ensures features work reliably regardless of which Swift mode you use.
+
+### Transient Menus
+
+The package includes comprehensive transient menus (magit-style popup menus) for all major functionality:
+
+#### Main Menu
+- `M-x swift-development-transient` - Main menu with status display (scheme, simulator, booted devices)
+
+#### Sub-Menus (accessible from main menu)
+- `M-x ios-simulator-transient` - Full simulator control (boot, shutdown, screenshots, location, privacy, notifications)
+- `M-x ios-device-transient` - Physical device management (selection, logging, screenshots)
+- `M-x spm-transient` - Swift Package Manager UI (list, add, update, resolve dependencies)
+- `M-x swiftui-preview-transient` - SwiftUI preview generation and management
+- `M-x xcode-project-transient` - Xcode project info, build control, cache management
+- `M-x xcode-instruments-transient` - Instruments profiling (Time Profiler, Allocations, Leaks, etc.)
+
+#### Quick Access
+Recommended binding for the main transient menu:
+```elisp
+(global-set-key (kbd "C-c s") 'swift-development-transient)
+```
 
 ### Key Bindings
 

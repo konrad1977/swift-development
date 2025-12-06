@@ -15,10 +15,12 @@
 
 (require 'cl-lib)
 (require 'compile) ;; For compilation-mode when not using periphery
+(require 'transient)
 (require 'ios-device nil t)
 (require 'ios-simulator nil t)
 (require 'swift-cache nil t) ;; Unified caching system
 (require 'swift-error-handler nil t) ;; Enhanced error handling
+(require 'swift-package-manager nil t) ;; SPM dependency management
 (require 'swift-project-settings nil t) ;; Persistent project settings
 (require 'swiftui-preview nil t) ;; SwiftUI preview support
 (require 'xcode-build-config nil t) ;; Build configuration and command construction
@@ -2427,6 +2429,59 @@ swift-project-debug, swift-cache-debug, and ios-device-debug."
 
 ;; Load the minor mode for unified keybindings
 (require 'swift-development-mode nil t)
+
+;;; Transient Menu
+
+(defun swift-development--transient-status ()
+  "Return current status for transient header."
+  (let* ((scheme (ignore-errors (xcode-project-scheme-display-name)))
+         (simulator (ignore-errors ios-simulator--current-simulator-name))
+         (booted (ignore-errors (ios-simulator-get-all-booted-simulators)))
+         (booted-names (mapcar #'car booted)))
+    (concat
+     (format "Scheme: %s" (propertize (or scheme "Not selected") 'face 'font-lock-constant-face))
+     " | "
+     (format "Simulator: %s" (propertize (or simulator "Not selected") 'face 'font-lock-type-face))
+     (when booted-names
+       (format " | Booted: %s" (propertize (string-join booted-names ", ") 'face 'success))))))
+
+;;;###autoload
+(transient-define-prefix swift-development-transient ()
+  "Swift Development - Main Menu."
+  [:description swift-development--transient-status]
+  ["Build & Run"
+   [("c" "Compile" swift-development-compile-app)
+    ("r" "Compile & Run" swift-development-compile-and-run)
+    ("q" "Quick rebuild" swift-development-quick-rebuild)]
+   [("b" "Build SPM package" swift-development-build-swift-package)]]
+  ["Build Modes"
+   [("1" "Turbo mode" swift-development-enable-turbo-mode)
+    ("2" "Balanced mode" swift-development-enable-balanced-mode)
+    ("3" "Fast analysis" swift-development-set-fast-mode)
+    ("4" "Minimal analysis" swift-development-set-minimal-mode)]]
+  ["Cache & Status"
+   [("w" "Warm build cache" swift-development-warm-build-cache)
+    ("B" "Build status" swift-development-build-status)
+    ("e" "Show last errors" swift-development-show-last-build-errors)]
+   [("C" "Clear hash cache" swift-development-clear-hash-cache)
+    ("X" "Clear DerivedData" swift-development-clear-derived-data)
+    ("R" "Reset all" swift-development-reset)]]
+  ["Packages"
+   [("P" "Resolve packages" spm-resolve)
+    ("L" "List dependencies" spm-list-dependencies)
+    ("U" "Update all packages" spm-update-all)]]
+  ["Sub-Menus"
+   [("s" "Simulator..." ios-simulator-transient)
+    ("d" "Device..." ios-device-transient)
+    ("p" "SPM UI..." spm-transient)]
+   [("v" "Preview..." swiftui-preview-transient)
+    ("x" "Xcode Project..." xcode-project-transient)]]
+  ["Settings"
+   [("D" "Toggle debug" swift-development-toggle-debug)
+    ("A" "Toggle analysis" swift-development-toggle-analysis-mode)
+    ("T" "Toggle device/sim" swift-development-toggle-device-choice)
+    ("O" "Toggle build output" swift-development-toggle-build-output)]]
+  [("Q" "Quit" transient-quit-one)])
 
 (provide 'swift-development)
 ;;; swift-development.el ends here

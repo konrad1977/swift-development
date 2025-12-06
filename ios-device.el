@@ -15,6 +15,7 @@
 (require 'periphery-helper nil t)
 (require 'cl-lib)
 (require 'json)
+(require 'transient)
 
 (defgroup ios-device nil
   "Customization group for ios-device package."
@@ -67,8 +68,7 @@
       (setq-local right-fringe-width 0)
       (setq-local ios-device--current-device-id device-id)
       (setq-local ios-device--current-app-identifier appIdentifier)
-      ;; (add-hook 'kill-buffer-hook #'ios-device-cleanup nil t)
-      )
+      (add-hook 'kill-buffer-hook #'ios-device-cleanup nil t))
 
     (async-start-command-to-string
      :command command
@@ -118,15 +118,17 @@
           identifier
           appIdentifier))
 
-(defun ios-device-reset()
-  "Reset the iOS device."
+(defun ios-device-reset ()
+  "Reset the iOS device selection and state."
+  (interactive)
   (ios-device-kill-buffer)
   (setq ios-device--current-buffer-name nil)
   (setq ios-device--current-device-id nil)
   (setq ios-device--current-device-udid nil)
   (setq ios-device--current-install-command nil)
   (setq ios-device--current-app-identifier nil)
-  (setq ios-device--current-buffer nil))
+  (setq ios-device--current-buffer nil)
+  (message "iOS device selection reset"))
 
 
 (defun ios-device-cleanup ()
@@ -169,8 +171,16 @@
 
 ;; Debug function to see raw output
 (defun ios-device-debug-output ()
-  "Debug function to see what devicectl actually return."
-  (shell-command-to-string "xcrun devicectl list devices"))
+  "Show raw devicectl output for debugging."
+  (interactive)
+  (let ((output (shell-command-to-string "xcrun devicectl list devices")))
+    (with-current-buffer (get-buffer-create "*iOS Devices*")
+      (erase-buffer)
+      (insert "Connected iOS Devices:\n")
+      (insert (make-string 50 ?─) "\n\n")
+      (insert output)
+      (goto-char (point-min)))
+    (display-buffer "*iOS Devices*")))
 
 ;; Parse all devices from devicectl output
 (defun ios-device-parse-devices ()
@@ -195,7 +205,8 @@ Each device is represented as a plist with :name, :hostname, :identifier, :state
 
 ;; Interactive device selection by name only
 (defun ios-device-choose-device ()
-  "Select a device by name and return its UUID identifier."
+  "Select a device by name and set it as current device."
+  (interactive)
   (let ((devices (ios-device-parse-devices)))
     (cond
      ((null devices)
@@ -304,23 +315,26 @@ Returns the process ID (PID) on success, nil on failure."
                           (shell-quote-argument device-id)
                           (shell-quote-argument app-identifier)
                           (shell-quote-argument json-file)))
-         (output (shell-command-to-string command))
          (pid nil))
-    (when ios-device-debug
-      (message "Device launch command: %s" command)
-      (message "Device launch output: %s" output))
-    ;; Parse the JSON output to get the PID
-    (when (file-exists-p json-file)
-      (condition-case err
-          (let* ((json-data (json-read-file json-file))
-                 (result (cdr (assoc 'result json-data)))
-                 (process-info (cdr (assoc 'process result))))
-            (setq pid (cdr (assoc 'processIdentifier process-info)))
-            (when ios-device-debug
-              (message "Launched app with PID: %s" pid)))
-        (error
-         (message "Failed to parse devicectl JSON output: %s" (error-message-string err))))
-      (delete-file json-file))
+    (unwind-protect
+        (let ((output (shell-command-to-string command)))
+          (when ios-device-debug
+            (message "Device launch command: %s" command)
+            (message "Device launch output: %s" output))
+          ;; Parse the JSON output to get the PID
+          (when (file-exists-p json-file)
+            (condition-case err
+                (let* ((json-data (json-read-file json-file))
+                       (result (cdr (assoc 'result json-data)))
+                       (process-info (cdr (assoc 'process result))))
+                  (setq pid (cdr (assoc 'processIdentifier process-info)))
+                  (when ios-device-debug
+                    (message "Launched app with PID: %s" pid)))
+              (error
+               (message "Failed to parse devicectl JSON output: %s" (error-message-string err))))))
+      ;; Cleanup: always delete temp file
+      (when (file-exists-p json-file)
+        (delete-file json-file)))
     pid))
 
 (defun ios-device-get-device-name (device-id)
@@ -330,6 +344,184 @@ Returns the process ID (PID) on success, nil on failure."
                                    (string= (plist-get d :identifier) device-id))
                                  devices)))
       (plist-get device :name))))
+
+;;; Device Logging Support
+
+(defvar ios-device--log-process nil
+  "Current device log streaming process.")
+
+(defvar ios-device--log-buffer-name "*iOS Device Log*"
+  "Buffer name for device logs.")
+
+(defcustom ios-device-colorize-output t
+  "Whether to colorize device log output."
+  :type 'boolean
+  :group 'ios-device)
+
+;; Reuse face definitions from ios-simulator if available
+(defface ios-device-error-face
+  '((t (:inherit error :weight bold)))
+  "Face for error messages in device output."
+  :group 'ios-device)
+
+(defface ios-device-warning-face
+  '((t (:inherit warning :weight bold)))
+  "Face for warning messages in device output."
+  :group 'ios-device)
+
+(defface ios-device-debug-face
+  '((t (:inherit font-lock-comment-face)))
+  "Face for debug messages in device output."
+  :group 'ios-device)
+
+(defface ios-device-info-face
+  '((t (:inherit font-lock-function-name-face)))
+  "Face for info messages in device output."
+  :group 'ios-device)
+
+(defvar ios-device-log-font-lock-keywords
+  `(;; Error patterns
+    ("\\bERROR\\b\\|\\bFATAL\\b\\|\\bCRITICAL\\b" . 'ios-device-error-face)
+    ("Error Domain=\\w+ Code=[0-9]+" . 'ios-device-error-face)
+    ("\\*\\*\\* Terminating app" . 'ios-device-error-face)
+    ;; Warning patterns
+    ("\\bWARNING\\b\\|\\bWARN\\b" . 'ios-device-warning-face)
+    ;; Debug patterns
+    ("\\bDEBUG\\b\\|\\bdebug\\b" . 'ios-device-debug-face)
+    ;; Info patterns
+    ("\\bINFO\\b" . 'ios-device-info-face)
+    ;; Memory addresses
+    ("0x[0-9a-fA-F]+" . 'font-lock-constant-face)
+    ;; Timestamps
+    ("^[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\} [0-9:.]*" . 'font-lock-comment-face)
+    ;; URLs
+    ("https?://[^ \t\n\r\"'>)]*" . 'link))
+  "Font lock keywords for iOS device log output.")
+
+(define-derived-mode ios-device-log-mode special-mode "iOS-Device-Log"
+  "Major mode for viewing iOS device logs."
+  (setq buffer-read-only nil)
+  (when ios-device-colorize-output
+    (setq font-lock-defaults '(ios-device-log-font-lock-keywords t)))
+  (setq-local truncate-lines t)
+  (setq-local scroll-conservatively 101)
+  (auto-revert-mode -1))
+
+;;;###autoload
+(defun ios-device-start-logging (&optional app-filter)
+  "Start streaming logs from the connected physical device.
+With optional APP-FILTER, only show logs from that app bundle ID."
+  (interactive)
+  (let* ((device-id (ios-device-identifier))
+         (buffer (get-buffer-create ios-device--log-buffer-name)))
+    (unless device-id
+      (user-error "No device connected or selected"))
+    ;; Kill existing log process if any
+    (ios-device-stop-logging)
+    (with-current-buffer buffer
+      (ios-device-log-mode)
+      (erase-buffer)
+      (insert (format "=== Device Log: %s ===\n\n"
+                      (or (ios-device-get-device-name device-id) device-id))))
+    ;; Start the log streaming process
+    (let* ((cmd-parts (list "xcrun" "devicectl" "device" "process"
+                            "log" "--device" device-id "--style" "compact"))
+           (proc (apply #'start-process "ios-device-log" buffer cmd-parts)))
+      (setq ios-device--log-process proc)
+      (set-process-filter proc #'ios-device--log-filter)
+      (set-process-sentinel proc #'ios-device--log-sentinel)
+      (set-process-query-on-exit-flag proc nil))
+    (pop-to-buffer buffer)
+    (goto-char (point-max))
+    (message "Device logging started. Use M-x ios-device-stop-logging to stop.")))
+
+(defun ios-device--log-filter (proc string)
+  "Process filter for device log PROC, handling STRING output."
+  (when (buffer-live-p (process-buffer proc))
+    (with-current-buffer (process-buffer proc)
+      (let ((inhibit-read-only t)
+            (moving (= (point) (process-mark proc))))
+        (save-excursion
+          (goto-char (process-mark proc))
+          (insert string)
+          (set-marker (process-mark proc) (point))
+          ;; Apply font-lock if enabled
+          (when ios-device-colorize-output
+            (font-lock-fontify-region (line-beginning-position -50)
+                                      (point))))
+        (when moving
+          (goto-char (process-mark proc)))))))
+
+(defun ios-device--log-sentinel (proc event)
+  "Sentinel for device log PROC handling EVENT."
+  (when (string-match-p "\\(?:finished\\|exited\\|killed\\)" event)
+    (setq ios-device--log-process nil)
+    (when (buffer-live-p (process-buffer proc))
+      (with-current-buffer (process-buffer proc)
+        (let ((inhibit-read-only t))
+          (goto-char (point-max))
+          (insert (format "\n\n=== Log streaming ended: %s ==="
+                          (string-trim event))))))))
+
+;;;###autoload
+(defun ios-device-stop-logging ()
+  "Stop the device log streaming."
+  (interactive)
+  (when (and ios-device--log-process
+             (process-live-p ios-device--log-process))
+    (kill-process ios-device--log-process)
+    (setq ios-device--log-process nil)
+    (message "Device logging stopped")))
+
+;;;###autoload
+(defun ios-device-clear-log ()
+  "Clear the device log buffer."
+  (interactive)
+  (when-let ((buffer (get-buffer ios-device--log-buffer-name)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert "=== Log cleared ===\n\n")))))
+
+;;;###autoload
+(defun ios-device-screenshot ()
+  "Take a screenshot from the connected device."
+  (interactive)
+  (let* ((device-id (ios-device-identifier))
+         (timestamp (format-time-string "%Y%m%d-%H%M%S"))
+         (filename (expand-file-name
+                    (format "device-screenshot-%s.png" timestamp)
+                    "~/Desktop/")))
+    (unless device-id
+      (user-error "No device connected or selected"))
+    (message "Taking screenshot...")
+    (let ((result (shell-command-to-string
+                   (format "xcrun devicectl device capture screenshot --device %s --output %s"
+                           (shell-quote-argument device-id)
+                           (shell-quote-argument filename)))))
+      (if (file-exists-p filename)
+          (progn
+            (message "Screenshot saved to %s" filename)
+            (when (y-or-n-p "Open screenshot? ")
+              (start-process "open-screenshot" nil "open" filename)))
+        (message "Screenshot failed: %s" result)))))
+
+;;; Transient Menu
+
+;;;###autoload
+(transient-define-prefix ios-device-transient ()
+  "iOS Physical Device actions."
+  ["Device Selection"
+   [("c" "Choose device" ios-device-choose-device)
+    ("r" "Reset selection" ios-device-reset)
+    ("l" "List devices (debug)" ios-device-debug-output)]]
+  ["Logging"
+   [("L" "Start logging" ios-device-start-logging)
+    ("S" "Stop logging" ios-device-stop-logging)
+    ("C" "Clear log buffer" ios-device-clear-log)]]
+  ["Screenshots"
+   [("p" "Take screenshot" ios-device-screenshot)]]
+  [("q" "Quit" transient-quit-one)])
 
 (provide 'ios-device)
 ;;; ios-device.el ends here

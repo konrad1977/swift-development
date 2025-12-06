@@ -1369,5 +1369,28 @@ Installs package and creates registry if needed."
 
     (message "✓ SwiftUI Preview setup complete! Run M-x swiftui-preview-generate to create preview.")))
 
+;;; Transient Menu
+
+(require 'transient)
+
+;;;###autoload
+(transient-define-prefix swiftui-preview-transient ()
+  "SwiftUI Preview actions."
+  ["Generate Preview"
+   [("p" "Generate preview" swiftui-preview-generate)
+    ("h" "Generate with hot-reload" swiftui-preview-generate-with-hot-reload)
+    ("s" "Stop hot-reload" swiftui-preview-stop-hot-reload)]]
+  ["View Previews"
+   [("r" "Refresh current" swiftui-preview-refresh)
+    ("e" "Show existing previews" swiftui-preview-show-existing)
+    ("d" "Open preview directory" swiftui-preview-show-directory)]]
+  ["Cleanup"
+   [("c" "Clear preview window" swiftui-preview-clear)
+    ("C" "Clean temp files" swiftui-preview-clean-temp-files)]]
+  ["Debug"
+   [("g" "Toggle debug mode" swiftui-preview-toggle-debug)
+    ("t" "Test auto-show" swiftui-preview-test-auto-show)]]
+  [("q" "Quit" transient-quit-one)])
+
 (provide 'swiftui-preview)
 ;;; swiftui-preview.el ends here
