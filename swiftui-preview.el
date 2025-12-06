@@ -1,10 +1,11 @@
 ;;; swiftui-preview.el --- SwiftUI preview support for swift-development -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025
-
+;; Copyright (C) 2025 Mikael Konradsson
 ;; Author: Mikael Konradsson
-;; Keywords: Swift, swiftui, preview, ios
+;; Version: 0.5.2
 ;; Package-Requires: ((emacs "28.1"))
+;; URL: https://github.com/konrad1977/swift-development
+;; Keywords: Swift, swiftui, preview, ios
 
 ;;; Commentary:
 
@@ -207,6 +208,10 @@ If nil and `swiftui-preview-fit-to-window' is nil, no height limit."
   "Timestamp of last preview display operation.
 Used to debounce buffer-change reactions after auto-show.")
 
+(defvar swiftui-preview--last-build-failed nil
+  "Non-nil if last preview build failed.
+Used to retry preview generation after fixing errors.")
+
 ;;; Directory Management
 
 (defun swiftui-preview--directory (project-root)
@@ -367,6 +372,7 @@ Uses fast rebuild detection to skip unnecessary rebuilds."
           (when swiftui-preview-debug
             (message "[SwiftUI Preview] App is up-to-date, skipping rebuild"))
           (message "Preview: App up-to-date, launching...")
+          (setq swiftui-preview--last-build-failed nil)
           (funcall callback))
 
       ;; Need to rebuild
@@ -399,13 +405,16 @@ Uses fast rebuild detection to skip unnecessary rebuilds."
             (with-current-buffer compilation-buffer
               (add-hook 'compilation-finish-functions
                         (lambda (buffer status)
-                          (when (string-match "finished" status)
+                          (cond
+                           ((string-match "finished" status)
+                            (setq swiftui-preview--last-build-failed nil)
                             (message "Preview updated, launching...")
                             (funcall callback))
-                          (when (string-match "exited abnormally" status)
-                            (message "Build failed. Check *compilation* buffer for details.")
+                           ((string-match "exited abnormally" status)
+                            (setq swiftui-preview--last-build-failed t)
+                            (message "Build failed. Fix errors and save to retry preview.")
                             ;; Show compilation buffer on failure
-                            (display-buffer buffer)))
+                            (display-buffer buffer))))
                         nil t))))))))
 
 (defun swiftui-preview--update-preview-registry-for-current-view (project-root view-name &optional wrapper-names)
@@ -1003,11 +1012,13 @@ Called from swift-mode-hook when swiftui-preview-auto-show-on-open is t."
 
 (defun swiftui-preview--auto-update-on-save ()
   "Automatically regenerate preview when saving Swift file.
-Only triggers if preview buffer is currently visible."
+Only triggers if preview buffer is currently visible, OR if the last
+build failed (to allow automatic retry after fixing errors)."
   (when (and swiftui-preview-auto-update-on-save
              (buffer-file-name)
              (string-match-p "\\.swift$" (buffer-file-name))
-             (get-buffer-window swiftui-preview-buffer-name))
+             (or (get-buffer-window swiftui-preview-buffer-name)
+                 swiftui-preview--last-build-failed))
     ;; Capture current buffer context immediately
     (let* ((saved-buffer (current-buffer))
            (saved-file (buffer-file-name))
