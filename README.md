@@ -273,12 +273,18 @@ When `swift-development-auto-launch-simulator` is `t` (default), the simulator a
 ```
 
 ### xcode-build-config.el
-Build configuration, command construction, and optimization flags.
+Build configuration, command construction, and optimization flags with intelligent caching.
 
 **Key functions:**
 - `xcode-build-config-build-app-command` - Generate xcodebuild command
 - `xcode-build-config-setup-build-environment` - Configure environment vars
 - `xcode-build-config-generate-fast-build-xcconfig` - Create optimized xcconfig
+
+**Build Command Caching:**
+Build commands are automatically cached per project/scheme/device combination. This means:
+- Repeated builds skip command regeneration overhead
+- Cache is automatically invalidated when scheme or device changes
+- Faster build initiation for iterative development
 
 **Key variables:**
 - `xcode-build-config-other-swift-flags` - Custom Swift compiler flags
@@ -1820,7 +1826,22 @@ Developed for efficient iOS/macOS development in Emacs.
 
 ## Changelog
 
-### Latest Updates (2025-12-06)
+### Latest Updates (2025-12-18)
+
+#### 🔔 Unified Notification System
+- **Consistent notifications across all modules**
+  - Build, clean, and package operations now use unified transient notifications
+  - Notifications no longer disrupt minibuffer input
+  - Consistent duration and styling across all commands
+
+- **Build command caching**
+  - Build commands cached per project/scheme/device combination
+  - Faster build initiation for iterative development
+
+- **New keybinding**
+  - `C-c s` now built into `swift-development-mode` for quick transient menu access
+
+### Updates (2025-12-06)
 
 #### 🎛️ Comprehensive Transient Menus
 - **Main transient menu** (`swift-development-transient`)
@@ -2052,6 +2073,9 @@ Recommended binding for the main transient menu:
 ```
 
 ### Key Bindings
+
+#### Transient Menu
+- `C-c s` - Open main transient menu (`swift-development-transient`)
 
 #### Build & Run
 - `C-c C-c` - Compile and run app
