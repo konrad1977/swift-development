@@ -880,9 +880,9 @@ This should be used for user-facing messages and UI, not for shell commands."
 (defun xcode-project-fetch-or-load-build-configuration ()
   "Get the build configuration from the scheme file."
   (unless xcode-project--current-build-configuration
+    (xcode-project-notify :message "Fetching build configuration..." :seconds 2)
     ;; Ensure scheme is loaded first
     (xcode-project-scheme)
-    (xcode-project-notify :message "Fetching build configuration...")
     (let* ((scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme "")))
            (project-root (xcode-project-project-root))
            (xcodeproj-dirs (directory-files project-root t "\\.xcodeproj$"))
@@ -928,9 +928,9 @@ This should be used for user-facing messages and UI, not for shell commands."
 (defun xcode-project-fetch-or-load-app-identifier ()
   "Get the app identifier for the current configiration."
   (unless xcode-project--current-app-identifier
+    (xcode-project-notify :message "Fetching app identifier..." :seconds 2)
     ;; Ensure scheme is loaded first
     (xcode-project-scheme)
-    (xcode-project-notify :message "Fetching app identifier...")
     (let ((config (xcode-project-fetch-or-load-build-configuration)))
       (when xcode-project-debug
         (message "xcode-project-fetch-or-load-app-identifier - scheme: %s, config: %s"

@@ -16,6 +16,13 @@
 
 ;; Optional dependencies
 (require 'swift-cache nil t)
+(require 'swift-notification nil t)
+
+(defun xcode-build-config--notify (message &optional seconds)
+  "Send notification with MESSAGE, shown for SECONDS (default 2)."
+  (if (fboundp 'swift-notification-send)
+      (swift-notification-send :message message :seconds (or seconds 2))
+    (message "%s" message)))
 
 ;; Forward declarations to avoid circular dependency
 (declare-function xcode-project-project-root "xcode-project")
@@ -48,7 +55,7 @@
   :type '(repeat string)
   :group 'xcode-build-config)
 
-(defcustom xcode-build-config-other-swift-flags '("-no-whole-module-optimization")
+(defcustom xcode-build-config-other-swift-flags '("-no-whole-module-optimization" "-DDEBUG")
   "Additional flags to pass to the Swift compiler (OTHER_SWIFT_FLAGS)."
   :type '(repeat string)
   :group 'xcode-build-config)
@@ -180,8 +187,8 @@ Captures file path, line number, and column number."
 (defvar xcode-build-config--current-environment-x86 nil
   "Whether to use x86_64 architecture.")
 
-(defvar xcode-build-config--current-build-command nil
-  "Cached build command for current configuration.")
+(defvar xcode-build-config--build-command-cache (make-hash-table :test 'equal)
+  "Cache of build commands keyed by (project-root sim-id device-id).")
 
 ;;; ============================================================================
 ;;; Utility Functions
@@ -251,10 +258,10 @@ Based on xcode-build-config-skip-package-resolution setting."
 Returns the command string to include in the build command or empty string."
   (if (xcode-build-config-should-resolve-packages-p)
       (progn
-        (message "Resolving Swift package dependencies...")
+        (xcode-build-config--notify "Resolving Swift package dependencies..." 3)
         "-resolvePackageDependencies \\")
     (progn
-      (message "Skipping package resolution (packages exist or skip enabled)")
+      (xcode-build-config--notify "Skipping package resolution (cached)" 2)
       "")))
 
 (defun xcode-build-config-get-package-optimization-flags ()
@@ -331,10 +338,10 @@ For .build-based builds, we should resolve if packages aren't available locally 
   "Get package resolution flags for .build-based builds."
   (if (xcode-build-config-should-resolve-packages-for-build)
       (progn
-        (message "Resolving Swift package dependencies for .build...")
+        (xcode-build-config--notify "Resolving Swift package dependencies..." 3)
         "-resolvePackageDependencies \\")
     (progn
-      (message "Skipping package resolution (packages exist in .build)")
+      (xcode-build-config--notify "Skipping package resolution (cached)" 2)
       "")))
 
 (defun xcode-build-config-get-package-cache-flags ()
@@ -551,9 +558,14 @@ If FOR-DEVICE is non-nil, setup for device build (with signing), otherwise for s
   "Generate optimized xcodebuild command with aggressive parallelization and CocoaPods support.
 SIM-ID is the simulator identifier, DEVICE-ID is the physical device identifier,
 DERIVED-PATH is the derived data path."
-  (if xcode-build-config--current-build-command
-      xcode-build-config--current-build-command
-    (let ((workspace-or-project (xcode-project-get-workspace-or-project)))
+  (let* ((project-root (xcode-project-project-root))
+         (scheme (xcode-project-scheme-display-name))
+         (cache-key (list project-root scheme sim-id device-id))
+         (cached-command (gethash cache-key xcode-build-config--build-command-cache)))
+    (if cached-command
+        cached-command
+      (let* ((workspace-or-project (xcode-project-get-workspace-or-project))
+             (new-command
       (mapconcat 'identity
                  (delq nil
                        (list
@@ -630,7 +642,10 @@ DERIVED-PATH is the derived data path."
                         "COPY_PHASE_STRIP=NO"
                         ;; Derived data path
                         "-derivedDataPath .build"))
-                 " "))))
+                 " ")))
+        ;; Cache the command and return it
+        (puthash cache-key new-command xcode-build-config--build-command-cache)
+        new-command))))
 
 ;;; ============================================================================
 ;;; Optimization Flags
@@ -675,8 +690,8 @@ DERIVED-PATH is the derived data path."
 
 (defun xcode-build-config-reset ()
   "Reset all build configuration cache."
-  (setq xcode-build-config--current-build-command nil
-        xcode-build-config--current-environment-x86 nil))
+  (clrhash xcode-build-config--build-command-cache)
+  (setq xcode-build-config--current-environment-x86 nil))
 
 (provide 'xcode-build-config)
 ;;; xcode-build-config.el ends here

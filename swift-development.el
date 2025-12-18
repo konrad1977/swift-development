@@ -542,7 +542,7 @@ Returns a cons cell (PROCESS . LOG-BUFFER) where LOG-BUFFER accumulates the buil
                                                     (with-current-buffer output-buffer
                                                       (let ((inhibit-read-only t))
                                                         (goto-char (point-max))
-                                                        (insert "\n✅ BUILD SUCCEEDED\n"))))
+                                                        (insert "\nBUILD SUCCEEDED\n"))))
                                                   ;; Run xcode-build-server parse asynchronously
                                                   (swift-development-run-xcode-build-server-parse output)
                                                   (when (and callback (functionp callback))
@@ -554,7 +554,7 @@ Returns a cons cell (PROCESS . LOG-BUFFER) where LOG-BUFFER accumulates the buil
                                                   (with-current-buffer output-buffer
                                                     (let ((inhibit-read-only t))
                                                       (goto-char (point-max))
-                                                      (insert (format "\n❌ BUILD FAILED (exit status: %d)\n" exit-status)))))
+                                                      (insert (format "\nBUILD FAILED (exit status: %d)\n" exit-status)))))
                                                 ;; Run xcode-build-server parse for errors too
                                                 (swift-development-run-xcode-build-server-parse output)
                                                 (swift-development-handle-build-error output)))
@@ -611,6 +611,7 @@ Uses async rebuild check if swift-development-use-async-rebuild-check is t."
         ;; Setup current project first to ensure settings are loaded for correct project
         ;; This handles project switching - if project changed, it resets cached values
         ;; and loads settings from .swift-development/settings
+        ;; Note: This is fast when project hasn't changed (just a string comparison)
         (when (fboundp 'xcode-project-setup-current-project)
           (xcode-project-setup-current-project (swift-project-root)))
 
@@ -625,19 +626,22 @@ Uses async rebuild check if swift-development-use-async-rebuild-check is t."
         ;; Use async or sync check based on configuration
         (if (and (not force) swift-development-use-async-rebuild-check)
             ;; Async path - doesn't block Emacs
-            ;; IMPORTANT: Capture ALL project info NOW before going async
-            (let* ((device-type (if swift-development--device-choice :device :simulator))
-                   (captured-root (xcode-project-project-root))
-                   (captured-build-folder (xcode-project-build-folder :device-type device-type))
-                   (captured-app-id (xcode-project-fetch-or-load-app-identifier))
-                   (captured-device-choice swift-development--device-choice))
-              (when swift-development-debug
-                (message "Captured before async: root=%s, build-folder=%s, app-id=%s"
-                         captured-root captured-build-folder captured-app-id))
+            ;; Show notification FIRST before any blocking operations
+            (progn
               (when (fboundp 'xcode-project-notify)
                 (xcode-project-notify
-                 :message (propertize "Checking if rebuild needed..." 'face 'font-lock-keyword-face)))
-              (swift-development-needs-rebuild-async-p
+                 :message (propertize "Checking build cache..." 'face 'font-lock-keyword-face)
+                 :seconds 3))
+              ;; IMPORTANT: Capture ALL project info NOW before going async
+              (let* ((device-type (if swift-development--device-choice :device :simulator))
+                     (captured-root (xcode-project-project-root))
+                     (captured-build-folder (xcode-project-build-folder :device-type device-type))
+                     (captured-app-id (xcode-project-fetch-or-load-app-identifier))
+                     (captured-device-choice swift-development--device-choice))
+                (when swift-development-debug
+                  (message "Captured before async: root=%s, build-folder=%s, app-id=%s"
+                           captured-root captured-build-folder captured-app-id))
+                (swift-development-needs-rebuild-async-p
                (lambda (needs-rebuild)
                  (if needs-rebuild
                      (swift-development--do-compile :run run)
@@ -699,7 +703,7 @@ Uses async rebuild check if swift-development-use-async-rebuild-check is t."
                                     :simulatorId sim-id)))))
                          (error
                           (message "Error running app: %s" (error-message-string err))
-                          (message "Try running with prefix arg to force rebuild: C-u C-c C-c"))))))))
+                          (message "Try running with prefix arg to force rebuild: C-u C-c C-c")))))))))
               ;; Return t to prevent fall-through to sync path
               t)
           ;; Sync path or forced build
@@ -756,6 +760,11 @@ Uses async rebuild check if swift-development-use-async-rebuild-check is t."
 (cl-defun swift-development--do-compile (&key run)
   "Internal function to perform the actual compilation.
 RUN specifies whether to run after building."
+  ;; Show compiling notification immediately
+  (when (fboundp 'xcode-project-notify)
+    (xcode-project-notify
+     :message (propertize "Compiling..." 'face 'font-lock-keyword-face)
+     :seconds 3))
   (when swift-development-use-periphery
     (periphery-kill-buffer))
   (ios-simulator-kill-buffer)
@@ -865,7 +874,8 @@ RUN specifies whether to run after building."
                         (propertize (swift-development-format-scheme-name (xcode-project-scheme))
                                    'face 'font-lock-builtin-face)
                         (propertize (swift-development-format-simulator-name (ios-simulator-simulator-name))
-                                   'face 'font-lock-negation-char-face))))
+                                   'face 'font-lock-negation-char-face))
+       :seconds 3))
 
     (xcode-project-setup-xcodebuildserver)
 
@@ -907,9 +917,10 @@ RUN specifies whether to run after building."
     (xcode-project-setup-xcodebuildserver)
     (when (fboundp 'xcode-project-notify)
       (xcode-project-notify
-       :message (format "Compiling %s|%s"
+       :message (format "Building: %s|%s"
                         (propertize (xcode-project-scheme) 'face 'font-lock-builtin-face)
-                        (propertize "Physical Device" 'face 'font-lock-negation-char-face))))
+                        (propertize "Physical Device" 'face 'font-lock-negation-char-face))
+       :seconds 3))
 
     (if swift-development-use-periphery
         (swift-development-compile-with-progress
@@ -1161,7 +1172,8 @@ Shows message while checking, builds if needed."
     (progn
       (when (fboundp 'xcode-project-notify)
         (xcode-project-notify
-         :message (propertize "Checking if rebuild needed..." 'face 'font-lock-keyword-face)))
+         :message (propertize "Checking build cache..." 'face 'font-lock-keyword-face)
+         :seconds 2))
       (swift-development-needs-rebuild-async-p
        (lambda (needs-rebuild)
          (if needs-rebuild
@@ -1800,8 +1812,8 @@ This is the fastest way to rebuild after small changes."
   (interactive)
   (setq xcode-build-config-use-thin-lto nil  ; Thin LTO can actually slow down incremental builds
         swift-development-enable-timing-summary t
-        xcode-build-config-other-swift-flags 
-        '("-no-whole-module-optimization"))  ; Keep it simple and working
+        xcode-build-config-other-swift-flags
+        '("-no-whole-module-optimization" "-DDEBUG"))  ; Keep it simple and working
   (swift-development-reset)  ; Reset cached build commands
   (message "Turbo mode enabled. Next build will use speed optimizations."))
 
@@ -1811,8 +1823,8 @@ This is the fastest way to rebuild after small changes."
   (interactive)
   (setq xcode-build-config-use-thin-lto nil
         swift-development-enable-timing-summary t
-        xcode-build-config-other-swift-flags 
-        '("-no-whole-module-optimization"))  ; Remove problematic flags
+        xcode-build-config-other-swift-flags
+        '("-no-whole-module-optimization" "-DDEBUG"))  ; Remove problematic flags
   (swift-development-reset)  ; Reset cached build commands
   (message "Balanced mode enabled. Next build will balance speed and debugging."))
 

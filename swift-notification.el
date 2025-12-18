@@ -50,41 +50,44 @@ Accepts keyword arguments:
         (seconds (plist-get args :seconds))
         (reset (plist-get args :reset))
         (face (plist-get args :face))
-        (no-redisplay (plist-get args :no-redisplay)))
+        (no-redisplay (plist-get args :no-redisplay))
+        (minibuffer-active (active-minibuffer-window)))
 
-    (pcase swift-notification-backend
-      ('mode-line-hud
-       (when swift-notification--mode-line-hud-available-p
-         (cond
-          ;; Notification style (with seconds and reset)
-          ((and seconds reset)
-           (mode-line-hud:notification :message message-text :seconds seconds :reset reset))
-          ;; Update with delay
-          (delay
-           (mode-line-hud:updateWith :message message-text :delay delay))
-          ;; Simple update
-          (t
-           (mode-line-hud:update :message message-text)))))
+    ;; Send to backend (but not if minibuffer is active - would disrupt input)
+    (unless minibuffer-active
+      (pcase swift-notification-backend
+        ('mode-line-hud
+         (when swift-notification--mode-line-hud-available-p
+           (cond
+            ;; Notification style (with seconds and reset)
+            ((and seconds reset)
+             (mode-line-hud:notification :message message-text :seconds seconds :reset reset))
+            ;; Update with delay
+            (delay
+             (mode-line-hud:updateWith :message message-text :delay delay))
+            ;; Simple update
+            (t
+             (mode-line-hud:update :message message-text)))))
 
-      ('message
-       ;; Use minibuffer messages with optional color
-       (if face
-           (message "%s" (propertize message-text 'face face))
+        ('message
+         ;; Use minibuffer messages with optional color
+         (if face
+             (message "%s" (propertize message-text 'face face))
+           (message "%s" message-text)))
+
+        ('custom
+         ;; Call custom function if configured
+         (when (functionp swift-notification-function)
+           (apply swift-notification-function args)))
+
+        (_
+         ;; Fallback to message if backend unknown
          (message "%s" message-text)))
 
-      ('custom
-       ;; Call custom function if configured
-       (when (functionp swift-notification-function)
-         (apply swift-notification-function args)))
-
-      (_
-       ;; Fallback to message if backend unknown
-       (message "%s" message-text)))
-
-    ;; Force display update so notification is visible before any blocking operation
-    ;; This is especially important before shell commands, file I/O, or user input
-    (unless no-redisplay
-      (redisplay t))))
+      ;; Force display update so notification is visible before any blocking operation
+      ;; This is especially important before shell commands, file I/O, or user input
+      (unless no-redisplay
+        (redisplay t)))))
 
 ;; Compatibility aliases for existing code
 (defalias 'swift-notification-update #'swift-notification-send)

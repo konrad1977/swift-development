@@ -28,6 +28,7 @@
   (let ((map (make-sparse-keymap)))
     ;; Build & Run Commands
     (define-key map (kbd "C-c C-c") #'swift-development-compile-and-run)
+    (define-key map (kbd "C-c s") #'swift-development-transient)
     (define-key map (kbd "C-c C-b") #'swift-development-compile-app)
     (define-key map (kbd "M-r") #'swift-development-run)
     (define-key map (kbd "C-c C-x") #'swift-development-reset)

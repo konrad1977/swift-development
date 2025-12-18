@@ -559,8 +559,8 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
     (message "Setting up simulator with id %s" id))
   ;; Try to boot directly - if Simulator.app is not running, boot will fail
   ;; and we'll start the app as fallback. This avoids blocking ps command.
-  (when (fboundp 'xcode-project-notify)
-    (xcode-project-notify :message "Preparing simulator..."))
+  ;; NOTE: Don't show "Preparing simulator..." here - it runs too often (on file switch)
+  ;; Only show notifications when simulator actually needs action
   (let ((proc (make-process
                :name "boot-simulator-dwim"
                :command (list "xcrun" "simctl" "boot" id)
@@ -570,10 +570,10 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
                            (when (string= event "finished\n")
                              (let ((exit-code (process-exit-status proc)))
                                (cond
-                                ;; Success or already booted (exit code 149)
-                                ((or (= exit-code 0) (= exit-code 149))
+                                ;; Successfully booted (exit code 0) - show notification
+                                ((= exit-code 0)
                                  (when ios-simulator-debug
-                                   (message "Simulator %s ready (exit: %d)" id exit-code))
+                                   (message "Simulator %s booted successfully" id))
                                  ;; Activate Simulator.app
                                  (make-process
                                   :name "activate-simulator"
@@ -584,6 +584,15 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
                                     :message (propertize "Simulator ready" 'face 'success)
                                     :seconds 2
                                     :reset t)))
+                                ;; Already booted (exit code 149) - just activate, no notification
+                                ((= exit-code 149)
+                                 (when ios-simulator-debug
+                                   (message "Simulator %s already booted" id))
+                                 ;; Still activate Simulator.app to bring it to front
+                                 (make-process
+                                  :name "activate-simulator"
+                                  :command (list "osascript" "-e" "tell application \"Simulator\" to activate")
+                                  :noquery t))
                                 ;; Simulator.app not running, start it
                                 (t
                                  (when ios-simulator-debug

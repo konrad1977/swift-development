@@ -17,6 +17,13 @@
 (require 'cl-lib)
 (require 'transient)
 (require 'swift-project nil t)
+(require 'swift-notification nil t)
+
+(defun spm--notify (message &optional seconds)
+  "Send notification with MESSAGE, shown for SECONDS (default 2)."
+  (if (fboundp 'swift-notification-send)
+      (swift-notification-send :message message :seconds (or seconds 2))
+    (message "%s" message)))
 
 (defgroup swift-package-manager nil
   "Swift Package Manager integration."
@@ -244,7 +251,7 @@ Press '?' to open the actions menu.
     (when (get-buffer spm-buffer-name)
       (with-current-buffer spm-buffer-name
         (spm--render-buffer dependencies)))
-    (message "Dependencies refreshed")))
+    (spm--notify "Dependencies refreshed" 2)))
 
 ;;;###autoload
 (defun spm-add-package (url version)
@@ -261,11 +268,11 @@ Press '?' to open the actions menu.
                           (shell-quote-argument version))
                 (format "swift package add %s"
                         (shell-quote-argument full-url)))))
-    (message "Adding package...")
+    (spm--notify "Adding package..." 3)
     (let ((output (spm--run-command cmd)))
       (if (string-match-p "error:" output)
-          (message "Failed to add package: %s" (string-trim output))
-        (message "Package added successfully")
+          (spm--notify (format "Failed to add package: %s" (string-trim output)) 3)
+        (spm--notify "Package added successfully" 2)
         (spm-refresh)))))
 
 ;;;###autoload
@@ -274,12 +281,12 @@ Press '?' to open the actions menu.
   (interactive
    (list (completing-read "Remove package: " (spm--get-dependency-names) nil t)))
   (when (yes-or-no-p (format "Remove package '%s'? " name))
-    (message "Removing package %s..." name)
+    (spm--notify (format "Removing package %s..." name) 3)
     (let ((output (spm--run-command
                    (format "swift package remove %s" (shell-quote-argument name)))))
       (if (string-match-p "error:" output)
-          (message "Failed to remove package: %s" (string-trim output))
-        (message "Package '%s' removed" name)
+          (spm--notify (format "Failed to remove package: %s" (string-trim output)) 3)
+        (spm--notify (format "Package '%s' removed" name) 2)
         (spm-refresh)))))
 
 ;;;###autoload
@@ -287,12 +294,12 @@ Press '?' to open the actions menu.
   "Update Swift package with NAME to latest compatible version."
   (interactive
    (list (completing-read "Update package: " (spm--get-dependency-names) nil t)))
-  (message "Updating package %s..." name)
+  (spm--notify (format "Updating package %s..." name) 3)
   (let ((output (spm--run-command
                  (format "swift package update %s" (shell-quote-argument name)))))
     (if (string-match-p "error:" output)
-        (message "Failed to update: %s" (string-trim output))
-      (message "Package '%s' updated" name)
+        (spm--notify (format "Failed to update: %s" (string-trim output)) 3)
+      (spm--notify (format "Package '%s' updated" name) 2)
       (spm-refresh))))
 
 ;;;###autoload
@@ -300,31 +307,32 @@ Press '?' to open the actions menu.
   "Update all Swift packages to latest compatible versions."
   (interactive)
   (when (yes-or-no-p "Update all packages? ")
-    (message "Updating all packages...")
+    (spm--notify "Updating all packages..." 3)
     (let ((output (spm--run-command "swift package update")))
       (if (string-match-p "error:" output)
-          (message "Update failed: %s" (string-trim output))
-        (message "All packages updated")
+          (spm--notify (format "Update failed: %s" (string-trim output)) 3)
+        (spm--notify "All packages updated" 2)
         (spm-refresh)))))
 
 ;;;###autoload
 (defun spm-resolve ()
   "Resolve package dependencies."
   (interactive)
-  (message "Resolving packages...")
+  (spm--notify "Resolving packages..." 3)
   (let ((output (spm--run-command "swift package resolve")))
     (if (string-match-p "error:" output)
-        (message "Resolution failed: %s" (string-trim output))
-      (message "Packages resolved")
+        (spm--notify (format "Resolution failed: %s" (string-trim output)) 3)
+      (spm--notify "Packages resolved" 2)
       (spm-refresh))))
 
 ;;;###autoload
 (defun spm-dependency-graph ()
   "Show dependency graph for the project."
   (interactive)
+  (spm--notify "Generating dependency graph..." 2)
   (let ((output (spm--run-command "swift package show-dependencies --format dot")))
     (if (string-match-p "error:" output)
-        (message "Failed to generate graph: %s" (string-trim output))
+        (spm--notify (format "Failed to generate graph: %s" (string-trim output)) 3)
       (with-current-buffer (get-buffer-create "*SPM Dependency Graph*")
         (erase-buffer)
         (insert output)
@@ -332,13 +340,14 @@ Press '?' to open the actions menu.
           (graphviz-dot-mode))
         (goto-char (point-min)))
       (pop-to-buffer "*SPM Dependency Graph*")
-      (message "Dependency graph generated (DOT format)"))))
+      (spm--notify "Dependency graph generated" 2))))
 
 ;;;###autoload
 (defun spm-clean-cache ()
   "Clean SPM cache directories."
   (interactive)
   (when (yes-or-no-p "Clean all SPM caches? This may require re-downloading packages. ")
+    (spm--notify "Cleaning SPM caches..." 3)
     (let ((cleaned 0))
       (dolist (path spm-cache-paths)
         (let ((expanded (expand-file-name path)))
@@ -349,7 +358,7 @@ Press '?' to open the actions menu.
         (when (file-directory-p build-dir)
           (delete-directory build-dir t)
           (cl-incf cleaned)))
-      (message "Cleaned %d cache directories" cleaned))))
+      (spm--notify (format "Cleaned %d cache directories" cleaned) 2))))
 
 ;;;###autoload
 (defun spm-describe-package ()

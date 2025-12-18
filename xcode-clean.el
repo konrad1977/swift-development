@@ -15,6 +15,13 @@
 
 (require 'cl-lib)
 (require 'async nil t)  ; Optional - only needed for async cleaning
+(require 'swift-notification nil t)  ; For knockknock/mode-line-hud notifications
+
+(defun xcode-clean--notify (message &optional seconds)
+  "Send notification with MESSAGE, shown for SECONDS (default 2)."
+  (if (fboundp 'swift-notification-send)
+      (swift-notification-send :message message :seconds (or seconds 2))
+    (message "%s" message)))
 
 (defgroup xcode-clean nil
   "Cleaning utilities for Xcode projects."
@@ -50,8 +57,9 @@ This function handles errors gracefully and continues cleaning even if some dele
         (cloned-sources-dir (expand-file-name "~/Library/Caches/org.swift.cloned-sources"))
         (cleaned 0))
 
+    (xcode-clean--notify "Cleaning Swift package caches..." 3)
+
     (when (file-directory-p package-cache-dir)
-      (message "Cleaning Swift package cache...")
       (condition-case err
           (progn
             (delete-directory package-cache-dir t)
@@ -59,14 +67,13 @@ This function handles errors gracefully and continues cleaning even if some dele
         (file-error (message "Could not clean package cache: %s" (error-message-string err)))))
 
     (when (file-directory-p cloned-sources-dir)
-      (message "Cleaning Swift cloned sources...")
       (condition-case err
           (progn
             (delete-directory cloned-sources-dir t)
             (setq cleaned (1+ cleaned)))
         (file-error (message "Could not clean cloned sources: %s" (error-message-string err)))))
 
-    (message "Cleaned %d Swift package cache locations" cleaned)))
+    (xcode-clean--notify (format "Cleaned %d Swift package cache locations" cleaned) 2)))
 
 (defun xcode-clean-project-derived-data (project-name)
   "Clean Xcode derived data for PROJECT-NAME."
@@ -78,7 +85,7 @@ This function handles errors gracefully and continues cleaning even if some dele
          (deleted 0))
 
     (when (and project-name (file-directory-p derived-data-dir))
-      (message "Cleaning derived data for %s..." project-name)
+      (xcode-clean--notify (format "Cleaning derived data for %s..." project-name) 3)
       (dolist (dir (directory-files derived-data-dir t project-pattern))
         (when (file-directory-p dir)
           (condition-case err
@@ -87,7 +94,7 @@ This function handles errors gracefully and continues cleaning even if some dele
                 (setq deleted (1+ deleted)))
             (file-error (message "Could not delete %s: %s" dir (error-message-string err)))))))
 
-    (message "Deleted %d derived data folder(s) for %s" deleted project-name)))
+    (xcode-clean--notify (format "Deleted %d derived data folder(s) for %s" deleted project-name) 2)))
 
 (defun xcode-clean-all-derived-data (&optional preserve-module-cache)
   "Clean all Xcode derived data.
@@ -98,7 +105,7 @@ If PRESERVE-MODULE-CACHE is non-nil, keep the ModuleCache folder."
 
     (when (and (file-directory-p derived-data-dir)
                (yes-or-no-p "Delete ALL Xcode derived data? "))
-      (message "Cleaning all derived data...")
+      (xcode-clean--notify "Cleaning all derived data..." 3)
       (dolist (file (directory-files derived-data-dir t "^[^.]"))
         (when (file-directory-p file)
           (let ((file-name (file-name-nondirectory file)))
@@ -109,7 +116,7 @@ If PRESERVE-MODULE-CACHE is non-nil, keep the ModuleCache folder."
                     (setq deleted (1+ deleted)))
                 (file-error (message "Could not delete %s: %s" file (error-message-string err)))))))))
 
-    (message "Deleted %d derived data folder(s)" deleted)))
+    (xcode-clean--notify (format "Deleted %d derived data folder(s)" deleted) 2)))
 
 (cl-defun xcode-clean-build-folder-async (&key directory ignore-list callback display-name)
   "Clean DIRECTORY asynchronously, ignoring items in IGNORE-LIST.
@@ -117,26 +124,28 @@ Calls CALLBACK with result string when done.
 DISPLAY-NAME is used for user messages."
   (let ((name (or display-name "project")))
     (if (file-directory-p directory)
-        (async-start
-         `(lambda ()
-            (let ((errors nil))
-              (dolist (file (directory-files ,directory t "^[^.]"))
-                (let ((file-name (file-name-nondirectory file)))
-                  (unless (member file-name ',ignore-list)
-                    (condition-case err
-                        (if (file-directory-p file)
-                            (delete-directory file t)
-                          (delete-file file))
-                      (file-error
-                       (push (format "%s: %s" file (error-message-string err)) errors))))))
-              (if errors
-                  (format "completed with %d errors" (length errors))
-                "successfully")))
-         (lambda (result)
-           (message "Cleaning %s %s" name result)
-           (when callback
-             (funcall callback result))))
-      (message "Build folder is empty or does not exist.")
+        (progn
+          (xcode-clean--notify (format "Cleaning build folder for %s..." name) 3)
+          (async-start
+           `(lambda ()
+              (let ((errors nil))
+                (dolist (file (directory-files ,directory t "^[^.]"))
+                  (let ((file-name (file-name-nondirectory file)))
+                    (unless (member file-name ',ignore-list)
+                      (condition-case err
+                          (if (file-directory-p file)
+                              (delete-directory file t)
+                            (delete-file file))
+                        (file-error
+                         (push (format "%s: %s" file (error-message-string err)) errors))))))
+                (if errors
+                    (format "completed with %d errors" (length errors))
+                  "successfully")))
+           (lambda (result)
+             (xcode-clean--notify (format "Cleaning %s %s" name result) 2)
+             (when callback
+               (funcall callback result)))))
+      (xcode-clean--notify "Build folder is empty or does not exist." 2)
       (when callback
         (funcall callback "skipped - folder not found")))))
 
