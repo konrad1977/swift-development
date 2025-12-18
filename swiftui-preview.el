@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2025 Mikael Konradsson
 ;; Author: Mikael Konradsson
-;; Version: 0.5.2
+;; Version: 0.6.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; URL: https://github.com/konrad1977/swift-development
 ;; Keywords: Swift, swiftui, preview, ios

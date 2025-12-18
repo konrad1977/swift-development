@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2025 Mikael Konradsson
 ;; Author: Mikael Konradsson
-;; Version: 0.5.1
+;; Version: 0.6.0
 ;; Package-Requires: ((emacs "28.1") (async "1.9"))
 ;; Keywords: swift, xcode, clean
 
