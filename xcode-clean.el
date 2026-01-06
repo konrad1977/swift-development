@@ -126,6 +126,13 @@ DISPLAY-NAME is used for user messages."
     (if (file-directory-p directory)
         (progn
           (xcode-clean--notify (format "Cleaning build folder for %s..." name) 3)
+          ;; Start progress bar
+          (when (fboundp 'swift-notification-progress-start)
+            (swift-notification-progress-start
+             :id 'xcode-clean
+             :title "Cleaning"
+             :message name
+             :percent 0))
           (async-start
            `(lambda ()
               (let ((errors nil))
@@ -142,6 +149,12 @@ DISPLAY-NAME is used for user messages."
                     (format "completed with %d errors" (length errors))
                   "successfully")))
            (lambda (result)
+             ;; Finish progress bar
+             (if (string-match-p "successfully" result)
+                 (when (fboundp 'swift-notification-progress-finish)
+                   (swift-notification-progress-finish 'xcode-clean (format "Cleaned %s" name)))
+               (when (fboundp 'swift-notification-progress-cancel)
+                 (swift-notification-progress-cancel 'xcode-clean)))
              (xcode-clean--notify (format "Cleaning %s %s" name result) 2)
              (when callback
                (funcall callback result)))))

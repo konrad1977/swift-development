@@ -1845,7 +1845,8 @@ Handles escaped parentheses like \\( and \\), quotes, and other escaped characte
   (when xcode-project-debug
     (message "Parsing compile output: %s" input))
   (let ((seen-messages (make-hash-table :test 'equal))
-        (error-regex "^\\(.+\\):\\([0-9]+\\):\\([0-9]+\\): \\(error\\|warning\\|note\\): .+$"))
+        ;; Match both file-based errors (file:line:col: severity:) and build-level warnings (warning:/note:)
+        (error-regex "^\\(?:.+:[0-9]+:[0-9]+: \\)?\\(error\\|warning\\|note\\): .+$"))
     (dolist (line (split-string input "\n"))
       (cond
        ;; Check for .compile.lock error and clear it

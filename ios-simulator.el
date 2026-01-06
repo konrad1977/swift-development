@@ -26,6 +26,7 @@
 (require 'xcode-project nil t)
 (require 'swift-project nil t)
 (require 'swift-project-settings nil t)
+(require 'swift-notification nil t)
 
 (with-eval-after-load 'json
   (require 'json))
@@ -236,7 +237,7 @@ When non-nil, apply syntax highlighting to log messages."
     (ios-simulator-mode-teardown)))
 
 
-(defvar-local ios-simulator--installation-process nil
+(defvar ios-simulator--installation-process nil
   "Process object for the current app installation.")
 
 (defvar-local ios-simulator--current-simulator-name nil)
@@ -504,6 +505,10 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
       (xcode-project-notify
        :message (format "Installing %s..." (propertize appname 'face 'font-lock-constant-face))))
 
+    ;; Update progress bar
+    (when (fboundp 'swift-notification-progress-update)
+      (swift-notification-progress-update 'swift-build :percent 75 :message "Installing app..."))
+
     ;; Direct process creation without buffer
     (setq ios-simulator--installation-process
           (make-process
@@ -515,7 +520,8 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
                            (progn
                              (when ios-simulator-debug
                                (message "Installation process event: %s" event))
-                             (when (string= event "finished\n")
+                             ;; Handle all process exit events (finished, exited abnormally, etc.)
+                             (when (memq (process-status process) '(exit signal))
                                (if (= 0 (process-exit-status process))
                                    (progn
                                      (when (fboundp 'xcode-project-notify)
@@ -524,6 +530,9 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
                                                          (propertize appname 'face 'success))
                                         :seconds 2
                                         :reset t))
+                                     ;; Update progress bar - installation complete
+                                     (when (fboundp 'swift-notification-progress-update)
+                                       (swift-notification-progress-update 'swift-build :percent 85 :message "Installed"))
                                      (when callback (funcall callback)))
                                  (progn
                                    (when (fboundp 'xcode-project-notify)
@@ -532,6 +541,9 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
                                                        (propertize appname 'face 'error))
                                       :seconds 3
                                       :reset t))
+                                   ;; Cancel progress bar on failure
+                                   (when (fboundp 'swift-notification-progress-cancel)
+                                     (swift-notification-progress-cancel 'swift-build))
                                    (message "App installation failed with exit code: %d"
                                             (process-exit-status process))))))
                          (error
@@ -1173,6 +1185,10 @@ If TERMINATE-RUNNING is non-nil, terminate any running instance before launching
                         (propertize safe-sim-name 'face 'font-lock-function-name-face))
        :delay 2.0
        :reset t)))
+
+  ;; Finish progress bar - app is launching
+  (when (fboundp 'swift-notification-progress-finish)
+    (swift-notification-progress-finish 'swift-build "Running!"))
 
   (let ((command (append (list "xcrun" "simctl" "launch" "--console-pty"
                                (or simulatorID "booted")
