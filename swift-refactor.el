@@ -12,6 +12,9 @@
 
 ;;; Code:
 
+(require 'swift-notification nil t)
+(require 'transient)
+
 (defgroup swift-refactor nil
   "Provides refactoring tools for Swift."
   :group 'tools
@@ -235,6 +238,136 @@
     "Insert a Todo."
     (interactive)
     (swift-refactor-insert-and-goto-eol "// TODO: "))
+
+;;; SwiftFormat integration
+
+(defcustom swift-refactor-swiftformat-command "swiftformat"
+  "Path to swiftformat executable."
+  :type 'string
+  :group 'swift-refactor)
+
+;;;###autoload
+(defun swift-refactor-format-buffer ()
+  "Format current buffer with swiftformat."
+  (interactive)
+  (unless (derived-mode-p 'swift-mode 'swift-ts-mode)
+    (user-error "Not a Swift buffer"))
+  (when-let* ((file (buffer-file-name)))
+    (unless (executable-find swift-refactor-swiftformat-command)
+      (user-error "swiftformat not installed. Install with: brew install swiftformat"))
+    (save-buffer)
+    (let ((point-before (point))
+          (window-start-before (window-start)))
+      (if (zerop (call-process swift-refactor-swiftformat-command nil nil nil file))
+          (progn
+            (revert-buffer t t t)
+            (goto-char (min point-before (point-max)))
+            (set-window-start nil (min window-start-before (point-max)))
+            (swift-notification-send :message "Formatted" :seconds 1))
+        (swift-notification-send :message "Format failed" :seconds 2)))))
+
+;;;###autoload
+(defun swift-refactor-format-region (start end)
+  "Format region from START to END with swiftformat."
+  (interactive "r")
+  (unless (derived-mode-p 'swift-mode 'swift-ts-mode)
+    (user-error "Not a Swift buffer"))
+  (unless (executable-find swift-refactor-swiftformat-command)
+    (user-error "swiftformat not installed. Install with: brew install swiftformat"))
+  (let ((temp-file (make-temp-file "swiftformat-region" nil ".swift")))
+    (unwind-protect
+        (progn
+          (write-region start end temp-file)
+          (when (zerop (call-process swift-refactor-swiftformat-command nil nil nil temp-file))
+            (let ((formatted (with-temp-buffer
+                               (insert-file-contents temp-file)
+                               (buffer-string))))
+              (delete-region start end)
+              (goto-char start)
+              (insert formatted)
+              (swift-notification-send :message "Region formatted" :seconds 1))))
+      (delete-file temp-file))))
+
+(defcustom swift-refactor-swiftlint-command "swiftlint"
+  "Command to run swiftlint."
+  :type 'string
+  :group 'swift-refactor)
+
+;;;###autoload
+(defun swift-refactor-lint-project ()
+  "Run SwiftLint on the project and show results in periphery buffer."
+  (interactive)
+  (require 'periphery-swiftlint)
+  (periphery-run-swiftlint))
+
+;;;###autoload
+(defun swift-refactor-lint-file ()
+  "Run SwiftLint on the current file and show results in periphery buffer."
+  (interactive)
+  (unless (derived-mode-p 'swift-mode 'swift-ts-mode)
+    (user-error "Not a Swift buffer"))
+  (when-let* ((file (buffer-file-name)))
+    (unless (executable-find swift-refactor-swiftlint-command)
+      (user-error "swiftlint not installed. Install with: brew install swiftlint"))
+    (save-buffer)
+    (require 'periphery-helper)
+    (require 'periphery)
+    (async-start-command-to-string
+     :command (format "%s lint --path %s" swift-refactor-swiftlint-command (shell-quote-argument file))
+     :callback (lambda (result)
+                 (periphery-run-parser result
+                                       (lambda ()
+                                         (message-with-color
+                                          :tag "[Success]"
+                                          :text "No lint warnings or errors."
+                                          :attributes 'success)))))
+    (swift-notification-send :message (format "Linting %s..." (file-name-nondirectory file)) :seconds 1)))
+
+;;;###autoload
+(defun swift-refactor-fix-file ()
+  "Auto-fix SwiftLint issues in the current file."
+  (interactive)
+  (unless (derived-mode-p 'swift-mode 'swift-ts-mode)
+    (user-error "Not a Swift buffer"))
+  (when-let* ((file (buffer-file-name)))
+    (unless (executable-find swift-refactor-swiftlint-command)
+      (user-error "swiftlint not installed. Install with: brew install swiftlint"))
+    (save-buffer)
+    (let ((point-before (point))
+          (window-start-before (window-start)))
+      (if (zerop (call-process swift-refactor-swiftlint-command nil nil nil
+                               "lint" "--fix" "--path" file))
+          (progn
+            (revert-buffer t t t)
+            (goto-char point-before)
+            (set-window-start nil window-start-before)
+            (swift-notification-send :message "File auto-fixed" :seconds 1))
+        (swift-notification-send :message "Auto-fix failed" :seconds 2)))))
+
+;;; Transient Menu
+
+;;;###autoload
+(transient-define-prefix swift-refactor-transient ()
+  "Swift refactoring commands."
+  [["Format"
+    ("f" "Format buffer" swift-refactor-format-buffer)
+    ("r" "Format region" swift-refactor-format-region)]
+   ["Lint"
+    ("l" "Lint file" swift-refactor-lint-file)
+    ("L" "Lint project" swift-refactor-lint-project)
+    ("x" "Fix file" swift-refactor-fix-file)]
+   ["Extract"
+    ("e" "Extract function" swift-refactor-extract-function)
+    ("w" "Wrap selection" swift-refactor-wrap-selection)
+    ("t" "Add try-catch" swift-refactor-add-try-catch)]
+   ["Edit"
+    ("s" "Split arguments" code-refactor-split-function-list)
+    ("d" "Delete matching brace" swift-refactor-delete-current-line-with-matching-brace)
+    ("c" "Clean .init()" swift-refactor-tidy-up-constructor)]
+   ["Insert"
+    ("m" "Insert MARK" swift-refactor-insert-mark)
+    ("o" "Insert TODO" swift-refactor-insert-todo)
+    ("p" "Print at point" swift-refactor-print-thing-at-point)]])
 
 (provide 'swift-refactor)
 ;;; swift-refactor.el ends here

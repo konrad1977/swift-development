@@ -13,6 +13,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'swift-notification nil t)
 
 (defcustom xcode-build-use-optimized-settings t
   "Whether to use optimized build settings when building with Xcode."
@@ -32,7 +33,7 @@
   (xcode-build-apply-optimized-settings)
   (shell-command-to-string
    "osascript -e 'tell application \"Xcode\"' -e 'set targetProject to active workspace document' -e 'build targetProject' -e 'end tell'")
-  (message "Building project using Xcode with optimized settings..."))
+  (swift-notification-send :message "Building project using Xcode..." :seconds 2))
 
 (defun xcode-build-stop()
   "Stop application from Xcode."
@@ -40,7 +41,7 @@
   (save-some-buffers t)
   (shell-command-to-string
    "osascript -e 'tell application \"Xcode\"' -e 'set targetProject to active workspace document' -e 'stop targetProject' -e 'end tell'")
-  (message "Stopping simulator..."))
+  (swift-notification-send :message "Stopping simulator..." :seconds 2))
 
 (defun xcode-build-run()
   "Run application from Xcode with optimized settings."
@@ -49,7 +50,7 @@
   (xcode-build-apply-optimized-settings)
   (shell-command-to-string
    "osascript -e 'tell application \"Xcode\"' -e 'set targetProject to active workspace document' -e 'stop targetProject' -e 'run targetProject' -e 'end tell'")
-  (message "Running project using Xcode with optimized settings..."))
+  (swift-notification-send :message "Running project using Xcode..." :seconds 2))
 
 (defun xcode-build-test()
   "Run current test scheme from Xcode."
@@ -57,7 +58,7 @@
   (save-some-buffers t)
   (shell-command-to-string
    "osascript -e 'tell application \"Xcode\"' -e 'set targetProject to active workspace document' -e 'stop targetProject' -e 'test targetProject' -e 'end tell'")
-  (message "Testing project using Xcode..."))
+  (swift-notification-send :message "Testing project using Xcode..." :seconds 2))
 
 (defun xcode-build-clean()
   "Clean the project in Xcode."
@@ -65,7 +66,7 @@
   (save-some-buffers t)
   (shell-command-to-string
    "osascript -e 'tell application \"Xcode\"' -e 'set targetProject to active workspace document' -e 'clean targetProject' -e 'end tell'")
-  (message "Cleaning project in Xcode..."))
+  (swift-notification-send :message "Cleaning project in Xcode..." :seconds 2))
 
 (defun xcode-build-clean-build-folder()
   "Clean the build folder in Xcode."
@@ -73,7 +74,7 @@
   (save-some-buffers t)
   (shell-command-to-string
    "osascript -e 'tell application \"Xcode\"' -e 'set targetProject to active workspace document' -e 'tell targetProject' -e 'clean build folder' -e 'end tell' -e 'end tell'")
-  (message "Cleaning build folder in Xcode..."))
+  (swift-notification-send :message "Cleaning build folder in Xcode..." :seconds 2))
 
 (provide 'xcode-build)
 ;;; xcode-build.el ends here

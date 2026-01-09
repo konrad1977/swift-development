@@ -298,7 +298,7 @@ This is called on `kill-emacs-hook' to ensure proper cleanup."
   (setq ios-simulator--cached-devices nil
         ios-simulator--cache-timestamp nil
         ios-simulator--target-simulators nil)
-  (message "iOS Simulator global state cleaned up"))
+  (swift-notification-send :message "iOS Simulator global state cleaned up" :seconds 2))
 
 ;; Register cleanup on Emacs exit
 (add-hook 'kill-emacs-hook #'ios-simulator-cleanup-global-state)
@@ -372,7 +372,7 @@ With prefix argument CHOOSE-NEW-SIMULATOR, also select a new simulator."
   "Shut down all simulators."
   (interactive)
   (call-process-shell-command "xcrun simctl shutdown all")
-  (message "All simulators shut down"))
+  (swift-notification-send :message "All simulators shut down" :seconds 2))
 
 (defun ios-simulator-target ()
   "Get the current simulator sdk."
@@ -1120,7 +1120,7 @@ Returns list of (name . id) pairs."
   (interactive)
   (let ((booted (ios-simulator-get-all-booted-simulators)))
     (if (null booted)
-        (message "No booted simulators")
+        (swift-notification-send :message "No booted simulators" :seconds 2)
       (with-current-buffer (get-buffer-create "*Booted Simulators*")
         (erase-buffer)
         (insert "Booted Simulators:\n")
@@ -1131,7 +1131,7 @@ Returns list of (name . id) pairs."
                           (cdr sim))))
         (goto-char (point-min)))
       (display-buffer "*Booted Simulators*")
-      (message "%d booted simulator(s)" (length booted)))))
+      (swift-notification-send :message (format "%d booted simulator(s)" (length booted)) :seconds 2))))
 
 (cl-defun ios-simulator-booted-simulator (&key callback)
   "Get booted simulator if any. If CALLBACK provided, run asynchronously."

@@ -16,6 +16,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'transient)
+(require 'swift-notification nil t)
 
 (defgroup ios-device nil
   "Customization group for ios-device package."
@@ -128,7 +129,7 @@
   (setq ios-device--current-install-command nil)
   (setq ios-device--current-app-identifier nil)
   (setq ios-device--current-buffer nil)
-  (message "iOS device selection reset"))
+  (swift-notification-send :message "iOS device selection reset" :seconds 2))
 
 
 (defun ios-device-cleanup ()
@@ -433,7 +434,7 @@ With optional APP-FILTER, only show logs from that app bundle ID."
       (set-process-query-on-exit-flag proc nil))
     (pop-to-buffer buffer)
     (goto-char (point-max))
-    (message "Device logging started. Use M-x ios-device-stop-logging to stop.")))
+    (swift-notification-send :message "Device logging started" :seconds 3)))
 
 (defun ios-device--log-filter (proc string)
   "Process filter for device log PROC, handling STRING output."
@@ -471,7 +472,7 @@ With optional APP-FILTER, only show logs from that app bundle ID."
              (process-live-p ios-device--log-process))
     (kill-process ios-device--log-process)
     (setq ios-device--log-process nil)
-    (message "Device logging stopped")))
+    (swift-notification-send :message "Device logging stopped" :seconds 2)))
 
 ;;;###autoload
 (defun ios-device-clear-log ()
@@ -494,17 +495,17 @@ With optional APP-FILTER, only show logs from that app bundle ID."
                     "~/Desktop/")))
     (unless device-id
       (user-error "No device connected or selected"))
-    (message "Taking screenshot...")
+    (swift-notification-send :message "Taking screenshot..." :seconds 2)
     (let ((result (shell-command-to-string
                    (format "xcrun devicectl device capture screenshot --device %s --output %s"
                            (shell-quote-argument device-id)
                            (shell-quote-argument filename)))))
       (if (file-exists-p filename)
           (progn
-            (message "Screenshot saved to %s" filename)
+            (swift-notification-send :message (format "Screenshot saved to %s" filename) :seconds 3)
             (when (y-or-n-p "Open screenshot? ")
               (start-process "open-screenshot" nil "open" filename)))
-        (message "Screenshot failed: %s" result)))))
+        (swift-notification-send :message (format "Screenshot failed: %s" result) :seconds 4)))))
 
 ;;; Transient Menu
 

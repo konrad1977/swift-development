@@ -255,7 +255,7 @@ Safe to call multiple times - will only warm once per project."
   (let ((accessibility-inspector-path (concat (xcode-project-get-app-path) "Contents/Applications/Accessibility Inspector.app")))
     (if (file-exists-p accessibility-inspector-path)
         (start-process "Accessibility Inspector" nil "open" accessibility-inspector-path)
-      (message "Accessibility Inspector not found at %s" accessibility-inspector-path))))
+      (swift-notification-send :message (format "Accessibility Inspector not found at %s" accessibility-inspector-path) :seconds 3))))
 
 (defun xcode-project-instruments ()
   "Launch the Instruments application."
@@ -263,7 +263,7 @@ Safe to call multiple times - will only warm once per project."
   (let ((instruments-file-path (concat (xcode-project-get-app-path) "Contents/Applications/Instruments.app")))
     (if (file-exists-p instruments-file-path)
         (start-process "Instruments" nil "open" instruments-file-path)
-      (message "Instruments not found at %s" instruments-file-path))))
+      (swift-notification-send :message (format "Instruments not found at %s" instruments-file-path) :seconds 3))))
 
 (defun xcode-project-get-extension (type)
   "Get file extension for TYPE (:project or :workspace)."
@@ -862,12 +862,10 @@ Use this when scheme files are not found in the project."
          (progn
            (xcode-project--handle-scheme-selection schemes)
            (when xcode-project--current-xcode-scheme
-             (message "Scheme set to: %s" xcode-project--current-xcode-scheme)))
-       (xcode-project-notify
-        :message (propertize "No schemes found! Share schemes in Xcode." 'face 'error)
-        :seconds 5
-        :reset t)
-       (message "No schemes found. In Xcode: Product > Scheme > Manage Schemes, check 'Shared'")))))
+             (swift-notification-send :message (format "Scheme set to: %s" xcode-project--current-xcode-scheme) :seconds 2)))
+       (swift-notification-send
+        :message "No schemes found! In Xcode: Product > Scheme > Manage Schemes, check 'Shared'"
+        :seconds 5)))))
 
 (defun xcode-project-scheme-display-name ()
   "Get the scheme name for display purposes (without shell escaping).
@@ -1263,7 +1261,7 @@ Only matches if there's exactly one match to avoid ambiguity."
         xcode-project--last-device-type nil)
   (when (fboundp 'swift-cache-invalidate-pattern)
     (swift-cache-invalidate-pattern "build-folder-"))
-  (message "Build folder cache cleared"))
+  (swift-notification-send :message "Build folder cache cleared" :seconds 2))
 
 (defun xcode-project-setup-xcodebuildserver ()
   "Setup xcodebuild server."
@@ -1535,7 +1533,7 @@ Prompts to choose scheme first, then simulator."
   ;; Use swift-development-reset-build-status to manually reset if needed.
   (swift-project-reset-root)
   (xcode-project-safe-mode-line-update :message "Resetting configuration")
-  (message "Xcode configuration reset - scheme cache cleared")
+  (swift-notification-send :message "Xcode configuration reset - scheme cache cleared" :seconds 2)
 
   ;; Now prompt for scheme selection first
   ;; This ensures scheme is set before simulator selection
@@ -1557,15 +1555,16 @@ Automatically builds the app if sources have changed."
         (when (fboundp 'swift-development-needs-rebuild-p)
           (if (swift-development-needs-rebuild-p)
               (progn
-                (message "Changes detected, building before debugging...")
+                (swift-notification-send :message "Building before debugging..." :seconds 2)
                 (swift-development-compile-app)
                 ;; Wait a moment for build to complete
                 ;; TODO: Better synchronization with build completion
                 (sit-for 1))
-            (message "App up-to-date, launching debugger...")))
+            (swift-notification-send :message "App up-to-date, launching debugger..." :seconds 2)))
         (xcode-project-setup-dape))
     (error
-     (message "Error starting debugger: %s" (error-message-string err))
+     (swift-notification-send :message (format "Debug error: %s" (error-message-string err))
+                              :seconds 5)
      (message "Please ensure a scheme is selected and the project is properly configured")
      (signal (car err) (cdr err)))))
 
@@ -1639,7 +1638,8 @@ LLDB-PATH is path to LLDB framework."
                    :request "attach"
                    :cwd "."))
     ;; Start dape with simulator configuration
-    (message "Starting debugger on simulator: %s" simulator-id)
+    (swift-notification-send :message (format "Starting debugger on simulator: %s" simulator-id)
+                             :seconds 3)
     (let ((config (copy-tree (cdr (assq 'ios-simulator dape-configs)))))
       (if config
           (dape config)
@@ -1664,20 +1664,23 @@ LLDB-PATH is path to LLDB framework (unused for device, kept for signature)."
       (error "lldb-dap not found at %s. Device debugging requires Xcode 16+" lldb-dap-path))
 
     ;; First, terminate any existing instance
-    (message "Terminating any existing app instance on %s..." device-name)
+    (swift-notification-send :message (format "Terminating app on %s..." device-name)
+                             :seconds 2)
     (shell-command-to-string
      (format "xcrun devicectl device process terminate --device %s %s 2>/dev/null"
              (shell-quote-argument device-id)
              (shell-quote-argument app-bundle-id)))
 
     ;; Launch app in stopped state and get PID
-    (message "Launching app on %s for debugging..." device-name)
+    (swift-notification-send :message (format "Launching app on %s for debugging..." device-name)
+                             :seconds 2)
     (let ((pid (ios-device-launch-for-debug :device-id device-id
                                             :app-identifier app-bundle-id)))
       (unless pid
         (error "Failed to launch app on device. Make sure the app is installed"))
 
-      (message "App launched with PID %s, attaching debugger via lldb-dap..." pid)
+      (swift-notification-send :message (format "Attaching debugger to PID %s..." pid)
+                               :seconds 3)
 
       ;; Setup dape config for device using lldb-dap with device commands
       ;; lldb-dap is Xcode's native DAP server that supports device debugging
@@ -1711,7 +1714,13 @@ LLDB-PATH is path to LLDB framework (unused for device, kept for signature)."
   (let ((root (xcode-project-project-root)))
     (unless root
       (error "Not in an Xcode project"))
-    
+
+    ;; Show initial notification
+    (swift-notification-send
+     :message (format "Cleaning build folder for %s..."
+                      (or (xcode-project-product-name) "project"))
+     :seconds 2)
+
     ;; Clean .build folder
     (xcode-project-clean-build-folder-with
      :root root
@@ -1757,6 +1766,12 @@ LLDB-PATH is path to LLDB framework (unused for device, kept for signature)."
       (error "Not in an Xcode project"))
     
     (when (yes-or-no-p "Perform deep clean? This will delete .build, Swift caches, and ALL derived data.")
+      ;; Show initial notification
+      (swift-notification-send
+       :message (format "Deep cleaning %s..."
+                        (or (xcode-project-product-name) "project"))
+       :seconds 2)
+
       ;; Clean .build folder
       (xcode-project-clean-build-folder-with
        :root root
@@ -2051,7 +2066,7 @@ CONFIGURATION is the build configuration (Debug/Release)."
     (let ((default-directory (xcode-project-derived-data-path)))
         (if (file-directory-p default-directory)
             (dired default-directory)
-          (message "No build folder found"))))
+          (swift-notification-send :message "No build folder found" :seconds 3))))
 
 ;; Note: xcode-project-toggle-device-choice is now defined in swift-development.el
 ;; with a defalias for backwards compatibility
@@ -2161,14 +2176,14 @@ Also checks for and handles compile.lock errors that can halt builds."
               (message "Detected compile.lock error in %s - this can cause hanging builds" buffer-name))))))
     
     (when has-lock-error
-      (message "Compile.lock error detected - will clean derived data after interrupting build")))
-  
+      (swift-notification-send :message "Compile.lock error detected - will clean derived data" :seconds 3)))
+
   (cond
    ;; Check for active swift-additions build process
    ((and (boundp 'swift-development--active-build-process)
          swift-development--active-build-process
          (process-live-p swift-development--active-build-process))
-    (message "Interrupting active build process...")
+    (swift-notification-send :message "Interrupting active build process..." :seconds 2)
     (interrupt-process swift-development--active-build-process)
     ;; Give it a moment, then kill if still alive
     (run-with-timer 2 nil
@@ -2176,34 +2191,34 @@ Also checks for and handles compile.lock errors that can halt builds."
                       (when (and swift-development--active-build-process
                                  (process-live-p swift-development--active-build-process))
                         (kill-process swift-development--active-build-process)
-                        (message "Build process killed"))))
+                        (swift-notification-send :message "Build process killed" :seconds 2))))
     (setq swift-development--active-build-process nil)
     (when (boundp 'swift-development--active-build-buffer)
       (setq swift-development--active-build-buffer nil))
     (when (and (boundp 'swift-development--build-progress-spinner)
                swift-development--build-progress-spinner)
       (spinner-stop swift-development--build-progress-spinner)))
-   
+
    ;; Check for compilation buffer with active process
    ((get-buffer "*Swift Build*")
     (let ((proc (get-buffer-process (get-buffer "*Swift Build*"))))
       (if (and proc (process-live-p proc))
           (progn
-            (message "Interrupting build in *Swift Build* buffer...")
+            (swift-notification-send :message "Interrupting build in *Swift Build* buffer..." :seconds 2)
             (interrupt-process proc)
             (run-with-timer 2 nil
                             (lambda ()
                               (when (and proc (process-live-p proc))
                                 (kill-process proc)
-                                (message "Build process killed")))))
-        (message "No active build process found in *Swift Build* buffer"))))
-   
+                                (swift-notification-send :message "Build process killed" :seconds 2)))))
+        (swift-notification-send :message "No active build process found" :seconds 2))))
+
    ;; Fall back to killing any xcodebuild processes
    (t
     (let ((killed-count (xcode-project-kill-all-xcodebuild-processes)))
       (if (> killed-count 0)
-          (message "Killed %d xcodebuild process(es)" killed-count)
-        (message "No active build processes found"))))))
+          (swift-notification-send :message (format "Killed %d xcodebuild process(es)" killed-count) :seconds 2)
+        (swift-notification-send :message "No active build processes found" :seconds 2))))))
 
 ;;;###autoload
 (defun xcode-project-kill-all-xcodebuild-processes ()
@@ -2237,8 +2252,8 @@ Returns the number of processes killed."
     
     (when (called-interactively-p 'interactive)
       (if (> killed-count 0)
-          (message "Killed %d xcodebuild process(es)" killed-count)
-        (message "No xcodebuild processes found")))
+          (swift-notification-send :message (format "Killed %d xcodebuild process(es)" killed-count) :seconds 2)
+        (swift-notification-send :message "No xcodebuild processes found" :seconds 2)))
     killed-count))
 
 ;;;###autoload
@@ -2258,8 +2273,8 @@ Returns the number of processes killed."
     (if found-error
         (when (yes-or-no-p "Compile.lock error detected.  Kill build processes and clean derived data?")
           (xcode-project-interrupt-build)
-          (message "Interrupted build. Consider running clean derived data."))
-      (message "No compile.lock errors found in build buffers"))))
+          (swift-notification-send :message "Interrupted build. Consider running clean derived data." :seconds 3))
+      (swift-notification-send :message "No compile.lock errors found in build buffers" :seconds 2))))
 
 ;;;###autoload
 (defun xcode-project-build-status ()

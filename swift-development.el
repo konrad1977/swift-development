@@ -26,6 +26,7 @@
 (require 'xcode-build-config nil t) ;; Build configuration and command construction
 (require 'xcode-project nil t) ;; For notification system
 (require 'swift-notification nil t) ;; Unified notification system with progress bars
+(require 'swift-refactor nil t) ;; Code refactoring tools
 
 ;; Provide fallback for message-with-color when periphery is not available
 (unless (fboundp 'message-with-color)
@@ -169,7 +170,7 @@ This also invalidates the build status to force a rebuild on next compile."
   ;; Also clear the build folder cache
   (setq xcode-project--current-build-folder nil
         xcode-project--last-device-type nil)
-  (message "Build settings reset - next build will run unconditionally"))
+  (swift-notification-send :message "Build settings reset - next build will run unconditionally" :seconds 3))
 
 (defun swift-development-toggle-device-choice ()
   "Toggle between running on simulator and physical device."
@@ -184,8 +185,10 @@ This also invalidates the build status to force a rebuild on next compile."
     (let ((root (xcode-project-project-root)))
       (when root
         (swift-project-settings-capture-from-variables root))))
-  (message "Now running on %s\nYou can run the command 'swift-development-toggle-device-choice' with C-c x t"
-           (if swift-development--device-choice "physical device" "simulator")))
+  (swift-notification-send
+   :message (format "Now running on %s"
+                    (if swift-development--device-choice "physical device" "simulator"))
+   :seconds 3))
 
 ;; Legacy alias for backwards compatibility
 (defalias 'xcode-project-toggle-device-choice 'swift-development-toggle-device-choice)
@@ -809,7 +812,7 @@ Uses async rebuild check if swift-development-use-async-rebuild-check is t."
         ;; Cancel progress bar - not a valid project
         (when (fboundp 'swift-notification-progress-cancel)
           (swift-notification-progress-cancel 'swift-build))
-        (message "Not xcodeproject nor swift package")))))
+        (swift-notification-send :message "Not xcodeproject nor swift package" :seconds 3)))))
 
 (cl-defun swift-development--do-compile (&key run)
   "Internal function to perform the actual compilation.
@@ -1248,7 +1251,7 @@ Shows message while checking, builds if needed."
 This forces the next build to run regardless of file timestamps."
   (interactive)
   (setq swift-development--last-build-succeeded nil)
-  (message "Build status reset - next build will run unconditionally"))
+  (swift-notification-send :message "Build status reset - next build will run unconditionally" :seconds 3))
 
 ;;;###autoload
 (defun swift-development-clear-hash-cache ()
@@ -1262,7 +1265,7 @@ Clears settings, device-cache, and file-cache from .swift-development/."
       (when project-root
         (swift-project-settings-clear-all-cache project-root))))
 
-  (message "All cache files cleared for current project"))
+  (swift-notification-send :message "All cache files cleared for current project" :seconds 3))
 
 ;;;###autoload
 (defun swift-development-build-status ()
@@ -1377,7 +1380,7 @@ Clears settings, device-cache, and file-cache from .swift-development/."
         (compilation-mode)
         (goto-char (point-min))
         (display-buffer (current-buffer)))
-    (message "No *Swift Build* buffer found. Run a build first.")))
+    (swift-notification-send :message "No *Swift Build* buffer found. Run a build first." :seconds 3)))
 
 ;; ============================================================================
 
@@ -2542,7 +2545,8 @@ swift-project-debug, swift-cache-debug, and ios-device-debug."
     ("d" "Device..." ios-device-transient)
     ("p" "SPM UI..." spm-transient)]
    [("v" "Preview..." swiftui-preview-transient)
-    ("x" "Xcode Project..." xcode-project-transient)]]
+    ("x" "Xcode Project..." xcode-project-transient)
+    ("f" "Refactor..." swift-refactor-transient)]]
   ["Settings"
    [("D" "Toggle debug" swift-development-toggle-debug)
     ("A" "Toggle analysis" swift-development-toggle-analysis-mode)
