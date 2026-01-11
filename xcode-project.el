@@ -2333,6 +2333,9 @@ Returns the number of processes killed."
    [("c" "Clear build folder cache" xcode-project-clear-build-folder-cache)
     ("C" "Cache diagnostics" xcode-project-cache-diagnostics)]
    [("r" "Reset project state" xcode-project-reset)]]
+  ["Build Server (LSP)"
+   [("b" "Regenerate BSP config" xcodebuildserver-regenerate-configuration)
+    ("B" "Ensure build_root" xcodebuildserver-ensure-build-root)]]
   [("q" "Quit" transient-quit-one)])
 
 (provide 'xcode-project)

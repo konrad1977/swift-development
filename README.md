@@ -729,7 +729,9 @@ struct SettingsView: View {
 Automatic Build Server Protocol (BSP) configuration for LSP integration.
 
 **Key functions:**
-- `xcodebuildserver-check-configuration` - Verify and generate BSP configuration
+- `xcodebuildserver-check-configuration` - Verify and generate BSP configuration with `build_root`
+- `xcodebuildserver-regenerate-configuration` - Regenerate BSP config for the current project
+- `xcodebuildserver-ensure-build-root` - Add `build_root` to existing configuration
 - `xcodebuildserver-does-configuration-file-exist` - Check for existing `buildServer.json`
 
 **What it does:**
@@ -737,15 +739,29 @@ The package automatically configures the Build Server Protocol for your Xcode pr
 - Accurate code completion for your project's dependencies
 - Jump to definition across Swift Package dependencies
 - Proper symbol resolution for CocoaPods and Carthage dependencies
+- **Cross-file references** (requires `build_root` - automatically configured)
+
+**build_root Support (xcode-build-server 1.3.0+):**
+The package automatically sets the `build_root` property in `buildServer.json`, which points to your project's DerivedData folder. This enables reliable cross-file "go to definition" and "find references" throughout your codebase.
 
 **Requirements:**
-Install `xcode-build-server` via Homebrew:
+Install `xcode-build-server` version 1.3.0 or later via Homebrew:
 ```bash
 brew install xcode-build-server
 ```
 
+To verify your version supports `build_root`:
+```bash
+xcode-build-server config -h | grep build_root
+```
+
+If you have an older version, upgrade with `brew upgrade xcode-build-server`.
+
 **Integration:**
-The package automatically runs `xcode-build-server config` when you open a project, creating the necessary configuration file. After building your project, the build output is parsed and fed to `xcode-build-server parse` to keep the LSP server synchronized with your build state.
+The package automatically runs `xcode-build-server config` when you open a project, creating the necessary configuration file with `build_root` set. After building your project, the build output is parsed and fed to `xcode-build-server parse` to keep the LSP server synchronized with your build state.
+
+**Manual configuration:**
+If your existing `buildServer.json` lacks `build_root`, run `M-x xcodebuildserver-ensure-build-root` or access it via the Xcode Project transient menu (`x` then `B`).
 
 ### ios-simulator.el
 iOS Simulator control and log viewing with syntax-highlighted console output.
