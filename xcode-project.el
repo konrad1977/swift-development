@@ -107,6 +107,9 @@ This is a compatibility wrapper - prefer using `xcode-project-notify' directly."
 (defvar xcode-project--async-processes (make-hash-table :test 'equal)
   "Hash table tracking active async processes by key.")
 
+(defvar xcode-project--periphery-debounce-timer nil
+  "Timer for debouncing periphery parsing during builds.")
+
 ;; Forward declaration to avoid byte-compile warnings
 (defvar xcode-project-debug)
 
@@ -1497,6 +1500,10 @@ Shows that multi-project support is enabled via buffer-local variables."
 Also clears all persistent cache files (.swift-development/).
 Prompts to choose scheme first, then simulator."
   (interactive)
+  ;; Cancel any pending periphery debounce timer
+  (when xcode-project--periphery-debounce-timer
+    (cancel-timer xcode-project--periphery-debounce-timer)
+    (setq xcode-project--periphery-debounce-timer nil))
   ;; First, reset simulator state (but don't choose new one yet)
   (when (fboundp 'ios-simulator-reset)
     (ios-simulator-reset nil))  ; Pass nil - don't choose yet
@@ -2034,7 +2041,19 @@ Handles escaped parentheses like \\( and \\), quotes, and other escaped characte
        ;; Errors, warnings, notes
        ((string-match error-regex line)
         (setq xcode-project--current-errors-or-warnings (concat line "\n" xcode-project--current-errors-or-warnings))
-        (periphery-run-parser xcode-project--current-errors-or-warnings))))))
+        ;; Debounce periphery parsing to avoid blocking UI
+        (when xcode-project--periphery-debounce-timer
+          (cancel-timer xcode-project--periphery-debounce-timer))
+        (let ((errors-snapshot xcode-project--current-errors-or-warnings))
+          (setq xcode-project--periphery-debounce-timer
+                (run-with-idle-timer
+                 0.2 nil
+                 (lambda (errors)
+                   (when (fboundp 'periphery-run-parser)
+                     (condition-case nil
+                         (periphery-run-parser errors)
+                       (error nil))))
+                 errors-snapshot))))))))
 
 (defun xcode-project-derived-data-path ()
   "Get the actual DerivedData path by running xcodebuild -showBuildSettings.

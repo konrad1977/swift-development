@@ -41,7 +41,15 @@
     (define-key map (kbd "C-c p r") #'swiftui-preview-refresh)
 
     ;; Test Commands
-    (define-key map (kbd "C-c t m") #'swift-development-test-module-silent)
+    (define-key map (kbd "C-c t t") #'swift-development-test-at-point)
+    (define-key map (kbd "C-c t c") #'swift-development-test-class-at-point)
+    (define-key map (kbd "C-c t s") #'swift-development-test-select)
+    (define-key map (kbd "C-c t a") #'swift-development-test-swift-package)
+    (define-key map (kbd "C-c t T") #'swift-development-test-target)
+    (define-key map (kbd "C-c t f") #'swift-development-test-filter)
+    (define-key map (kbd "C-c t r") #'swift-development-test-last-failed)
+    (define-key map (kbd "C-c t l") #'swift-development-test-list)
+    (define-key map (kbd "C-c t m") #'swift-development-test-transient)
     (define-key map (kbd "C-c t p") #'swift-development-test-swift-package-from-file)
 
     ;; Simulator Commands

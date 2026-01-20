@@ -118,6 +118,29 @@ nil = unknown/never built, t = success, \\='failed = failed.")
 (defvar swift-development--device-choice nil
   "Whether to run on physical device (t) or simulator (nil).")
 
+(defvar swift-development--build-context nil
+  "Captured build context for the current build session.
+Plist with :root, :build-folder, :app-id, :sim-id, :scheme, :device-id.")
+
+(defun swift-development--capture-build-context (&optional for-device)
+  "Capture current build context for use in callbacks.
+When FOR-DEVICE is non-nil, captures device-specific context."
+  (setq swift-development--build-context
+        (if for-device
+            (list :root (xcode-project-project-root)
+                  :build-folder (xcode-project-build-folder :device-type :device)
+                  :app-id (xcode-project-fetch-or-load-app-identifier)
+                  :device-id (when (fboundp 'ios-device-udid) (ios-device-udid))
+                  :scheme xcode-project--current-xcode-scheme)
+          (list :root (xcode-project-project-root)
+                :build-folder (xcode-project-build-folder :device-type :simulator)
+                :app-id (xcode-project-fetch-or-load-app-identifier)
+                :sim-id (ios-simulator-simulator-identifier)
+                :scheme xcode-project--current-xcode-scheme)))
+  (when swift-development-debug
+    (message "[Build Context] Captured: %S" swift-development--build-context))
+  swift-development--build-context)
+
 (defun swift-development-log-debug (format-string &rest args)
   "Log debug message using FORMAT-STRING and ARGS when debug is enabled."
   (when swift-development-debug
@@ -201,63 +224,71 @@ This also invalidates the build status to force a rebuild on next compile."
     "N/A"))
 
 (defun swift-development-run-app-on-device-after-build ()
-  "Run app on device after build."
-  (when (fboundp 'xcode-project-notify)
-    (xcode-project-notify
-     :message (format "Built %s in %s seconds"
-                      (propertize (xcode-project-scheme-display-name) 'face 'font-lock-builtin-face)
-                      (propertize (swift-development--compilation-time) 'face 'warning))))
+  "Run app on device after build using captured context."
+  (let* ((ctx swift-development--build-context)
+         (scheme-name (or (plist-get ctx :scheme) "Unknown")))
+    (when (fboundp 'xcode-project-notify)
+      (xcode-project-notify
+       :message (format "Built %s in %s seconds"
+                        (propertize scheme-name 'face 'font-lock-builtin-face)
+                        (propertize (swift-development--compilation-time) 'face 'warning)))))
 
-  ;; Save last-modified file to settings (fast, synchronous)
-  (let* ((project-root (xcode-project-project-root))
+  ;; Save last-modified file to settings
+  (let* ((ctx swift-development--build-context)
+         (project-root (or (plist-get ctx :root) (xcode-project-project-root)))
          (last-modified (swift-development-get-last-modified-file)))
-    (when (and project-root last-modified
-               (fboundp 'swift-project-settings-update))
-      (swift-project-settings-update project-root :last-modified-file last-modified)
-      (when swift-development-debug
-        (message "[Build Success] Saved last-modified: %s at %s"
-                 (cdr last-modified) (car last-modified)))))
+    (when (and project-root last-modified (fboundp 'swift-project-settings-update))
+      (swift-project-settings-update project-root :last-modified-file last-modified)))
 
-  (ios-device-install-app
-   :buildfolder (xcode-project-build-folder :device-type :device)
-   :appIdentifier (xcode-project-fetch-or-load-app-identifier)))
+  ;; Use captured context for installation
+  (let ((ctx swift-development--build-context))
+    (if (and ctx (plist-get ctx :build-folder) (plist-get ctx :app-id))
+        (ios-device-install-app
+         :buildfolder (plist-get ctx :build-folder)
+         :appIdentifier (plist-get ctx :app-id))
+      ;; Fallback to fresh lookups
+      (ios-device-install-app
+       :buildfolder (xcode-project-build-folder :device-type :device)
+       :appIdentifier (xcode-project-fetch-or-load-app-identifier)))))
 
 (defun swift-development-run-app-after-build()
-  "Either in simulator or on physical."
-  (when (fboundp 'xcode-project-notify)
-    (xcode-project-notify
-     :message (format "Built %s in %s seconds"
-                      (propertize (xcode-project-scheme-display-name) 'face 'font-lock-builtin-face)
-                      (propertize (swift-development--compilation-time) 'face 'warning))))
+  "Run app in simulator after build using captured context."
+  (let* ((ctx swift-development--build-context)
+         (scheme-name (or (plist-get ctx :scheme) "Unknown")))
+    (when (fboundp 'xcode-project-notify)
+      (xcode-project-notify
+       :message (format "Built %s in %s seconds"
+                        (propertize scheme-name 'face 'font-lock-builtin-face)
+                        (propertize (swift-development--compilation-time) 'face 'warning)))))
 
   ;; Update progress bar - moving to install phase
   (when (fboundp 'swift-notification-progress-update)
     (swift-notification-progress-update 'swift-build :percent 65 :message "Installing..."))
 
-  ;; Save last-modified file to settings (fast, synchronous)
-  (let* ((project-root (xcode-project-project-root))
+  ;; Save last-modified file to settings
+  (let* ((ctx swift-development--build-context)
+         (project-root (or (plist-get ctx :root) (xcode-project-project-root)))
          (last-modified (swift-development-get-last-modified-file)))
-    (when (and project-root last-modified
-               (fboundp 'swift-project-settings-update))
-      (swift-project-settings-update project-root :last-modified-file last-modified)
-      (when swift-development-debug
-        (message "[Build Success] Saved last-modified: %s at %s"
-                 (cdr last-modified) (car last-modified)))))
+    (when (and project-root last-modified (fboundp 'swift-project-settings-update))
+      (swift-project-settings-update project-root :last-modified-file last-modified)))
 
   (swift-development-cleanup)
 
-  ;; Debug information for project switching issues
-  (when swift-development-debug
-    (message "Installing app - Project: %s, App ID: %s, Build folder: %s"
-             (xcode-project-project-root)
-             (xcode-project-fetch-or-load-app-identifier)
-             (xcode-project-build-folder :device-type :simulator)))
-
-  (ios-simulator-install-and-run-app
-   :rootfolder (xcode-project-project-root)
-   :build-folder (xcode-project-build-folder :device-type :simulator)
-   :simulatorId (ios-simulator-simulator-identifier)
-   :appIdentifier (xcode-project-fetch-or-load-app-identifier)))
+  ;; Use captured context for installation
+  (let ((ctx swift-development--build-context))
+    (if (and ctx (plist-get ctx :root) (plist-get ctx :build-folder)
+             (plist-get ctx :sim-id) (plist-get ctx :app-id))
+        (ios-simulator-install-and-run-app
+         :rootfolder (plist-get ctx :root)
+         :build-folder (plist-get ctx :build-folder)
+         :simulatorId (plist-get ctx :sim-id)
+         :appIdentifier (plist-get ctx :app-id))
+      ;; Fallback to fresh lookups
+      (ios-simulator-install-and-run-app
+       :rootfolder (xcode-project-project-root)
+       :build-folder (xcode-project-build-folder :device-type :simulator)
+       :simulatorId (ios-simulator-simulator-identifier)
+       :appIdentifier (xcode-project-fetch-or-load-app-identifier)))))
 
 (defun swift-development-check-if-build-was-successful (input-text)
   "Check if INPUT-TEXT indicates a successful build.
@@ -922,6 +953,9 @@ RUN specifies whether to run after building."
   (xcode-project-setup-project)
   (setq run-once-compiled run)
 
+  ;; Capture build context before async build starts
+  (swift-development--capture-build-context nil)
+
   (let ((build-command (xcode-build-config-build-app-command
                         :sim-id (ios-simulator-simulator-identifier)))
         (default-directory (xcode-project-project-root)))
@@ -965,6 +999,9 @@ RUN specifies whether to run after building."
   (setq swift-development--current-build-command nil)
   (xcode-project-setup-project)
   (setq run-once-compiled run)
+
+  ;; Capture build context before async build starts
+  (swift-development--capture-build-context t)
 
   (let ((build-command (xcode-build-config-build-app-command
                         :device-id (ios-device-udid)))
