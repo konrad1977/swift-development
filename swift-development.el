@@ -2552,6 +2552,85 @@ swift-project-debug, swift-cache-debug, and ios-device-debug."
      (when booted-names
        (format " | Booted: %s" (propertize (string-join booted-names ", ") 'face 'success))))))
 
+(defun swift-development-filter-errors ()
+  "Open periphery filter menu to filter build errors."
+  (interactive)
+  (if (fboundp 'periphery-filter-menu)
+      (periphery-filter-menu)
+    (message "Periphery not loaded. Enable swift-development-use-periphery.")))
+
+(defun swift-development-toggle-build-output-buffer ()
+  "Toggle visibility of the build output buffer."
+  (interactive)
+  (let ((buf (get-buffer "*Swift Build Output*")))
+    (if buf
+        (if (get-buffer-window buf)
+            (delete-window (get-buffer-window buf))
+          (display-buffer buf))
+      (message "No build output buffer exists yet."))))
+
+;;;###autoload
+(defun swift-development-toggle-continue-after-errors ()
+  "Toggle continue building after errors.
+When enabled, xcodebuild will compile as many files as possible
+even when some files have errors, showing all errors at once."
+  (interactive)
+  (setq xcode-build-config-continue-building-after-errors
+        (not xcode-build-config-continue-building-after-errors))
+  ;; Clear cached build command since flags changed
+  (when (boundp 'xcode-build-config--build-command-cache)
+    (clrhash xcode-build-config--build-command-cache))
+  (message "Continue building after errors: %s"
+           (if xcode-build-config-continue-building-after-errors
+               (propertize "ENABLED" 'face 'success)
+             (propertize "DISABLED" 'face 'font-lock-comment-face))))
+
+(defun swift-development--settings-status ()
+  "Return current settings status for transient header."
+  (concat
+   (format "Analysis: %s"
+           (propertize (symbol-name swift-development-analysis-mode) 'face 'font-lock-constant-face))
+   " | "
+   (format "Continue after errors: %s"
+           (if xcode-build-config-continue-building-after-errors
+               (propertize "ON" 'face 'success)
+             (propertize "OFF" 'face 'font-lock-comment-face)))
+   " | "
+   (format "Debug: %s"
+           (if swift-development-debug
+               (propertize "ON" 'face 'warning)
+             (propertize "OFF" 'face 'font-lock-comment-face)))))
+
+;;;###autoload
+(transient-define-prefix swift-development-settings-transient ()
+  "Swift Development - Settings Menu."
+  [:description swift-development--settings-status]
+  ["Build Behavior"
+   [("e" "Toggle continue after errors" swift-development-toggle-continue-after-errors)
+    ("p" "Toggle package resolution" swift-development-toggle-package-resolution)
+    ("P" "Toggle periphery mode" swift-development-toggle-periphery-mode)]]
+  ["Analysis Mode"
+   [("1" "Fast analysis (recommended)" swift-development-set-fast-mode)
+    ("2" "Minimal analysis (fastest)" swift-development-set-minimal-mode)
+    ("3" "Full analysis" (lambda () (interactive)
+                           (setq swift-development-analysis-mode 'full)
+                           (message "Swift analysis set to full mode")))
+    ("4" "Disabled" (lambda () (interactive)
+                      (setq swift-development-analysis-mode 'disabled)
+                      (message "Swift analysis disabled")))]]
+  ["Build Modes"
+   [("t" "Turbo mode" swift-development-enable-turbo-mode)
+    ("b" "Balanced mode" swift-development-enable-balanced-mode)]]
+  ["Debug & Cache"
+   [("d" "Toggle debug" swift-development-toggle-debug)
+    ("c" "Clear hash cache" swift-development-clear-hash-cache)
+    ("C" "Clear build command cache" (lambda () (interactive)
+                                        (when (boundp 'xcode-build-config--build-command-cache)
+                                          (clrhash xcode-build-config--build-command-cache))
+                                        (message "Build command cache cleared")))
+    ("X" "Clear DerivedData" swift-development-clear-derived-data)]]
+  [("q" "Quit" transient-quit-one)])
+
 ;;;###autoload
 (transient-define-prefix swift-development-transient ()
   "Swift Development - Main Menu."
@@ -2573,6 +2652,10 @@ swift-project-debug, swift-cache-debug, and ios-device-debug."
    [("C" "Clear hash cache" swift-development-clear-hash-cache)
     ("X" "Clear DerivedData" swift-development-clear-derived-data)
     ("R" "Reset all" swift-development-reset)]]
+  ["Windows"
+   [("W p" "Toggle Periphery" periphery-toggle-buffer)
+    ("W o" "Toggle Build Output" swift-development-toggle-build-output-buffer)
+    ("W s" "Toggle Simulator Log" ios-simulator-toggle-buffer)]]
   ["Packages"
    [("P" "Resolve packages" spm-resolve)
     ("L" "List dependencies" spm-list-dependencies)
@@ -2583,12 +2666,15 @@ swift-project-debug, swift-cache-debug, and ios-device-debug."
     ("p" "SPM UI..." spm-transient)]
    [("v" "Preview..." swiftui-preview-transient)
     ("x" "Xcode Project..." xcode-project-transient)
-    ("f" "Refactor..." swift-refactor-transient)]]
-  ["Settings"
+    ("f" "Refactor..." swift-refactor-transient)
+    ("E" "Errors (Periphery)..." periphery-transient)
+    ("S" "Settings..." swift-development-settings-transient)]]
+  ["Quick Settings"
    [("D" "Toggle debug" swift-development-toggle-debug)
     ("A" "Toggle analysis" swift-development-toggle-analysis-mode)
     ("T" "Toggle device/sim" swift-development-toggle-device-choice)
-    ("O" "Toggle build output" swift-development-toggle-build-output)]]
+    ("O" "Toggle build output" swift-development-toggle-build-output)
+    ("e" "Toggle continue after errors" swift-development-toggle-continue-after-errors)]]
   [("Q" "Quit" transient-quit-one)])
 
 (provide 'swift-development)

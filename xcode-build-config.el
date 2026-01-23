@@ -98,6 +98,14 @@ Higher values may speed up builds but increase memory usage."
   :type 'integer
   :group 'xcode-build-config)
 
+(defcustom xcode-build-config-continue-building-after-errors nil
+  "Continue building other files after encountering errors.
+When enabled, xcodebuild will compile as many files as possible
+even when some files have errors, showing all errors at once.
+This is equivalent to Xcode's 'Continue building after errors' setting."
+  :type 'boolean
+  :group 'xcode-build-config)
+
 (defcustom xcode-build-config-link-jobs-divisor 2
   "Divisor for parallel link jobs (cores / divisor).
 Linking is memory-intensive, so using fewer jobs prevents OOM errors."
@@ -605,6 +613,9 @@ DERIVED-PATH is the derived data path."
                         ;; Other build flags
                         "-skipUnavailableActions"
                         "-useNewBuildSystem=YES"
+                        ;; Continue building after errors (shows all errors at once)
+                        (when xcode-build-config-continue-building-after-errors
+                          "-IDEBuildingContinueBuildingAfterErrors=YES")
                         ;; Optimization flags as a list (only if they exist)
                         (when (and xcode-build-config-other-swift-flags
                                   (> (length xcode-build-config-other-swift-flags) 0))
