@@ -179,24 +179,28 @@ git clone <repository-url> ~/.emacs.d/localpackages/swift
 ## File Structure
 
 ```
-swift/
+swift-development/
 ├── README.md                      # This file
 ├── swift-development.el           # Main Swift development utilities
+├── swift-development-mode.el      # Minor mode with unified keybindings
 ├── xcode-project.el               # Xcode project management
 ├── swift-project-settings.el      # Persistent project settings
-├── xcode-build-config.el          # Build configuration and flags
-├── swift-cache.el                 # Unified caching system
 ├── swift-project.el               # Project utilities
+├── xcode-build-config.el          # Build configuration and flags
+├── xcode-build.el                 # Build system
+├── xcode-clean.el                 # Clean build utilities
+├── xcodebuildserver.el            # Build server configuration
+├── swift-cache.el                 # Unified caching system
+├── swift-file-watcher.el          # File change detection
 ├── swift-features.el              # Additional Swift features
 ├── swift-error-handler.el         # Error parsing and handling
 ├── swift-lsp.el                   # LSP integration
+├── swift-notification.el          # Unified notification system
 ├── swiftui-preview.el             # SwiftUI preview support
 ├── swift-refactor.el              # Refactoring tools
-├── xcode-build.el                 # Build system
-├── xcodebuildserver.el            # Build server configuration
 ├── ios-simulator.el               # iOS Simulator integration
 ├── ios-device.el                  # Physical device management
-├── swift-package-manager.el       # SPM dependency UI
+├── swift-package-manager.el       # SPM dependency UI and build integration
 ├── xcode-instruments.el           # Instruments profiling integration
 ├── localizeable-mode.el           # Localization file editing
 ├── apple-docs-query.el            # Apple documentation lookup
@@ -844,9 +848,9 @@ Physical device deployment and debugging.
 **Transient menu:** `M-x ios-device-transient`
 
 ### swift-package-manager.el
-Interactive UI for managing Swift Package Manager dependencies.
+Interactive UI for managing Swift Package Manager dependencies with build integration.
 
-**Key functions:**
+**Package Management:**
 - `spm-list-dependencies` - Show all dependencies in a dedicated buffer with versions and sources
 - `spm-add-package` - Add a new Swift package (supports GitHub shorthand: `user/repo`)
 - `spm-remove-package` - Remove a package interactively
@@ -857,11 +861,29 @@ Interactive UI for managing Swift Package Manager dependencies.
 - `spm-clean-cache` - Clean SPM cache directories
 - `spm-describe-package` - Show package description
 
+**Build Integration:**
+- `spm-check-status` - Check and display Swift package status for .build-based builds
+- `spm-watch-download` - Watch package download progress in real-time
+- `spm-monitor-build-progress` - Monitor build progress with package status updates
+- `spm-prebuild` - Pre-build Swift packages to speed up subsequent builds
+- `spm-clean-build-dir` - Clean .build directory to force fresh package download
+- `spm-toggle-resolution-mode` - Toggle package resolution mode (auto/always/never)
+- `spm-force-resolve` - Force package resolution on next build
+
 **Features:**
 - Parses `Package.resolved` for accurate version information
 - Supports both SPM packages and Xcode workspace packages
 - Interactive completion for package selection
 - Colorized dependency list with package names, versions, and sources
+- Real-time package download monitoring during builds
+- Integration with xcode-build-config for resolution settings
+
+**Backwards Compatibility:**
+All functions have aliases with `swift-development-` prefix for backwards compatibility:
+- `swift-development-check-package-status` → `spm-check-status`
+- `swift-development-watch-package-download` → `spm-watch-download`
+- `swift-development-prebuild-packages` → `spm-prebuild`
+- etc.
 
 **Transient menu:** `M-x spm-transient`
 
@@ -978,22 +1000,6 @@ Performs multiple optimizations to speed up the build system:
 
 ```elisp
 M-x swift-development-optimize-build-system
-```
-
-### Incremental Build Optimization
-
-**`swift-development-optimize-for-incremental-builds`** - Configure for fastest incremental builds
-
-Optimizes specifically for incremental compilation scenarios:
-
-**What it does:**
-- Smart package resolution (auto mode)
-- Fast analysis mode
-- No Thin LTO
-- Removes extra Swift compiler flags for maximum compatibility
-
-```elisp
-M-x swift-development-optimize-for-incremental-builds
 ```
 
 ### Build Benchmarking
