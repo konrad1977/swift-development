@@ -20,6 +20,7 @@
 (require 'swift-notification nil t)
 (require 'xcode-project nil t)
 (require 'xcode-build-config nil t)
+(require 'swift-macro-manager nil t)
 
 ;; Forward declarations
 (defvar swift-development-force-package-resolution)
@@ -590,6 +591,11 @@ This builds all package dependencies once so they're cached for future builds."
    [("C" "Clean .build dir" spm-clean-build-dir)
     ("t" "Toggle resolution mode" spm-toggle-resolution-mode)
     ("f" "Force resolve next build" spm-force-resolve)]]
+  ["Macros (Swift 5.9+)"
+   [("m" "Approve unapproved" spm-macro-approve-unapproved)
+    ("M" "List approved" spm-macro-list-approved)]
+   [("I" "Inspect macro source" spm-macro-inspect-source)
+    ("R" "Remove approval" spm-macro-remove-approval)]]
   [("q" "Quit" transient-quit-one)])
 
 ;; Backwards compatibility aliases

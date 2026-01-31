@@ -144,6 +144,11 @@ Real-time simulator logs and debugging output directly in Emacs.
 
 ![iOS Simulator Console](screenshots/ios-simulator-console.png)
 
+### Test Explorer
+Interactive test explorer with tree view, XCTest and Swift Testing support, and inline error messages.
+
+![Test Explorer](screenshots/test-explorer.png)
+
 ## Installation
 
 ### Prerequisites
@@ -201,6 +206,8 @@ swift-development/
 ├── ios-simulator.el               # iOS Simulator integration
 ├── ios-device.el                  # Physical device management
 ├── swift-package-manager.el       # SPM dependency UI and build integration
+├── swift-macro-manager.el         # Swift macro approval management (Swift 5.9+)
+├── swift-test-explorer.el         # Test explorer with tree view and test running
 ├── xcode-instruments.el           # Instruments profiling integration
 ├── localizeable-mode.el           # Localization file editing
 ├── apple-docs-query.el            # Apple documentation lookup
@@ -878,6 +885,36 @@ Interactive UI for managing Swift Package Manager dependencies with build integr
 - Real-time package download monitoring during builds
 - Integration with xcode-build-config for resolution settings
 
+**Macro Management (Swift 5.9+):**
+Swift macros from SPM packages require explicit approval before they can be used in builds.
+The package automatically detects macro approval errors and offers to approve them.
+
+- `spm-macro-approve-unapproved` - Approve all unapproved macros from last build
+- `spm-macro-list-approved` - Display currently approved macros
+- `spm-macro-inspect-source` - Open macro source files for review before approving
+- `spm-macro-remove-approval` - Remove approval for a macro (useful for testing)
+- `spm-macro-approve-interactive` - Manually approve a macro by entering details
+
+**Automatic Macro Approval Flow:**
+1. Build fails with macro approval error
+2. Package detects the error and prompts: "1 unapproved macro detected. Approve and rebuild?"
+3. On confirmation, approves the macro and triggers rebuild
+4. Build succeeds!
+
+**Configuration:**
+```elisp
+;; Enable auto-approval without prompting (use with caution!)
+(setq spm-macro-auto-approve nil)  ; Default: nil (always prompt)
+
+;; Disable approval notifications
+(setq spm-macro-notify-on-approval t)  ; Default: t
+```
+
+**How it works:**
+- Macro approvals are stored in `~/Library/org.swift.swiftpm/security/macros.json`
+- Fingerprints are resolved from `Package.resolved` using the package's revision SHA
+- Both curly quotes (Xcode) and straight quotes are supported in error detection
+
 **Backwards Compatibility:**
 All functions have aliases with `swift-development-` prefix for backwards compatibility:
 - `swift-development-check-package-status` → `spm-check-status`
@@ -886,6 +923,71 @@ All functions have aliases with `swift-development-` prefix for backwards compat
 - etc.
 
 **Transient menu:** `M-x spm-transient`
+
+### swift-test-explorer.el
+Test Explorer for Swift/iOS development with tree view UI and test running.
+
+![Test Explorer](screenshots/test-explorer.png)
+
+**Test Explorer:**
+- `swift-test-explorer-show` - Open the test explorer window
+- `swift-test-explorer-toggle` - Toggle test explorer visibility
+- `swift-test-explorer-refresh` - Discover/refresh tests
+- `swift-test-explorer-clear` - Clear all test results
+
+**Run Tests:**
+- `swift-test-explorer-run-at-point` - Run test at cursor position
+- `swift-test-explorer-run-all` - Run all tests in project
+- `swift-test-explorer-run-failed` - Re-run failed tests
+
+**Features:**
+- **4-level tree hierarchy**: Target → File → Class/Suite → Test
+- **XCTest support**: Traditional `func testXxx()` methods
+- **Swift Testing support**: `@Test` and `@Suite` macros with display names
+- **Display names**: Shows `@Test("Addition works")` as "Addition works" instead of function name
+- **Error messages**: Failed tests show error details on separate lines below
+- **Multiple errors**: Each assertion failure shown on its own line
+- **Animated indicators**: Spinner animation while tests are running
+- **Scheme caching**: Auto-detects and caches scheme per project
+- **Navigation**: Jump to test source, navigate between failed tests
+
+**Tree Structure Example:**
+```
+- MyAppTests                          (target)
+   ContentViewTests                  (file, no .swift extension)
+    - ContentViewTests                (class)
+      ✔ testContentViewCreation
+   SwiftTestingExamples              (file with orange Swift icon)
+    - Math Operations                 (suite with display name)
+      ✘ Addition works correctly      (test with display name)
+        ↳ Expectation failed: (1 + 1) == 3
+        ↳ Expectation failed: (2 + 2) == 5
+      ✔ Subtraction works
+```
+
+**Test Explorer Keybindings:**
+| Key | Action |
+|-----|--------|
+| `RET` | Jump to source (file/class/test) or toggle expand (target) |
+| `TAB` | Toggle expand/collapse |
+| `o` | Jump to test source |
+| `x` / `C-c C-c` | Run test at point |
+| `X` | Run all tests |
+| `r` | Re-run failed tests |
+| `R` / `g` | Refresh/discover tests |
+| `c` | Clear results |
+| `S` | Set scheme |
+| `[` | Previous failed test |
+| `]` | Next failed test |
+| `n` / `j` | Next line |
+| `p` / `k` | Previous line |
+| `q` | Close explorer |
+| `?` | Show help |
+
+**Evil-mode Support:**
+Full support for evil-mode with motion state - `j`/`k` navigation works out of the box.
+
+**Transient menu:** `M-x swift-test-transient`
 
 ### xcode-instruments.el
 Xcode Instruments integration for profiling iOS apps.

@@ -21,7 +21,9 @@
 (require 'swift-cache nil t) ;; Unified caching system
 (require 'swift-error-handler nil t) ;; Enhanced error handling
 (require 'swift-file-watcher nil t) ;; File change detection for instant rebuild checks
+(require 'swift-macro-manager nil t) ;; Swift macro approval management
 (require 'swift-package-manager nil t) ;; SPM dependency management
+(require 'swift-test-explorer nil t) ;; Test explorer and test running
 (require 'swift-project-settings nil t) ;; Persistent project settings
 (require 'swiftui-preview nil t) ;; SwiftUI preview support
 (require 'xcode-build-config nil t) ;; Build configuration and command construction
@@ -45,6 +47,16 @@
 (declare-function async-shell-command-to-string "periphery" (&rest args))
 (declare-function async-start-command-to-string "periphery" (&rest args))
 (declare-function message-with-color "periphery" (&rest args))
+
+;; Swift macro manager
+(declare-function spm-macro-check-and-offer-approval "swift-macro-manager" (build-output))
+
+;; Swift test explorer
+(declare-function swift-test-explorer-show "swift-test-explorer")
+(declare-function swift-test-run-at-point "swift-test-explorer")
+(declare-function swift-test-run-class "swift-test-explorer")
+(declare-function swift-test-run-all "swift-test-explorer")
+(declare-function swift-test-transient "swift-test-explorer")
 
 ;; Provide fallback for message-with-color when periphery is not available
 (unless (fboundp 'message-with-color)
@@ -184,17 +196,25 @@ When FOR-DEVICE is non-nil, captures device-specific context."
         swift-development-force-package-resolution nil))  ; Reset force flag after build
 
 (defun swift-development-handle-build-error (error-message)
-  "Handle build ERROR-MESSAGE and display appropriate feedback."
-  (if swift-development-debug
-      (message "Build error: %s" error-message))
+  "Handle build ERROR-MESSAGE and display appropriate feedback.
+Also checks for Swift macro approval errors and offers to approve them."
+  (when swift-development-debug
+    (message "Build error: %s" error-message))
   (swift-development-cleanup)
-  (when (fboundp 'xcode-project-notify)
-    (xcode-project-notify
-     :message (format "Build failed: %s"
-                      (propertize (truncate-string-to-width error-message 50) 'face 'error))))
-  (if swift-development-use-periphery
-      (periphery-run-parser error-message)
-    (swift-development-show-errors-in-compilation-mode error-message)))
+  
+  ;; Check for macro approval errors first - offer to approve and rebuild
+  (if (and (fboundp 'spm-macro-check-and-offer-approval)
+           (spm-macro-check-and-offer-approval error-message))
+      ;; User approved macros - trigger rebuild
+      (swift-development-compile-app)
+    ;; No macro errors (or user declined to approve) - show normal error output
+    (when (fboundp 'xcode-project-notify)
+      (xcode-project-notify
+       :message (format "Build failed: %s"
+                        (propertize (truncate-string-to-width error-message 50) 'face 'error))))
+    (if swift-development-use-periphery
+        (periphery-run-parser error-message)
+      (swift-development-show-errors-in-compilation-mode error-message))))
 
 (defun swift-development-show-errors-in-compilation-mode (output)
   "Display build OUTPUT in compilation-mode buffer."
@@ -2602,7 +2622,8 @@ even when some files have errors, showing all errors at once."
   ["Sub-Menus"
    [("s" "Simulator..." ios-simulator-transient)
     ("d" "Device..." ios-device-transient)
-    ("p" "SPM UI..." spm-transient)]
+    ("p" "SPM UI..." spm-transient)
+    ("t" "Tests..." swift-test-transient)]
    [("v" "Preview..." swiftui-preview-transient)
     ("x" "Xcode Project..." xcode-project-transient)
     ("f" "Refactor..." swift-refactor-transient)
