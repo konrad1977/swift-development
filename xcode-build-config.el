@@ -28,6 +28,7 @@
 (declare-function xcode-project-project-root "xcode-project")
 (declare-function xcode-project-get-workspace-or-project "xcode-project")
 (declare-function xcode-project-scheme "xcode-project")
+(declare-function xcode-project-scheme-display-name "xcode-project")
 
 ;;; ============================================================================
 ;;; Customization Variables
@@ -696,13 +697,198 @@ DERIVED-PATH is the derived data path."
     "COPY_PHASE_STRIP=NO"))
 
 ;;; ============================================================================
+;;; Async Package Resolution
+;;; ============================================================================
+
+(defvar xcode-build-config--package-resolution-process nil
+  "Background process for package dependency resolution.")
+
+(defvar xcode-build-config--packages-resolved-projects (make-hash-table :test 'equal)
+  "Hash table tracking which projects have resolved packages.
+Keys are project roots, values are timestamps of last resolution.")
+
+(defvar xcode-build-config--package-resolution-timeout 120
+  "Timeout in seconds for package resolution.")
+
+(defcustom xcode-build-config-auto-resolve-packages t
+  "Automatically resolve packages in background when project opens.
+When non-nil, starts package resolution as soon as project is detected."
+  :type 'boolean
+  :group 'xcode-build-config)
+
+(defun xcode-build-config--packages-recently-resolved-p (project-root)
+  "Check if packages were recently resolved for PROJECT-ROOT.
+Returns non-nil if resolved within the last 30 minutes."
+  (let ((last-resolved (gethash project-root xcode-build-config--packages-resolved-projects)))
+    (and last-resolved
+         (< (- (float-time) last-resolved) 1800))))  ; 30 minutes
+
+(cl-defun xcode-build-config-resolve-packages-async (&optional callback)
+  "Resolve Swift package dependencies asynchronously in the background.
+Calls CALLBACK with t on success, nil on failure.
+Does not block Emacs - resolution happens in background process."
+  (interactive)
+  (let* ((project-root (xcode-project-project-root))
+         (workspace-or-project (xcode-project-get-workspace-or-project))
+         (scheme (xcode-project-scheme-display-name)))
+    
+    ;; Check if already resolving
+    (when (and xcode-build-config--package-resolution-process
+               (process-live-p xcode-build-config--package-resolution-process))
+      (when (called-interactively-p 'any)
+        (message "Package resolution already in progress..."))
+      (cl-return-from xcode-build-config-resolve-packages-async nil))
+    
+    ;; Check if recently resolved
+    (when (xcode-build-config--packages-recently-resolved-p project-root)
+      (when (called-interactively-p 'any)
+        (message "Packages already resolved recently"))
+      (when callback (funcall callback t))
+      (cl-return-from xcode-build-config-resolve-packages-async t))
+    
+    ;; Build the resolve command
+    (let* ((cmd (format "xcrun xcodebuild -resolvePackageDependencies %s -scheme '%s' -derivedDataPath .build 2>&1"
+                        workspace-or-project scheme))
+           (default-directory project-root))
+      
+      (xcode-build-config--notify "Resolving packages in background..." 2)
+      
+      (setq xcode-build-config--package-resolution-process
+            (make-process
+             :name "swift-package-resolve"
+             :command (list shell-file-name shell-command-switch cmd)
+             :noquery t
+             :buffer " *swift-package-resolve*"
+             :sentinel
+             (lambda (proc event)
+               (when (memq (process-status proc) '(exit signal))
+                 (setq xcode-build-config--package-resolution-process nil)
+                 (let ((exit-code (process-exit-status proc))
+                       (output (when (buffer-live-p (process-buffer proc))
+                                (with-current-buffer (process-buffer proc)
+                                  (buffer-string)))))
+                   (if (= exit-code 0)
+                       (progn
+                         ;; Mark as resolved
+                         (puthash project-root (float-time)
+                                  xcode-build-config--packages-resolved-projects)
+                         (xcode-build-config--notify 
+                          (propertize "Packages resolved" 'face 'success) 2)
+                         (when callback (funcall callback t)))
+                     (progn
+                       (xcode-build-config--notify
+                        (propertize "Package resolution failed" 'face 'error) 3)
+                       (when callback (funcall callback nil))))
+                   ;; Clean up buffer
+                   (when (buffer-live-p (process-buffer proc))
+                     (kill-buffer (process-buffer proc))))))))
+      t)))
+
+(defun xcode-build-config-ensure-packages-resolved ()
+  "Ensure packages are resolved before building.
+If resolution is in progress, waits for it to complete (with timeout).
+If not started, starts resolution synchronously.
+Returns t if packages are resolved, nil otherwise."
+  (let ((project-root (xcode-project-project-root)))
+    (cond
+     ;; Already resolved recently
+     ((xcode-build-config--packages-recently-resolved-p project-root)
+      t)
+     
+     ;; Packages exist locally
+     ((xcode-build-config-swift-packages-exist-p)
+      (puthash project-root (float-time) xcode-build-config--packages-resolved-projects)
+      t)
+     
+     ;; Resolution in progress - wait for it
+     ((and xcode-build-config--package-resolution-process
+           (process-live-p xcode-build-config--package-resolution-process))
+      (xcode-build-config--notify "Waiting for package resolution..." 2)
+      (let ((start-time (float-time))
+            (timeout xcode-build-config--package-resolution-timeout))
+        (while (and (process-live-p xcode-build-config--package-resolution-process)
+                    (< (- (float-time) start-time) timeout))
+          (accept-process-output xcode-build-config--package-resolution-process 0.5))
+        (xcode-build-config--packages-recently-resolved-p project-root)))
+     
+     ;; Not resolving and not resolved - start sync resolution
+     (t
+      (xcode-build-config--notify "Resolving packages..." 2)
+      (let ((result nil))
+        (xcode-build-config-resolve-packages-async
+         (lambda (success) (setq result success)))
+        ;; Wait for completion
+        (let ((start-time (float-time))
+              (timeout xcode-build-config--package-resolution-timeout))
+          (while (and xcode-build-config--package-resolution-process
+                      (process-live-p xcode-build-config--package-resolution-process)
+                      (< (- (float-time) start-time) timeout))
+            (accept-process-output xcode-build-config--package-resolution-process 0.5)))
+        result)))))
+
+(defun xcode-build-config-invalidate-package-resolution (&optional project-root)
+  "Invalidate package resolution cache for PROJECT-ROOT.
+If PROJECT-ROOT is nil, uses current project."
+  (interactive)
+  (let ((root (or project-root (xcode-project-project-root))))
+    (when root
+      (remhash root xcode-build-config--packages-resolved-projects)
+      (when (called-interactively-p 'any)
+        (message "Package resolution cache invalidated for %s"
+                 (file-name-nondirectory (directory-file-name root)))))))
+
+(defun xcode-build-config-package-resolution-status ()
+  "Show status of package resolution for current project."
+  (interactive)
+  (let* ((project-root (xcode-project-project-root))
+         (last-resolved (gethash project-root xcode-build-config--packages-resolved-projects))
+         (in-progress (and xcode-build-config--package-resolution-process
+                          (process-live-p xcode-build-config--package-resolution-process)))
+         (packages-exist (xcode-build-config-swift-packages-exist-p)))
+    (message "Package resolution status for %s:\n  Packages exist: %s\n  Last resolved: %s\n  In progress: %s"
+             (file-name-nondirectory (directory-file-name project-root))
+             (if packages-exist "YES" "NO")
+             (if last-resolved
+                 (format-time-string "%H:%M:%S" (seconds-to-time last-resolved))
+               "Never")
+             (if in-progress "YES" "NO"))))
+
+;;; ============================================================================
+;;; Package.swift Change Hook Integration
+;;; ============================================================================
+
+(defun xcode-build-config--on-package-file-changed (filepath)
+  "Handle Package.swift or Package.resolved file change.
+FILEPATH is the changed file.  Triggers background package resolution."
+  (let ((project-root (xcode-project-project-root)))
+    (when project-root
+      ;; Invalidate cache
+      (xcode-build-config-invalidate-package-resolution project-root)
+      ;; Start async resolution
+      (when xcode-build-config-auto-resolve-packages
+        (run-with-idle-timer
+         1.0 nil
+         (lambda ()
+           (xcode-build-config-resolve-packages-async)))))))
+
+;; Hook into swift-file-watcher if available
+(with-eval-after-load 'swift-file-watcher
+  (add-hook 'swift-file-watcher-package-changed-hook
+            #'xcode-build-config--on-package-file-changed))
+
+;;; ============================================================================
 ;;; Reset Functions
 ;;; ============================================================================
 
 (defun xcode-build-config-reset ()
   "Reset all build configuration cache."
   (clrhash xcode-build-config--build-command-cache)
-  (setq xcode-build-config--current-environment-x86 nil))
+  (clrhash xcode-build-config--packages-resolved-projects)
+  (when (and xcode-build-config--package-resolution-process
+             (process-live-p xcode-build-config--package-resolution-process))
+    (delete-process xcode-build-config--package-resolution-process))
+  (setq xcode-build-config--package-resolution-process nil
+        xcode-build-config--current-environment-x86 nil))
 
 (provide 'xcode-build-config)
 ;;; xcode-build-config.el ends here

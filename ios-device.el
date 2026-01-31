@@ -53,7 +53,6 @@
   (let* ((default-directory buildfolder)
          (appname (ios-device-app-name-from :buildfolder buildfolder))
          (buffer-name (concat ios-device-buffer-name appname "*"))
-         (buffer (get-buffer-create buffer-name))
          (device-id (ios-device-identifier))
          (command (ios-device-install-cmd :identifier device-id :appname appname)))
 
@@ -62,29 +61,50 @@
       (message "build-folder: %s" buildfolder)
       (message "app-name: %s" appname))
 
-    (with-current-buffer buffer
-      (erase-buffer)
-      (setq-local mode-line-format nil)
-      (setq-local left-fringe-width 0)
-      (setq-local right-fringe-width 0)
-      (setq-local ios-device--current-device-id device-id)
-      (setq-local ios-device--current-app-identifier appIdentifier)
-      (add-hook 'kill-buffer-hook #'ios-device-cleanup nil t))
+    ;; Kill any existing buffer and its processes first
+    (when-let* ((existing-buffer (get-buffer buffer-name)))
+      (when (get-buffer-process existing-buffer)
+        (delete-process (get-buffer-process existing-buffer)))
+      (kill-buffer existing-buffer))
 
-    (async-start-command-to-string
-     :command command
-     :callback (lambda (output)
-                 (let ((run-command (ios-device-run-cmd :identifier device-id :appIdentifier appIdentifier)))
-                   (with-current-buffer buffer
-                     (erase-buffer)
-                     (insert output)
-                     (insert "\n\nRunning app...\n\n")
-                     (inhibit-sentinel-messages #'async-shell-command
-                                                run-command
-                                                buffer)))))
+    ;; Update progress notification
+    (when (fboundp 'swift-notification-progress-update)
+      (swift-notification-progress-update 'swift-build :percent 75 :message "Installing on device..."))
 
-    (when (buffer-live-p buffer)
-      (pop-to-buffer buffer))))
+    (let ((buffer (get-buffer-create buffer-name)))
+      (with-current-buffer buffer
+        (let ((inhibit-read-only t))
+          (erase-buffer))
+        (setq buffer-read-only nil)
+        (setq-local mode-line-format nil)
+        (setq-local left-fringe-width 0)
+        (setq-local right-fringe-width 0)
+        (setq-local ios-device--current-device-id device-id)
+        (setq-local ios-device--current-app-identifier appIdentifier)
+        (add-hook 'kill-buffer-hook #'ios-device-cleanup nil t))
+
+      (async-start-command-to-string
+       :command command
+       :callback (lambda (output)
+                   (let ((run-command (ios-device-run-cmd :identifier device-id :appIdentifier appIdentifier)))
+                     (when (buffer-live-p buffer)
+                       (with-current-buffer buffer
+                         (let ((inhibit-read-only t))
+                           (erase-buffer)
+                           (insert output)
+                           (insert "\n\nRunning app...\n\n"))
+                         ;; Update progress - launching
+                         (when (fboundp 'swift-notification-progress-update)
+                           (swift-notification-progress-update 'swift-build :percent 90 :message "Launching..."))
+                         (inhibit-sentinel-messages #'async-shell-command
+                                                    run-command
+                                                    buffer)))
+                     ;; Finish progress notification
+                     (when (fboundp 'swift-notification-progress-finish)
+                       (swift-notification-progress-finish 'swift-build "Running on device!")))))
+
+      (when (buffer-live-p buffer)
+        (pop-to-buffer buffer)))))
 
 (defun ios-device-identifier ()
   "Get iOS device identifier."
@@ -257,7 +277,7 @@ This returns the UDID format that xcodebuild expects."
 (defun ios-device-get-udid-for-name (device-name)
   "Get the UDID (xcodebuild format) for DEVICE-NAME."
   (let ((devices (ios-device-parse-xctrace-devices)))
-    (when-let ((device (seq-find (lambda (d)
+    (when-let* ((device (seq-find (lambda (d)
                                    (string= (plist-get d :name) device-name))
                                  devices)))
       (plist-get device :udid))))
@@ -341,7 +361,7 @@ Returns the process ID (PID) on success, nil on failure."
 (defun ios-device-get-device-name (device-id)
   "Get the device name for DEVICE-ID."
   (let ((devices (ios-device-parse-devices)))
-    (when-let ((device (seq-find (lambda (d)
+    (when-let* ((device (seq-find (lambda (d)
                                    (string= (plist-get d :identifier) device-id))
                                  devices)))
       (plist-get device :name))))
@@ -478,7 +498,7 @@ With optional APP-FILTER, only show logs from that app bundle ID."
 (defun ios-device-clear-log ()
   "Clear the device log buffer."
   (interactive)
-  (when-let ((buffer (get-buffer ios-device--log-buffer-name)))
+  (when-let* ((buffer (get-buffer ios-device--log-buffer-name)))
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (erase-buffer)

@@ -40,32 +40,56 @@
 (defun xcodebuildserver--get-build-root (root workspace scheme)
   "Get the build_root path for the project.
 ROOT is the project root, WORKSPACE is the workspace file, SCHEME is the build scheme.
-Returns the DerivedData path for this specific project, or nil if not found."
-  (let* ((default-directory root)
-         ;; Run xcodebuild to get BUILD_DIR
-         (command (format "xcodebuild -showBuildSettings %s -scheme %s 2>/dev/null | grep -E '^ *BUILD_DIR = ' | head -1 | sed 's/.*= //'"
-                          workspace (shell-quote-argument scheme)))
-         (build-dir (string-trim (shell-command-to-string command))))
-    (when (and build-dir
-               (not (string-empty-p build-dir))
-               (string-match-p "DerivedData" build-dir))
-      ;; BUILD_DIR is like: .../DerivedData/ProjectName-xxx/Build/Products/Debug-iphonesimulator
-      ;; We need: .../DerivedData/ProjectName-xxx
-      (let ((parts (split-string build-dir "/"))
-            (result nil))
-        ;; Find DerivedData in the path and take everything up to the next component
-        (catch 'found
-          (let ((i 0))
-            (while (< i (length parts))
-              (when (string= (nth i parts) "DerivedData")
-                (when (< (1+ i) (length parts))
-                  ;; Include up to and including the project folder (DerivedData/ProjectName-xxx)
-                  (setq result (string-join (seq-take parts (+ i 2)) "/")))
-                (throw 'found t))
-              (setq i (1+ i)))))
-        (when (and result (not (string-prefix-p "/" result)))
-          (setq result (concat "/" result)))
-        result))))
+Returns the build root path (either .build/ or DerivedData) for BSP configuration.
+
+First tries to use saved settings from swift-project-settings (fast).
+Falls back to running xcodebuild if settings not available."
+  (let ((build-dir nil))
+    ;; Try to get from saved settings first (fast path)
+    (when (fboundp 'swift-project-settings-load)
+      (let ((settings (swift-project-settings-load root scheme)))
+        (when settings
+          (setq build-dir (plist-get settings :target-build-dir)))))
+    
+    ;; Fallback to xcodebuild if not in settings
+    ;; Use -derivedDataPath .build to match actual build location
+    (unless build-dir
+      (let* ((default-directory root)
+             (command (format "xcodebuild -showBuildSettings %s -scheme %s -derivedDataPath .build 2>/dev/null | grep -E '^ *BUILD_DIR = ' | head -1 | sed 's/.*= //'"
+                              workspace (shell-quote-argument scheme))))
+        (setq build-dir (string-trim (shell-command-to-string command)))))
+    
+    ;; Extract build root from build-dir
+    ;; BUILD_DIR is like: /path/to/project/.build/Build/Products
+    ;; or: .../DerivedData/ProjectName-xxx/Build/Products
+    ;; We need the parent of "Build" directory
+    (when (and build-dir (not (string-empty-p build-dir)))
+      (cond
+       ;; Local .build directory
+       ((string-match-p "/\\.build/" build-dir)
+        (when (string-match "\\(.*/\\.build\\)" build-dir)
+          (match-string 1 build-dir)))
+       
+       ;; DerivedData directory
+       ((string-match-p "DerivedData" build-dir)
+        (let ((parts (split-string build-dir "/"))
+              (result nil))
+          (catch 'found
+            (let ((i 0))
+              (while (< i (length parts))
+                (when (string= (nth i parts) "DerivedData")
+                  (when (< (1+ i) (length parts))
+                    (setq result (string-join (seq-take parts (+ i 2)) "/")))
+                  (throw 'found t))
+                (setq i (1+ i)))))
+          (when (and result (not (string-prefix-p "/" result)))
+            (setq result (concat "/" result)))
+          result))
+       
+       ;; Unknown format - return parent of Build/Products
+       (t
+        (when (string-match "\\(.*\\)/Build/Products" build-dir)
+          (match-string 1 build-dir)))))))
 
 (defun xcodebuildserver--update-config-with-build-root (root build-root)
   "Update the buildServer.json in ROOT with BUILD-ROOT.

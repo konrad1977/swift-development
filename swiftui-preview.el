@@ -680,7 +680,7 @@ Updates the current preview path to track which preview is being shown."
 
 (defun swiftui-preview--revert-buffer (&rest _)
   "Revert the preview buffer by reloading the image."
-  (when-let ((image-path (buffer-local-value 'swiftui-preview--image-path (current-buffer))))
+  (when-let* ((image-path (buffer-local-value 'swiftui-preview--image-path (current-buffer))))
     (let ((inhibit-read-only t)
           (win (get-buffer-window (current-buffer))))
       (erase-buffer)
@@ -700,7 +700,7 @@ Updates the current preview path to track which preview is being shown."
 
 (defun swiftui-preview--on-window-resize (frame)
   "Handle window resize for FRAME by refreshing preview if visible."
-  (when-let ((buffer (get-buffer swiftui-preview-buffer-name)))
+  (when-let* ((buffer (get-buffer swiftui-preview-buffer-name)))
     (when (get-buffer-window buffer frame)
       ;; Debounce resize events
       (when swiftui-preview--resize-timer

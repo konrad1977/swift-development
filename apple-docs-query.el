@@ -24,7 +24,7 @@
 (defun apple-docs/query-thing-at-point ()
   "Query thing at point."
   (interactive)
-  (when-let ((word (thing-at-point 'word)))
+  (when-let* ((word (thing-at-point 'word)))
     (apple-docs/query word)))
 
 (provide 'apple-docs-query)

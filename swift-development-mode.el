@@ -18,11 +18,23 @@
 (require 'swift-refactor nil t)
 (require 'ios-simulator nil t)
 (require 'xcode-project nil t)
+(require 'swift-file-watcher nil t)
 
 (defgroup swift-development-mode nil
   "Minor mode for Swift development."
   :group 'programming
   :prefix "swift-development-mode-")
+
+(defcustom swift-development-mode-show-watcher-indicator nil
+  "Show file watcher status indicator in mode line.
+When non-nil, displays whether files have changed since last build.
+This is a convenience setting that sets `swift-file-watcher-show-indicator'."
+  :type 'boolean
+  :group 'swift-development-mode
+  :set (lambda (sym val)
+         (set-default sym val)
+         (when (boundp 'swift-file-watcher-show-indicator)
+           (setq swift-file-watcher-show-indicator val))))
 
 (defvar swift-development-mode-map
   (let ((map (make-sparse-keymap)))
@@ -93,10 +105,38 @@ different buffer types related to Swift development, including:
 - Localizeable .strings files
 - iOS simulator output buffers
 
+Features:
+- File watcher for instant rebuild detection (optional indicator in mode line)
+- Background package resolution for faster builds
+- Unified keybindings across Swift-related buffers
+
+To show the file watcher indicator in mode line, set:
+  (setq swift-development-mode-show-watcher-indicator t)
+
 \\{swift-development-mode-map}"
   :lighter " SwiftDev"
   :keymap swift-development-mode-map
-  :group 'swift-development-mode)
+  :group 'swift-development-mode
+  (if swift-development-mode
+      (swift-development-mode--setup)
+    (swift-development-mode--teardown)))
+
+(defun swift-development-mode--setup ()
+  "Setup swift-development-mode."
+  ;; Sync indicator setting
+  (when (and swift-development-mode-show-watcher-indicator
+             (boundp 'swift-file-watcher-show-indicator))
+    (setq swift-file-watcher-show-indicator t))
+  ;; Add mode-line indicator if enabled
+  (when (and swift-development-mode-show-watcher-indicator
+             (fboundp 'swift-file-watcher-add-to-modeline))
+    (swift-file-watcher-add-to-modeline)))
+
+(defun swift-development-mode--teardown ()
+  "Teardown swift-development-mode."
+  ;; Note: We don't remove the modeline indicator here because
+  ;; it might be used by other buffers
+  nil)
 
 ;;;###autoload
 (defun swift-development-mode-enable ()

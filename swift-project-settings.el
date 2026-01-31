@@ -279,17 +279,17 @@ This is called when opening a project to restore previous selections."
             (message "[Settings] Found settings: %S" settings))
 
           ;; Restore to xcode-project variables
-          (when-let ((scheme (or (plist-get settings :scheme) last-scheme)))
+          (when-let* ((scheme (or (plist-get settings :scheme) last-scheme)))
             (setq xcode-project--current-xcode-scheme scheme)
             (when swift-project-settings-debug
               (message "[Settings] Restored scheme: %s" scheme)))
 
-          (when-let ((build-config (plist-get settings :build-config)))
+          (when-let* ((build-config (plist-get settings :build-config)))
             (setq xcode-project--current-build-configuration build-config)
             (when swift-project-settings-debug
               (message "[Settings] Restored build-config: %s" build-config)))
 
-          (when-let ((app-id (plist-get settings :app-identifier)))
+          (when-let* ((app-id (plist-get settings :app-identifier)))
             (setq xcode-project--current-app-identifier app-id)
             (when swift-project-settings-debug
               (message "[Settings] Restored app-identifier: %s" app-id)))
@@ -302,7 +302,7 @@ This is called when opening a project to restore previous selections."
 
           ;; Restore device choice (physical device vs simulator)
           (when (boundp 'swift-development--device-choice)
-            (when-let ((platform (plist-get settings :platform)))
+            (when-let* ((platform (plist-get settings :platform)))
               (setq swift-development--device-choice
                     (string= platform "Physical Device"))
               (when swift-project-settings-debug
@@ -311,13 +311,13 @@ This is called when opening a project to restore previous selections."
 
           ;; Restore simulator selection (if variables exist)
           (when (boundp 'ios-simulator--current-simulator-name)
-            (when-let ((device-name (plist-get settings :device-name)))
+            (when-let* ((device-name (plist-get settings :device-name)))
               (setq ios-simulator--current-simulator-name device-name)
               (when swift-project-settings-debug
                 (message "[Settings] Restored device-name: %s" device-name))))
 
           (when (boundp 'current-simulator-id)
-            (when-let ((device-id (plist-get settings :device-id)))
+            (when-let* ((device-id (plist-get settings :device-id)))
               ;; Validate that the device still exists before restoring
               (if (and (fboundp 'ios-simulator-device-exists-p)
                        (ios-simulator-device-exists-p device-id))
@@ -356,17 +356,17 @@ IMPORTANT: Clears build-related variables first to prevent leaking between schem
 
       ;; Apply settings to buffer-local variables if they exist
       (when settings
-        (when-let ((build-config (plist-get settings :build-config)))
+        (when-let* ((build-config (plist-get settings :build-config)))
           (setq xcode-project--current-build-configuration build-config))
 
-        (when-let ((app-id (plist-get settings :app-identifier)))
+        (when-let* ((app-id (plist-get settings :app-identifier)))
           (setq xcode-project--current-app-identifier app-id))
 
         ;; NOTE: Do NOT restore build-folder - let it be auto-detected based on device type
 
         ;; Restore device choice (physical device vs simulator)
         (when (boundp 'swift-development--device-choice)
-          (when-let ((platform (plist-get settings :platform)))
+          (when-let* ((platform (plist-get settings :platform)))
             (setq swift-development--device-choice
                   (string= platform "Physical Device"))))
 
@@ -374,11 +374,11 @@ IMPORTANT: Clears build-related variables first to prevent leaking between schem
         ;; This prevents overwriting manual simulator selection after reset
         (unless (and (boundp 'current-simulator-id) current-simulator-id)
           (when (boundp 'ios-simulator--current-simulator-name)
-            (when-let ((device-name (plist-get settings :device-name)))
+            (when-let* ((device-name (plist-get settings :device-name)))
               (setq ios-simulator--current-simulator-name device-name)))
 
           (when (boundp 'current-simulator-id)
-            (when-let ((device-id (plist-get settings :device-id)))
+            (when-let* ((device-id (plist-get settings :device-id)))
               ;; Validate that the device still exists before restoring
               (if (and (fboundp 'ios-simulator-device-exists-p)
                        (ios-simulator-device-exists-p device-id))
@@ -559,6 +559,140 @@ IMPORTANT: Device-specific settings are ONLY saved to scheme-specific files."
 Returns relative filename or nil."
   (let ((xcodeproj-files (directory-files project-root nil "\\.xcodeproj$")))
     (car xcodeproj-files)))
+
+;;; Build Info Fetching (from xcodebuild)
+
+(defvar swift-project-settings--fetch-in-progress nil
+  "Hash table tracking in-progress build info fetches per scheme.")
+
+(cl-defun swift-project-settings-fetch-build-info (project-root scheme sdk callback)
+  "Fetch build info from xcodebuild for PROJECT-ROOT, SCHEME and SDK.
+SDK should be \"iphonesimulator\" or \"iphoneos\".
+Calls CALLBACK with the updated settings plist when done.
+Extracts: TARGET_BUILD_DIR, PRODUCT_NAME, PRODUCT_BUNDLE_IDENTIFIER.
+
+This is the ONLY source of truth for build paths. No guessing."
+  (unless swift-project-settings--fetch-in-progress
+    (setq swift-project-settings--fetch-in-progress (make-hash-table :test 'equal)))
+  
+  (let ((fetch-key (format "%s-%s-%s" project-root scheme sdk)))
+    ;; Prevent duplicate fetches
+    (when (gethash fetch-key swift-project-settings--fetch-in-progress)
+      (when swift-project-settings-debug
+        (message "[Settings] Fetch already in progress for %s" scheme))
+      (cl-return-from swift-project-settings-fetch-build-info nil))
+    
+    (puthash fetch-key t swift-project-settings--fetch-in-progress)
+    
+    (when swift-project-settings-debug
+      (message "[Settings] Fetching build info for scheme: %s sdk: %s" scheme sdk))
+    
+    ;; Build xcodebuild command directly - NO CACHE, always fresh
+    ;; IMPORTANT: Use -derivedDataPath .build to match actual build location
+    (let* ((workspace-or-project (when (fboundp 'xcode-project-get-workspace-or-project)
+                                   (xcode-project-get-workspace-or-project)))
+           (command (format "xcrun xcodebuild %s -scheme %s -showBuildSettings -sdk %s -derivedDataPath .build -json 2>/dev/null"
+                            (or workspace-or-project "")
+                            (shell-quote-argument scheme)
+                            sdk))
+           (output-buffer (generate-new-buffer " *build-settings-fetch*")))
+      
+      (when swift-project-settings-debug
+        (message "[Settings] Running: %s" command))
+      
+      (make-process
+       :name "swift-settings-fetch"
+       :buffer output-buffer
+       :command (list shell-file-name shell-command-switch command)
+       :sentinel
+       (lambda (process _event)
+         ;; Clear in-progress flag
+         (remhash fetch-key swift-project-settings--fetch-in-progress)
+         
+         (when (eq (process-status process) 'exit)
+           (if (= (process-exit-status process) 0)
+               (let ((json-data nil))
+                 (with-current-buffer output-buffer
+                   (goto-char (point-min))
+                   (condition-case nil
+                       (setq json-data (json-read))
+                     (error nil)))
+                 (kill-buffer output-buffer)
+                 
+                 (if (and json-data (> (length json-data) 0))
+                     (let* ((build-settings (let-alist (seq-elt json-data 0) .buildSettings))
+                            (target-build-dir (alist-get 'BUILT_PRODUCTS_DIR build-settings))
+                            (product-name (alist-get 'PRODUCT_NAME build-settings))
+                            (bundle-id (alist-get 'PRODUCT_BUNDLE_IDENTIFIER build-settings))
+                            (build-config (alist-get 'CONFIGURATION build-settings))
+                            (app-path (when (and target-build-dir product-name)
+                                        (expand-file-name 
+                                         (concat product-name ".app")
+                                         target-build-dir)))
+                            ;; Load existing settings and merge
+                            (existing (swift-project-settings-load project-root scheme))
+                            (updated (copy-sequence (or existing (list)))))
+                       
+                       ;; Update with new build info
+                       (setq updated (plist-put updated :scheme scheme))
+                       (setq updated (plist-put updated :sdk sdk))
+                       (when target-build-dir
+                         (setq updated (plist-put updated :target-build-dir 
+                                                  (file-name-as-directory target-build-dir))))
+                       (when product-name
+                         (setq updated (plist-put updated :product-name product-name)))
+                       (when bundle-id
+                         (setq updated (plist-put updated :bundle-id bundle-id)))
+                       (when build-config
+                         (setq updated (plist-put updated :build-config build-config)))
+                       (when app-path
+                         (setq updated (plist-put updated :app-path app-path)))
+                       
+                       ;; Save to disk
+                       (swift-project-settings-save project-root updated scheme)
+                       
+                       (when swift-project-settings-debug
+                         (message "[Settings] Saved: config=%s dir=%s" build-config target-build-dir))
+                       
+                       ;; Call callback with updated settings
+                       (when callback
+                         (funcall callback updated)))
+                   
+                    ;; JSON was empty/nil
+                    (when swift-project-settings-debug
+                      (message "[Settings] xcodebuild returned no data"))
+                    (when callback
+                      (funcall callback nil))))
+              ;; Process failed
+              (kill-buffer output-buffer)
+              (when swift-project-settings-debug
+                (message "[Settings] xcodebuild failed"))
+              (when callback
+                (funcall callback nil)))))))))
+
+(defun swift-project-settings-get-build-dir (project-root scheme sdk)
+  "Get cached build directory for PROJECT-ROOT, SCHEME and SDK.
+Returns nil if not cached - use `swift-project-settings-fetch-build-info' to fetch."
+  (let ((settings (swift-project-settings-load project-root scheme)))
+    (when (and settings (equal sdk (plist-get settings :sdk)))
+      (plist-get settings :target-build-dir))))
+
+(defun swift-project-settings-get-app-path (project-root scheme sdk)
+  "Get cached app path for PROJECT-ROOT, SCHEME and SDK.
+Returns nil if not cached."
+  (let ((settings (swift-project-settings-load project-root scheme)))
+    (when (and settings (equal sdk (plist-get settings :sdk)))
+      (plist-get settings :app-path))))
+
+(defun swift-project-settings-get-bundle-id (project-root scheme)
+  "Get cached bundle identifier for PROJECT-ROOT and SCHEME."
+  (let ((settings (swift-project-settings-load project-root scheme)))
+    (plist-get settings :bundle-id)))
+
+(defun swift-project-settings-get-product-name (project-root scheme)
+  "Get cached product name for PROJECT-ROOT and SCHEME."
+  (let ((settings (swift-project-settings-load project-root scheme)))
+    (plist-get settings :product-name)))
 
 (provide 'swift-project-settings)
 ;;; swift-project-settings.el ends here

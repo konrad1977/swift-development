@@ -1575,18 +1575,23 @@ This is called automatically when needed but can also be called manually."
 
 (defun ios-simulator-maybe-preload-cache ()
   "Schedule cache preloading if in a Swift/iOS project.
-Uses a timer to avoid blocking during file opening."
+Uses an idle timer to avoid blocking during file opening."
   (when ios-simulator-debug
     (message "[Auto-warming] Checking if cache preload needed for buffer: %s" (buffer-name)))
   ;; Only preload if we're likely in an iOS project
   (when (and (buffer-file-name)
              (or (string-match-p "\\.swift$" (buffer-file-name))
                  (string-match-p "\\.xcodeproj" (or default-directory ""))))
+    ;; Cancel any existing timer to avoid duplicate preloads
+    (when ios-simulator--preload-timer
+      (cancel-timer ios-simulator--preload-timer)
+      (setq ios-simulator--preload-timer nil))
     (when ios-simulator-debug
-      (message "[Auto-warming] ✓ Swift file detected, scheduling cache preload in 0.5s..."))
-    ;; Schedule preload after 0.5 seconds to not interfere with file opening
+      (message "[Auto-warming] ✓ Swift file detected, scheduling cache preload in 3s idle..."))
+    ;; Schedule preload after 3 seconds of idle time to not interfere with file opening
+    ;; This gives treesit, font-lock, and other major-mode setup time to complete first
     (setq ios-simulator--preload-timer
-          (run-with-idle-timer 0.5 nil #'ios-simulator-preload-cache))))
+          (run-with-idle-timer 3.0 nil #'ios-simulator-preload-cache))))
 
 (defun ios-simulator-toggle-buffer ()
   "Toggle visibility of the iOS Simulator buffer window."
@@ -2139,14 +2144,14 @@ CONTAINER-TYPE can be: app, data, groups, or a specific group identifier."
 (defun ios-simulator-open-app-data ()
   "Open the current app's data container in Finder."
   (interactive)
-  (when-let ((path (ios-simulator-app-container
+  (when-let* ((path (ios-simulator-app-container
                     xcode-project--current-app-identifier "data")))
     (call-process "open" nil nil nil path)))
 
 (defun ios-simulator-open-app-bundle ()
   "Open the current app's bundle container in Finder."
   (interactive)
-  (when-let ((path (ios-simulator-app-container
+  (when-let* ((path (ios-simulator-app-container
                     xcode-project--current-app-identifier "app")))
     (call-process "open" nil nil nil path)))
 

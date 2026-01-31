@@ -52,7 +52,7 @@
 (defun swift-features-swiftui-preview-stop ()
   "Stop SwiftUI Preview."
   (interactive)
-  (when-let ((process (get-process "swiftui-preview")))
+  (when-let* ((process (get-process "swiftui-preview")))
     (kill-process process)
     (message "SwiftUI Preview stopped")))
 

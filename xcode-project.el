@@ -345,10 +345,9 @@ If DIRECTORY is nil, use `default-directory'."
 (defun xcode-project-list-xcscheme-files (folder)
   "List the names of '.xcscheme' files in the xcshareddata/xcshemes subfolder of FOLDER.
 Falls back to xcuserdata schemes if no shared schemes are found."
-  (let ((xcscheme-names '()))
-    (setq folder (file-name-as-directory (expand-file-name folder)))
-    ;; Set the schemes folder path
-    (setq xcschemes-folder (concat folder "xcshareddata/xcschemes/"))
+  (let* ((xcscheme-names '())
+         (folder (file-name-as-directory (expand-file-name folder)))
+         (xcschemes-folder (concat folder "xcshareddata/xcschemes/")))
 
     (when xcode-project-debug
       (message "Searching for shared schemes in folder: %s" xcschemes-folder))
@@ -576,7 +575,7 @@ Results are cached for 30 minutes."
            ;; Use full scheme name
            scheme-name)))
      ;; Last resort: use project directory name
-     (when-let ((project-root (xcode-project-project-root)))
+     (when-let* ((project-root (xcode-project-project-root)))
        (file-name-nondirectory (directory-file-name project-root)))
      ;; Ultimate fallback
      "Unknown")))
@@ -988,120 +987,76 @@ CALLBACK is called with the list of schemes."
       (xcode-project-get-schemes-from-xcodebuild-async callback))))
 
 (cl-defun xcode-project-build-folder (&key (device-type :device))
-  "Get build folder using fast auto-detection (no xcodebuild blocking).
-Falls back to async xcodebuild fetch if auto-detection fails."
-  (when (or (not xcode-project--current-build-folder)
-            (not (eq device-type xcode-project--last-device-type)))
-    (let* ((scheme (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme "")))
-           (config (xcode-project-fetch-or-load-build-configuration))
-           (target-suffix (if (eq device-type :simulator) "iphonesimulator" "iphoneos"))
-           (cache-key (when (fboundp 'swift-cache-project-key)
-                        (swift-cache-project-key
-                         (xcode-project-project-root)
-                         (format "build-folder-%s-%s-%s" scheme config target-suffix)))))
-
-      ;; Try cached result first
-      (let ((cached-folder (when (and cache-key (fboundp 'swift-cache-get))
-                             (swift-cache-get cache-key))))
-        (if (and cached-folder (file-exists-p cached-folder))
-            (setq xcode-project--current-build-folder cached-folder)
-          ;; Try fast auto-detection first (no xcodebuild call)
-          (let ((base-build-products-dir (xcode-project-get-build-products-directory)))
-            (when base-build-products-dir
-              (let ((detected (xcode-project-auto-detect-build-folder
-                               :build-products-dir base-build-products-dir
-                               :scheme scheme
-                               :config config
-                               :device-type device-type
-                               :target-suffix target-suffix)))
-                (when detected
-                  (setq xcode-project--current-build-folder
-                        (if (file-name-absolute-p detected)
-                            detected
-                          (concat base-build-products-dir detected "/"))))))
-            ;; If auto-detection failed and we have no folder, try async fetch
-            (unless xcode-project--current-build-folder
+  "Get build folder from saved settings.
+If not cached, triggers async fetch and returns current value (may be nil).
+This function never blocks - it returns immediately with best available data."
+  (let* ((project-root (xcode-project-project-root))
+         (scheme (replace-regexp-in-string "^['\"]\\|['\"]$" "" 
+                   (or xcode-project--current-xcode-scheme "")))
+         (sdk (if (eq device-type :simulator) "iphonesimulator" "iphoneos")))
+    
+    ;; Check if we need to fetch (different device type or no folder)
+    (when (or (not xcode-project--current-build-folder)
+              (not (eq device-type xcode-project--last-device-type)))
+      
+      ;; Try to get from saved settings first
+      (let ((cached-dir (when (fboundp 'swift-project-settings-get-build-dir)
+                          (swift-project-settings-get-build-dir project-root scheme sdk))))
+        (if cached-dir
+            (progn
+              (setq xcode-project--current-build-folder cached-dir
+                    xcode-project--last-device-type device-type)
               (when xcode-project-debug
-                (message "Auto-detection failed, triggering async build settings fetch"))
-              ;; Trigger async fetch for next time
-              (xcode-project-build-folder-async
-               (lambda (folder)
-                 (when (and folder (not xcode-project--current-build-folder))
-                   (setq xcode-project--current-build-folder folder)
-                   (when xcode-project-debug
-                     (message "Async build folder fetch complete: %s" folder))))
-               :device-type device-type)))))
-
-      ;; Cache the result if we found something
-      (when (and cache-key (fboundp 'swift-cache-set) xcode-project--current-build-folder)
-        (swift-cache-set cache-key xcode-project--current-build-folder 1800))
-
-      (setq xcode-project--last-device-type device-type)
-
-      ;; Save build-folder to settings asynchronously
-      (when (and xcode-project--current-build-folder
-                 (fboundp 'swift-project-settings-capture-from-variables)
-                 (fboundp 'xcode-project-project-root))
-        (let ((current-buf (current-buffer))
-              (project-root (xcode-project-project-root)))
-          (when project-root
-            (run-with-idle-timer 0.1 nil
-                                 (lambda (buf root)
-                                   (when (buffer-live-p buf)
-                                     (with-current-buffer buf
-                                       (swift-project-settings-capture-from-variables root))))
-                                 current-buf project-root))))
-
-      (when xcode-project-debug
-        (message "xcode-project-build-folder: scheme=%s config=%s device=%s folder=%s"
-                 scheme config device-type xcode-project--current-build-folder))))
-  xcode-project--current-build-folder)
+                (message "[build-folder] Using saved settings: %s" cached-dir)))
+          
+          ;; Not cached or wrong SDK - trigger async fetch
+          (when xcode-project-debug
+            (message "[build-folder] Not cached for %s/%s, fetching..." scheme sdk))
+          (xcode-project-build-folder-async
+           (lambda (folder)
+             (when folder
+               (setq xcode-project--current-build-folder folder
+                     xcode-project--last-device-type device-type)
+               (when xcode-project-debug
+                 (message "[build-folder] Async fetch complete: %s" folder))))
+           :device-type device-type))))
+    
+    xcode-project--current-build-folder))
 
 (cl-defun xcode-project-build-folder-async (callback &key (device-type :device))
-  "Get build folder asynchronously using xcodebuild.
-CALLBACK is called with the folder path when complete."
-  (let* ((scheme (replace-regexp-in-string "^['\"]\\|['\"]$" "" (or xcode-project--current-xcode-scheme "")))
-         (config (or xcode-project--current-build-configuration "Debug"))
-         (sdk (if (eq device-type :simulator) "iphonesimulator" "iphoneos"))
-         (target-suffix sdk))
-    (xcode-project-get-build-settings-json-async
-     (lambda (json)
-       (let* ((xcode-built-products-dir (when (and json (> (length json) 0))
-                                          (let-alist (seq-elt json 0)
-                                            .buildSettings.BUILT_PRODUCTS_DIR)))
-              (base-build-products-dir (xcode-project-get-build-products-directory))
-              (result-folder
-               (if base-build-products-dir
-                   (let ((config-folder-name (when xcode-built-products-dir
-                                               (file-name-nondirectory
-                                                (directory-file-name xcode-built-products-dir)))))
-                     (if (and config-folder-name
-                              (file-directory-p (concat base-build-products-dir config-folder-name)))
-                         (file-name-as-directory (concat base-build-products-dir config-folder-name))
-                       ;; Try auto-detect as fallback
-                       (let ((detected (xcode-project-auto-detect-build-folder
-                                       :build-products-dir base-build-products-dir
-                                       :scheme scheme
-                                       :config config
-                                       :device-type device-type
-                                       :target-suffix target-suffix)))
-                         (when detected
-                           (if (file-name-absolute-p detected)
-                               detected
-                             (concat base-build-products-dir detected "/"))))))
-                 ;; Use xcodebuild path directly
-                 (when (and xcode-built-products-dir (file-directory-p xcode-built-products-dir))
-                   (file-name-as-directory xcode-built-products-dir)))))
-         ;; Cache the result
-         (when result-folder
-           (let ((cache-key (when (fboundp 'swift-cache-project-key)
-                             (swift-cache-project-key
-                              (xcode-project-project-root)
-                              (format "build-folder-%s-%s-%s" scheme config target-suffix)))))
-             (when (and cache-key (fboundp 'swift-cache-set))
-               (swift-cache-set cache-key result-folder 1800))))
-         (funcall callback result-folder)))
-     :config config :sdk sdk)))
+  "Get build folder asynchronously by querying xcodebuild.
+CALLBACK is called with the folder path when complete.
+This is the authoritative source - it asks xcodebuild directly."
+  (let* ((project-root (xcode-project-project-root))
+         (scheme (replace-regexp-in-string "^['\"]\\|['\"]$" "" 
+                   (or xcode-project--current-xcode-scheme "")))
+         (sdk (if (eq device-type :simulator) "iphonesimulator" "iphoneos")))
+    
+    ;; Use swift-project-settings-fetch-build-info if available
+    (if (fboundp 'swift-project-settings-fetch-build-info)
+        (swift-project-settings-fetch-build-info
+         project-root scheme sdk
+         (lambda (settings)
+           (let ((dir (when settings (plist-get settings :target-build-dir))))
+             (when dir
+               (setq xcode-project--current-build-folder dir
+                     xcode-project--last-device-type device-type))
+             (funcall callback dir))))
+      
+      ;; Fallback: direct xcodebuild call (legacy path)
+      (let ((config (or xcode-project--current-build-configuration "Debug")))
+        (xcode-project-get-build-settings-json-async
+         (lambda (json)
+           (let ((result-folder 
+                  (when (and json (> (length json) 0))
+                    (let-alist (seq-elt json 0)
+                      (when .buildSettings.BUILT_PRODUCTS_DIR
+                        (file-name-as-directory .buildSettings.BUILT_PRODUCTS_DIR))))))
+             (when result-folder
+               (setq xcode-project--current-build-folder result-folder
+                     xcode-project--last-device-type device-type))
+             (funcall callback result-folder)))
+         :config config :sdk sdk)))))
 
 (defun xcode-project-get-build-products-directory ()
   "Get the base build products directory path."
@@ -1119,159 +1074,70 @@ CALLBACK is called with the folder path when complete."
            ;; Otherwise use the path as-is with Build/Products
            (t (concat (file-name-as-directory derived-path) "Build/Products/"))))))))
 
-(cl-defun xcode-project-auto-detect-build-folder (&key build-products-dir scheme config device-type target-suffix)
-  "Intelligently auto-detect the correct build folder.
-Returns nil if build-products-dir is nil or doesn't exist."
-  (when (and build-products-dir (file-directory-p build-products-dir))
-    (let* ((default-directory build-products-dir)
-           (all-folders (xcode-project-parse-build-folder default-directory)))
+;; NOTE: xcode-project-auto-detect-build-folder was removed.
+;; Build folder detection is now handled by swift-project-settings-fetch-build-info
+;; which queries xcodebuild directly instead of guessing from folder names.
 
-      (when xcode-project-debug
-        (message "Auto-detecting build folder: scheme=%s config=%s target=%s" scheme config target-suffix)
-        (message "Available folders: %s" all-folders))
+;; NOTE: xcode-project-find-exact-build-folder was removed.
+;; See swift-project-settings-fetch-build-info for the new approach.
 
-      (or
-       ;; Strategy 1: Look for exact match with scheme-config-platform
-       (xcode-project-find-exact-build-folder all-folders scheme config target-suffix)
-
-       ;; Strategy 2: Look for config-platform match
-       (xcode-project-find-config-platform-folder all-folders config target-suffix)
-
-       ;; Strategy 3: Look for platform-only match
-       (xcode-project-find-platform-folder all-folders target-suffix)
-
-       ;; Strategy 4: Look for any folder containing the scheme name
-       (xcode-project-find-scheme-folder all-folders scheme)
-
-       ;; Strategy 5: Interactive fallback
-       (xcode-project-interactive-build-folder-selection all-folders target-suffix)))))
-
-(defun xcode-project-find-exact-build-folder (folders scheme config target-suffix)
-  "Find build folder matching scheme-config-platform pattern."
-  (let* ((scheme-base (if (and scheme (string-match "^\\([^(]+\\)" scheme))
-                         (string-trim (match-string 1 scheme))
-                       scheme))
-         ;; Extract suffix from scheme, e.g., "Bruce (Staging)" -> "Staging"
-         (scheme-suffix (when (and scheme (string-match "(\\([^)]+\\))" scheme))
-                         (match-string 1 scheme)))
-         ;; IMPORTANT: Extract suffix from config as well, e.g., "Debug (Production)" -> "Production"
-         ;; This is needed because scheme name might be "Bruce (Prod-debug)" but config is "Debug (Production)"
-         (config-base (if (and config (string-match "^\\([^(]+\\)" config))
-                         (string-trim (match-string 1 config))
-                       config))
-         (config-suffix (when (and config (string-match "(\\([^)]+\\))" config))
-                         (match-string 1 config)))
-         (patterns (list
-                   ;; Pattern 1: Debug (Production)-iphonesimulator (using config suffix - most specific!)
-                   ;; Use regexp-quote to escape special regex characters like parentheses
-                   (when (and config-suffix config-base)
-                     (regexp-quote (format "%s (%s)-%s" config-base config-suffix target-suffix)))
-                   ;; Pattern 1b: Debug (Staging)-iphonesimulator (using scheme suffix as fallback)
-                   (when (and scheme-suffix config-base)
-                     (regexp-quote (format "%s (%s)-%s" config-base scheme-suffix target-suffix)))
-                   ;; Pattern 1c: Any folder containing (Production)-iphonesimulator (when config-base is nil)
-                   (when (and config-suffix (not config-base))
-                     (format "(%s)-%s" (regexp-quote config-suffix) (regexp-quote target-suffix)))
-                   ;; Pattern 2: MyApp-Debug-iphonesimulator
-                   (when (and scheme-base config-base)
-                     (regexp-quote (format "%s-%s-%s" scheme-base config-base target-suffix)))
-                   ;; Pattern 3: MyApp_Debug-iphonesimulator
-                   (when (and scheme-base config-base)
-                     (regexp-quote (format "%s_%s-%s" scheme-base config-base target-suffix)))
-                   ;; Pattern 4: Debug-iphonesimulator (least specific - check last!)
-                   (when config-base
-                     (format "^%s-%s$" (regexp-quote config-base) (regexp-quote target-suffix))))))
-    (cl-some (lambda (pattern)
-              (when pattern  ; Skip nil patterns
-                (cl-find-if (lambda (folder)
-                             (string-match-p pattern folder))
-                           folders)))
-            patterns)))
-
-(defun xcode-project-find-config-platform-folder (folders config target-suffix)
-  "Find build folder matching config-platform pattern.
-Only matches if there's exactly one match to avoid ambiguity."
-  (when config
-    ;; Extract base config if it has suffix, e.g., "Debug (Production)" -> "Debug"
-    (let* ((config-base (if (string-match "^\\([^(]+\\)" config)
-                           (string-trim (match-string 1 config))
-                         config))
-           (pattern (format "%s.*%s" (regexp-quote config-base) (regexp-quote target-suffix)))
-           (matches (seq-filter (lambda (folder)
-                                 (string-match-p pattern folder))
-                               folders)))
-      ;; Only return a match if there's exactly one - avoid ambiguity
-      (when (= (length matches) 1)
-        (car matches)))))
-
-(defun xcode-project-find-platform-folder (folders target-suffix)
-  "Find any build folder matching the platform."
-  (cl-find-if (lambda (folder) 
-               (string-match-p target-suffix folder))
-             folders))
-
-(defun xcode-project-find-scheme-folder (folders scheme)
-  "Find build folder containing the scheme name."
-  (when (and scheme (not (string-empty-p scheme)))
-    (cl-find-if (lambda (folder) 
-                 (string-match-p (regexp-quote scheme) folder))
-               folders)))
-
-(defun xcode-project-interactive-build-folder-selection (folders target-suffix)
-  "Let user interactively select build folder with smart defaults."
-  (let ((platform-folders (seq-filter (lambda (folder) 
-                                        (string-match-p target-suffix folder)) 
-                                      folders)))
-    (cond
-     ;; Only one platform match - use it
-     ((= (length platform-folders) 1)
-      (car platform-folders))
-     ;; Multiple platform matches - let user choose
-     ((> (length platform-folders) 1)
-      (xcode-project-build-menu
-       :title (format "Choose %s build folder" 
-                     (if (string= target-suffix "iphonesimulator") "Simulator" "Device"))
-       :list platform-folders))
-     ;; No platform matches - show all folders
-     (t
-      (xcode-project-build-menu
-       :title "Choose build folder"
-       :list folders)))))
+;; NOTE: The following functions were removed as part of the build-folder refactoring:
+;; - xcode-project-find-config-platform-folder
+;; - xcode-project-find-platform-folder  
+;; - xcode-project-find-scheme-folder
+;; - xcode-project-interactive-build-folder-selection
+;; Build folder is now determined by xcodebuild, not by searching folder names.
 
 ;;;###autoload
 (defun xcode-project-debug-build-folder-detection ()
-  "Debug build folder detection process."
+  "Debug build folder detection - shows saved settings and current state."
   (interactive)
-  (let ((xcode-project-debug t))
-    (message "=== Build Folder Detection Debug ===")
-    (message "Project root: %s" (xcode-project-project-root))
-    (message "Current scheme: %s" xcode-project--current-xcode-scheme)
-    (message "Build configuration: %s" (xcode-project-fetch-or-load-build-configuration))
-    (message "Build products dir: %s" (xcode-project-get-build-products-directory))
-    (let ((build-products-dir (xcode-project-get-build-products-directory)))
-      (when (file-exists-p build-products-dir)
-        (message "Available build folders:")
-        (dolist (folder (xcode-project-parse-build-folder build-products-dir))
-          (message "  - %s" folder))))
-    (message "Simulator folder: %s" (xcode-project-build-folder :device-type :simulator))
-    (message "Device folder: %s" (xcode-project-build-folder :device-type :device))))
+  (let* ((project-root (xcode-project-project-root))
+         (scheme xcode-project--current-xcode-scheme)
+         (sim-settings (when (fboundp 'swift-project-settings-load)
+                         (swift-project-settings-load project-root scheme)))
+         (sim-dir (plist-get sim-settings :target-build-dir))
+         (app-path (plist-get sim-settings :app-path))
+         (sdk (plist-get sim-settings :sdk))
+         (saved-config (plist-get sim-settings :build-config)))
+    (message "=== Build Folder Debug ===")
+    (message "Project root: %s" project-root)
+    (message "Current scheme: %s" scheme)
+    (message "--- Saved Settings (from swift-project-settings) ---")
+    (message "  SDK: %s" sdk)
+    (message "  Build config: %s" saved-config)
+    (message "  Target build dir: %s" sim-dir)
+    (message "  App path: %s" app-path)
+    (message "  Product name: %s" (plist-get sim-settings :product-name))
+    (message "  Bundle ID: %s" (plist-get sim-settings :bundle-id))
+    (message "--- Current Variables ---")
+    (message "  xcode-project--current-build-folder: %s" xcode-project--current-build-folder)
+    (message "  xcode-project--current-build-configuration: %s" xcode-project--current-build-configuration)
+    (message "  xcode-project--last-device-type: %s" xcode-project--last-device-type)
+    (message "--- Disk Check ---")
+    (message "  Build dir exists: %s" (and sim-dir (file-directory-p sim-dir)))
+    (message "  App path exists: %s" (and app-path (file-exists-p app-path)))))
 
 ;;;###autoload  
 (defun xcode-project-clear-build-folder-cache ()
-  "Clear cached build folder selections."
+  "Clear cached build folder and force refetch from xcodebuild."
   (interactive)
   (setq xcode-project--current-build-folder nil
         xcode-project--last-device-type nil)
+  ;; Note: Build folder is now stored in swift-project-settings, not swift-cache.
+  ;; Clear build-settings cache to force fresh fetch on next build.
+  ;; Cache keys are "project-root::build-settings-..." so match with "::"
   (when (fboundp 'swift-cache-invalidate-pattern)
-    (swift-cache-invalidate-pattern "build-folder-"))
+    (swift-cache-invalidate-pattern "::build-settings-"))
   (swift-notification-send :message "Build folder cache cleared" :seconds 2))
 
 (defun xcode-project-setup-xcodebuildserver ()
-  "Setup xcodebuild server."
-  (xcodebuildserver-check-configuration
-   :root (xcode-project-project-root)
-   :workspace (xcode-project-get-workspace-or-project)
-   :scheme (shell-quote-argument (xcode-project-scheme))))
+  "Setup xcodebuild server for BSP/LSP integration."
+  (when xcode-project--current-xcode-scheme
+    (xcodebuildserver-check-configuration
+     :root (xcode-project-project-root)
+     :workspace (xcode-project-get-workspace-or-project)
+     :scheme xcode-project--current-xcode-scheme)))
 
 (defun xcode-project-get-workspace-or-project ()
   "Check if there is workspace or project."
@@ -1374,45 +1240,50 @@ Only matches if there's exactly one match to avoid ambiguity."
                 (message "[Settings] Restored settings for scheme: %s (buffer-local)" last-scheme))
 
               ;; Restore app-identifier from settings
-              (when-let ((app-id (plist-get settings :app-identifier)))
+              (when-let* ((app-id (plist-get settings :app-identifier)))
                 (setq xcode-project--current-app-identifier app-id)
                 (when xcode-project-debug
                   (message "[Settings] Restored app-identifier: %s" app-id)))
 
               ;; Restore build-config from settings
-              (when-let ((build-config (plist-get settings :build-config)))
+              (when-let* ((build-config (plist-get settings :build-config)))
                 (setq xcode-project--current-build-configuration build-config)
                 (when xcode-project-debug
                   (message "[Settings] Restored build-config: %s" build-config)))
 
-              ;; Restore build-folder from settings
-              (when-let ((build-folder (plist-get settings :build-folder)))
-                (setq xcode-project--current-build-folder build-folder)
-                (when xcode-project-debug
-                  (message "[Settings] Restored build-folder: %s" build-folder)))
+              ;; NOTE: Do NOT restore build-folder from settings - it must be
+              ;; auto-detected based on device type (simulator vs physical device)
+              ;; Restoring a cached build-folder causes wrong SDK builds to be installed
 
               ;; Restore simulator selection
               (when (boundp 'ios-simulator--current-simulator-name)
-                (when-let ((device-name (plist-get settings :device-name)))
+                (when-let* ((device-name (plist-get settings :device-name)))
                   (setq ios-simulator--current-simulator-name device-name)
                   (when xcode-project-debug
                     (message "[Settings] Restored simulator name: %s" device-name))))
 
               (when (boundp 'ios-simulator--current-simulator-id)
-                (when-let ((device-id (plist-get settings :device-id)))
+                (when-let* ((device-id (plist-get settings :device-id)))
                   (setq ios-simulator--current-simulator-id device-id)
                   (when xcode-project-debug
                     (message "[Settings] Restored simulator ID: %s" device-id))))
 
               ;; Auto-launch simulator if enabled and we have device settings
+              ;; Use idle timer to avoid blocking file open
               (when (and (boundp 'swift-development-auto-launch-simulator)
                          swift-development-auto-launch-simulator
                          (plist-get settings :device-id)
                          (fboundp 'ios-simulator-setup-simulator-dwim))
-                (when xcode-project-debug
-                  (message "[Settings] Auto-launching simulator: %s"
-                           (plist-get settings :device-name)))
-                (ios-simulator-setup-simulator-dwim (plist-get settings :device-id))))))))
+                (let ((device-id (plist-get settings :device-id))
+                      (device-name (plist-get settings :device-name)))
+                  (when xcode-project-debug
+                    (message "[Settings] Scheduling auto-launch simulator: %s" device-name))
+                  ;; Defer simulator setup to avoid blocking file open
+                  (run-with-idle-timer
+                   1.0 nil
+                   (lambda ()
+                     (when (fboundp 'ios-simulator-setup-simulator-dwim)
+                       (ios-simulator-setup-simulator-dwim device-id)))))))))))
 
     ;; Check cache warming independently of project-changed status
     ;; This handles cases where xcode-project--current-project-root was already set by another function
@@ -1423,23 +1294,38 @@ Only matches if there's exactly one match to avoid ambiguity."
       (message "[DEBUG]   - normalized-project: %s" normalized-project)
       (message "[DEBUG]   - already in cache?: %s" (gethash normalized-project xcode-project--cache-warmed-projects)))
 
+    ;; Defer cache warming to avoid blocking file open
+    ;; Use idle timer so it runs after Emacs is idle for 2 seconds
     (when (and (fboundp 'swift-development-warm-build-cache)
                (require 'swift-development nil t)
                (not (gethash normalized-project xcode-project--cache-warmed-projects)))
       (when xcode-project-debug
-        (message "[DEBUG] All conditions met - warming caches now!"))
+        (message "[DEBUG] Scheduling deferred cache warming..."))
+      ;; Mark as warmed immediately to prevent duplicate scheduling
+      (puthash normalized-project t xcode-project--cache-warmed-projects)
+      ;; Defer the actual cache warming
+      (let ((project-name (file-name-nondirectory normalized-project)))
+        (run-with-idle-timer
+         2.0 nil
+         (lambda ()
+           (when xcode-project-debug
+             (message "[DEBUG] Executing deferred cache warming for %s" project-name))
+           (message "Auto-warming build caches for %s..." project-name)
+           (xcode-project-notify
+            :message (format "Warming build caches for %s..."
+                             (propertize project-name 'face 'font-lock-constant-face)))
+           (swift-development-warm-build-cache)))))
 
-      ;; Always log to Messages buffer for visibility
-      (message "Auto-warming build caches for %s..." (file-name-nondirectory normalized-project))
-
-      ;; Show notification via configured backend (mode-line-hud, message, etc)
-      (xcode-project-notify
-       :message (format "Warming build caches for %s..."
-                        (propertize (file-name-nondirectory normalized-project) 'face 'font-lock-constant-face)))
-
-      (swift-development-warm-build-cache)
-      ;; Mark this project as having warmed caches
-      (puthash normalized-project t xcode-project--cache-warmed-projects))
+    ;; Start async package resolution in background (5s delay)
+    (when (and (fboundp 'xcode-build-config-resolve-packages-async)
+               (boundp 'xcode-build-config-auto-resolve-packages)
+               xcode-build-config-auto-resolve-packages)
+      (run-with-idle-timer
+       5.0 nil
+       (lambda ()
+         (when xcode-project-debug
+           (message "[DEBUG] Starting background package resolution"))
+         (xcode-build-config-resolve-packages-async))))
 
     (when (and xcode-project-debug (or (not xcode-project--current-project-root) project-changed))
       (message "Set up new project: %s" normalized-project))))
@@ -1496,60 +1382,108 @@ Shows that multi-project support is enabled via buffer-local variables."
 
 ;;;###autoload
 (defun xcode-project-reset ()
-  "Reset the current project root and device choice.
-Also clears all persistent cache files (.swift-development/).
-Prompts to choose scheme first, then simulator."
+  "Reset project configuration.
+Prompts for device/simulator choice, then scheme, then fetches build info.
+Build folder is determined by xcodebuild, not by guessing."
   (interactive)
-  ;; Cancel any pending periphery debounce timer
+  ;; 1. Cancel pending timers
   (when xcode-project--periphery-debounce-timer
     (cancel-timer xcode-project--periphery-debounce-timer)
     (setq xcode-project--periphery-debounce-timer nil))
-  ;; First, reset simulator state (but don't choose new one yet)
+  
+  ;; 2. Reset simulator state (but don't choose new one yet)
   (when (fboundp 'ios-simulator-reset)
-    (ios-simulator-reset nil))  ; Pass nil - don't choose yet
+    (ios-simulator-reset nil))
   (when (fboundp 'periphery-kill-buffer)
     (periphery-kill-buffer))
 
-  ;; Clear persistent cache files before resetting variables
-  (when (and xcode-project--current-project-root
-             (fboundp 'swift-project-settings-clear-all-cache))
-    (swift-project-settings-clear-all-cache xcode-project--current-project-root))
-
-  ;; Clear swift-cache for build folders and other cached data
-  (when (fboundp 'swift-cache-invalidate-pattern)
-    (swift-cache-invalidate-pattern "build-folder-")
-    (swift-cache-invalidate-pattern "build-settings-")
-    (swift-cache-invalidate-pattern "scheme-files"))
-
-  (setq swift-development--device-choice nil
-        xcode-project--current-local-device-id nil
-        xcode-project--current-is-xcode-project nil
-        xcode-project--current-build-folder nil
+  ;; 3. Clear all state variables
+  (setq xcode-project--current-build-folder nil
         xcode-project--current-app-identifier nil
         xcode-project--current-build-configuration nil
-        xcode-project--previous-project-root xcode-project--current-project-root ; Store before resetting
+        xcode-project--previous-project-root xcode-project--current-project-root
         xcode-project--current-project-root nil
         xcode-project--current-xcode-scheme nil
         xcode-project--current-buildconfiguration-json-data nil
         xcode-project--current-errors-or-warnings nil
-        swift-development--device-choice nil
-        xcode-project--last-device-type nil)  ; Reset device choice
+        xcode-project--current-local-device-id nil
+        xcode-project--current-is-xcode-project nil
+        xcode-project--last-device-type nil
+        swift-development--device-choice nil)
 
-  ;; NOTE: We intentionally DO NOT reset swift-development--last-build-succeeded here
-  ;; to allow each project to maintain its own build status across project switches.
-  ;; Use swift-development-reset-build-status to manually reset if needed.
+  ;; 4. Clear swift-cache for build-settings (keep scheme cache for performance)
+  ;; Cache keys are "project-root::build-settings-..." so match with "::"
+  (when (fboundp 'swift-cache-invalidate-pattern)
+    (swift-cache-invalidate-pattern "::build-settings-"))
+
+  ;; 5. Reset project root
   (swift-project-reset-root)
   (xcode-project-safe-mode-line-update :message "Resetting configuration")
-  (swift-notification-send :message "Xcode configuration reset - scheme cache cleared" :seconds 2)
+  (swift-notification-send :message "Configuration reset" :seconds 2)
 
-  ;; Now prompt for scheme selection first
-  ;; This ensures scheme is set before simulator selection
+  ;; 6. Prompt for new configuration
   (when (y-or-n-p "Choose a new scheme? ")
+    ;; 6a. Ask device or simulator FIRST
+    (let ((choice (completing-read "Run on: " '("Simulator" "Physical Device") nil t)))
+      (setq swift-development--device-choice (string= choice "Physical Device")))
+    
+    ;; 6b. Select scheme
     (xcode-project-scheme)
-    ;; After scheme is selected, prompt for simulator
-    (when (y-or-n-p "Choose a new simulator? ")
+    
+    ;; 6c. Clear build-settings cache AFTER scheme selection to ensure fresh fetch
+    ;; Cache keys are formatted as "project-root::build-settings-scheme-config-sdk"
+    ;; so we need to match the pattern within the full key
+    (when (fboundp 'swift-cache-invalidate-pattern)
+      (swift-cache-invalidate-pattern "::build-settings-"))
+    
+    ;; 6d. Force next build
+    (setq swift-development--force-next-build t)
+    (when (boundp 'swift-development--last-build-succeeded)
+      (setq swift-development--last-build-succeeded nil))
+    
+    ;; 6e. If simulator, prompt for which one and boot it
+    (unless swift-development--device-choice
       (when (fboundp 'ios-simulator-choose-simulator)
-        (ios-simulator-choose-simulator)))))
+        (ios-simulator-choose-simulator))
+      (when (and (fboundp 'ios-simulator-simulator-identifier)
+                 (fboundp 'ios-simulator-setup-simulator-dwim))
+        (ios-simulator-setup-simulator-dwim (ios-simulator-simulator-identifier))))
+    
+    ;; 6f. Fetch build info from xcodebuild (async)
+    ;; This is the ONLY source of truth for build paths
+    (let* ((project-root (xcode-project-project-root))
+           (scheme xcode-project--current-xcode-scheme)
+           (sdk (if swift-development--device-choice "iphoneos" "iphonesimulator"))
+           (device-type (if swift-development--device-choice :device :simulator)))
+      (swift-notification-send :message "Fetching build settings..." :seconds 2)
+      (if (fboundp 'swift-project-settings-fetch-build-info)
+          (swift-project-settings-fetch-build-info
+           project-root scheme sdk
+           (lambda (settings)
+             (when settings
+               (setq xcode-project--current-build-folder (plist-get settings :target-build-dir)
+                     xcode-project--current-app-identifier (plist-get settings :bundle-id)
+                     xcode-project--current-build-configuration (plist-get settings :build-config)
+                     xcode-project--last-device-type device-type)
+               (when xcode-project-debug
+                 (message "[Reset] Build info fetched: dir=%s bundle=%s config=%s"
+                          (plist-get settings :target-build-dir)
+                          (plist-get settings :bundle-id)
+                          (plist-get settings :build-config)))
+               (swift-notification-send 
+                :message (format "Ready: %s" (or (plist-get settings :product-name)
+                                                 (xcode-project-scheme-display-name)))
+                :seconds 2))))
+        ;; Fallback to old async method
+        (xcode-project-build-folder-async
+         (lambda (folder)
+           (when folder
+             (setq xcode-project--current-build-folder folder
+                   xcode-project--last-device-type device-type)
+             (swift-notification-send 
+              :message (format "Ready: %s" (xcode-project-scheme-display-name))
+              :seconds 2)))
+         :device-type device-type)))))
 
 ;;;###autoload
 (defun xcode-project-start-debugging ()
