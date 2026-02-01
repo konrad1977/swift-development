@@ -1,6 +1,6 @@
 ;;; swift-test-explorer.el --- Test Explorer for Swift/iOS development -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 Mikael Konradsson
+;; Copyright (C) 2026 Mikael Konradsson
 ;; Author: Mikael Konradsson
 ;; Version: 0.6.0
 ;; Package-Requires: ((emacs "28.1"))
@@ -548,10 +548,12 @@ Structure: target -> file -> class/suite -> test"
     (define-key map (kbd "X") #'swift-test-explorer-run-all)
     (define-key map (kbd "C-c C-r") #'swift-test-explorer-run-failed)
     (define-key map (kbd "r") #'swift-test-explorer-run-failed)
+    ;; Expand/collapse
+    (define-key map (kbd "E") #'swift-test-explorer-expand-all)
+    (define-key map (kbd "C") #'swift-test-explorer-collapse-all)
     ;; Other actions
     (define-key map (kbd "R") #'swift-test-explorer-refresh)
     (define-key map (kbd "g") #'swift-test-explorer-refresh)
-    (define-key map (kbd "C-c C-k") #'swift-test-explorer-clear)
     (define-key map (kbd "c") #'swift-test-explorer-clear)
     (define-key map (kbd "S") #'swift-test-set-scheme)
     (define-key map (kbd "[") #'swift-test-explorer-prev-failed)
@@ -573,6 +575,8 @@ Structure: target -> file -> class/suite -> test"
     (kbd "R") #'swift-test-explorer-refresh
     (kbd "gr") #'swift-test-explorer-refresh
     (kbd "c") #'swift-test-explorer-clear
+    (kbd "E") #'swift-test-explorer-expand-all
+    (kbd "C") #'swift-test-explorer-collapse-all
     (kbd "S") #'swift-test-set-scheme
     (kbd "[") #'swift-test-explorer-prev-failed
     (kbd "]") #'swift-test-explorer-next-failed
@@ -613,6 +617,24 @@ Structure: target -> file -> class/suite -> test"
     ('skipped 'swift-test-explorer-skipped-face)
     (_ 'swift-test-explorer-not-run-face)))
 
+(defun swift-test--count-tests (node)
+  "Count total and passed tests under NODE recursively.
+Returns (total . passed)."
+  (let ((total 0)
+        (passed 0))
+    (if (eq (swift-test-node-kind node) 'test)
+        ;; It's a test node
+        (progn
+          (setq total 1)
+          (when (eq (swift-test-node-status node) 'passed)
+            (setq passed 1)))
+      ;; It's a container - count children
+      (dolist (child (swift-test-node-children node))
+        (let ((counts (swift-test--count-tests child)))
+          (setq total (+ total (car counts)))
+          (setq passed (+ passed (cdr counts))))))
+    (cons total passed)))
+
 (defun swift-test--render-node (node depth)
   "Render NODE at DEPTH level. Returns list of formatted lines."
   (let* ((kind (swift-test-node-kind node))
@@ -649,6 +671,11 @@ Structure: target -> file -> class/suite -> test"
                         ('file 'swift-test-explorer-file-face)
                         ('class 'swift-test-explorer-class-face)
                         (_ 'swift-test-explorer-test-face)))
+           ;; Count tests for containers
+           (test-counts (unless (eq kind 'test)
+                          (swift-test--count-tests node)))
+           (total-tests (car test-counts))
+           (passed-tests (cdr test-counts))
            ;; Build the line differently for tests vs containers
            (line (if (eq kind 'test)
                      ;; Test: [indent] [status-icon] name [duration]
@@ -659,15 +686,28 @@ Structure: target -> file -> class/suite -> test"
                              (propertize shown-name 'face name-face)
                              (when duration
                                (propertize (format " (%.3fs)" duration) 'face 'shadow)))
-                   ;; Target/File/Class: [indent] [expand-icon] [kind-icon] name [status-icon if has result]
-                   (concat indent
-                           (propertize expand-icon 'face 'shadow)
-                           " "
-                           (when (not (string-empty-p kind-icon))
-                             (concat kind-icon " "))  ; icon already has face from swift-test-icon-*
-                           (propertize shown-name 'face name-face)
-                           (when (memq status '(passed failed))
-                             (concat " " (propertize status-icon 'face status-face)))))))
+                   ;; Target/File/Class: [indent] [expand-icon] [kind-icon] name [count] [status-icon]
+                   (let* ((all-passed (and (> total-tests 0) (= passed-tests total-tests)))
+                          (any-run (> passed-tests 0))
+                          (count-str (format "(%d/%d)" passed-tests total-tests))
+                          (count-face (cond
+                                       (all-passed 'swift-test-explorer-passed-face)
+                                       (any-run 'swift-test-explorer-failed-face)
+                                       (t 'shadow)))
+                          (result-icon (cond
+                                        (all-passed (swift-test-icon-passed))
+                                        (any-run (swift-test-icon-failed))
+                                        (t nil))))
+                     (concat indent
+                             (propertize expand-icon 'face 'shadow)
+                             " "
+                             (when (not (string-empty-p kind-icon))
+                               (concat kind-icon " "))  ; icon already has face from swift-test-icon-*
+                             (propertize shown-name 'face name-face)
+                             " "
+                             (propertize count-str 'face count-face)
+                             (when result-icon
+                               (concat " " (propertize result-icon 'face count-face))))))))
       
       (push (cons line node) lines)
       
@@ -727,27 +767,7 @@ Structure: target -> file -> class/suite -> test"
                   (puthash line-num (cdr rendered) swift-test--line-to-node)
                   (cl-incf line-num))))
             
-            ;; Render summary
-            (insert "\n")
-            (let ((total 0) (passed 0) (failed 0) (running 0))
-              (swift-test--walk-nodes
-               (lambda (node)
-                 (when (eq (swift-test-node-kind node) 'test)
-                   (cl-incf total)
-                   (pcase (swift-test-node-status node)
-                     ('passed (cl-incf passed))
-                     ('failed (cl-incf failed))
-                     ('running (cl-incf running))))))
-              (insert (format " Total: %d  " total))
-              (insert (format "%s %d  " (swift-test-icon-passed) passed))
-              (insert (format "%s %d  " (swift-test-icon-failed) failed))
-              (when (> running 0)
-                (insert (format "%s %d" (swift-test-icon-running) running)))
-              (insert "\n"))
-            
-            ;; Keybindings help
-            (insert (propertize " RET:goto  x/C-c C-c:run  X:all  r:failed  R:refresh  q:quit\n" 
-                                'face 'shadow)))
+)
           
           (goto-char (min pos (point-max)))
           ;; Force redisplay
@@ -846,6 +866,24 @@ For files/classes/tests: jump to source location."
       (setf (swift-test-node-expanded node)
             (not (swift-test-node-expanded node)))
       (swift-test--render-buffer))))
+
+(defun swift-test-explorer-expand-all ()
+  "Expand all nodes in the test explorer."
+  (interactive)
+  (swift-test--walk-nodes
+   (lambda (node)
+     (when (swift-test-node-children node)
+       (setf (swift-test-node-expanded node) t))))
+  (swift-test--render-buffer))
+
+(defun swift-test-explorer-collapse-all ()
+  "Collapse all nodes in the test explorer."
+  (interactive)
+  (swift-test--walk-nodes
+   (lambda (node)
+     (when (swift-test-node-children node)
+       (setf (swift-test-node-expanded node) nil))))
+  (swift-test--render-buffer))
 
 (defun swift-test-explorer-goto-test ()
   "Jump to the test source at point."
@@ -996,6 +1034,10 @@ For files/classes/tests: jump to source location."
 
 (defun swift-test--run-tests (test-ids)
   "Run tests with TEST-IDS (nil means all tests)."
+  ;; Auto-show test explorer when running tests
+  (unless (get-buffer-window swift-test--buffer-name)
+    (swift-test-explorer-show))
+  
   (setq swift-test--last-run-tests test-ids)
   (setq swift-test--failed-tests nil)
   (swift-test--mark-tests-running test-ids)
@@ -1503,21 +1545,23 @@ Returns plist with :class and :test."
 
 ;;; Transient Menu
 
-(when (require 'transient nil t)
-  (transient-define-prefix swift-test-transient ()
-    "Swift Test menu."
-    ["Test Explorer"
-     ("e" "Show explorer" swift-test-explorer-show)
-     ("E" "Toggle explorer" swift-test-explorer-toggle)]
-    ["Run Tests"
-     ("t" "Test at point" swift-test-run-at-point)
-     ("c" "Test class" swift-test-run-class)
-     ("a" "All tests" swift-test-run-all)
-     ("r" "Re-run failed" swift-test-run-failed)]
-    ["Actions"
-     ("R" "Refresh/discover" swift-test-explorer-refresh)
-     ("C" "Clear results" swift-test-explorer-clear)]
-    [("q" "Quit" transient-quit-one)]))
+(require 'transient)
+
+;;;###autoload (autoload 'swift-test-transient "swift-test-explorer" nil t)
+(transient-define-prefix swift-test-transient ()
+  "Swift Test menu."
+  ["Test Explorer"
+   ("e" "Show explorer" swift-test-explorer-show)
+   ("E" "Toggle explorer" swift-test-explorer-toggle)]
+  ["Run Tests"
+   ("t" "Test at point" swift-test-run-at-point)
+   ("c" "Test class" swift-test-run-class)
+   ("a" "All tests" swift-test-run-all)
+   ("r" "Re-run failed" swift-test-run-failed)]
+  ["Actions"
+   ("R" "Refresh/discover" swift-test-explorer-refresh)
+   ("C" "Clear results" swift-test-explorer-clear)]
+  [("q" "Quit" transient-quit-one)])
 
 (provide 'swift-test-explorer)
 ;;; swift-test-explorer.el ends here

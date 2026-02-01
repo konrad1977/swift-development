@@ -58,12 +58,33 @@
 (declare-function swift-test-run-all "swift-test-explorer")
 (declare-function swift-test-transient "swift-test-explorer")
 
-;; Provide fallback for message-with-color when periphery is not available
+;; Transient menus from other modules
+(declare-function ios-simulator-transient "ios-simulator")
+(declare-function ios-device-transient "ios-device")
+(declare-function spm-transient "swift-package-manager")
+(declare-function swiftui-preview-transient "swiftui-preview")
+(declare-function xcode-project-transient "xcode-project")
+(declare-function swift-refactor-transient "swift-refactor")
+(declare-function periphery-transient "periphery")
+
+;; Provide fallbacks when periphery is not available
 (unless (fboundp 'message-with-color)
   (cl-defun message-with-color (&key tag text attributes)
     "Fallback for message-with-color when periphery is not loaded."
     (ignore attributes)  ; Suppress unused variable warning
     (message "%s %s" (or tag "") (or text ""))))
+
+(unless (fboundp 'periphery-toggle-buffer)
+  (defun periphery-toggle-buffer ()
+    "Fallback when periphery is not installed."
+    (interactive)
+    (message "Periphery package is not installed")))
+
+(unless (fboundp 'periphery-transient)
+  (defun periphery-transient ()
+    "Fallback when periphery is not installed."
+    (interactive)
+    (message "Periphery package is not installed")))
 
 (defgroup swift-additions nil
   "Swift development tools and utilities for Emacs."
