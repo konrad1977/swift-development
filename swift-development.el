@@ -1724,15 +1724,29 @@ Returns the configuration name or 'Debug' as fallback."
    (t default-directory)))
 
 (defun swift-development-check-for-spm-build-errors (text)
-  "Check for Swift package build erros in TEXT."
+  "Check for Swift package build errors in TEXT."
   (when swift-development-debug (message text))
-  (if (or
-       (string-match-p (regexp-quote "error:") text)
-       (string-match-p (regexp-quote "warning:") text))
-      (progn
-        (when (not (string-match-p (regexp-quote "error:") text))
-          (swift-development-run-async-swift-package)))
-    (swift-development-run-async-swift-package)))
+  ;; Cancel progress notification
+  (when (fboundp 'swift-notification-progress-cancel)
+    (swift-notification-progress-cancel 'spm-build))
+  (let ((has-errors (string-match-p (regexp-quote "error:") text))
+        (has-warnings (string-match-p (regexp-quote "warning:") text)))
+    (cond
+     ;; Build failed with errors
+     (has-errors
+      (swift-notification-send :message "Build failed with errors" :seconds 3)
+      (when (and (fboundp 'periphery-run-parser) swift-development-use-periphery)
+        (periphery-run-parser text)))
+     ;; Build succeeded with warnings - run anyway
+     (has-warnings
+      (swift-notification-send :message "Build succeeded (with warnings)" :seconds 2)
+      (when (and (fboundp 'periphery-run-parser) swift-development-use-periphery)
+        (periphery-run-parser text))
+      (swift-development-run-async-swift-package))
+     ;; Build succeeded
+     (t
+      (swift-notification-send :message "Build succeeded - running..." :seconds 2)
+      (swift-development-run-async-swift-package)))))
 
 (defun swift-development-run-async-swift-package ()
   "Run async swift package and hide the normal output."
@@ -1746,17 +1760,32 @@ Returns the configuration name or 'Debug' as fallback."
 (defun swift-development-build-swift-package ()
   "Build swift package module."
   (interactive)
-  (let ((default-directory (swift-development-get-project-root)))
-    (xcode-project-reset)
+  (let* ((default-directory (swift-development-get-project-root))
+         (package-name (file-name-nondirectory (directory-file-name default-directory))))
     (if swift-development-use-periphery
         (progn
-          (async-shell-command-to-string :process-name "periphery" :command "swift build" :callback #'swift-development-check-for-spm-build-errors)
-          (message-with-color :tag "[ Package]" :text (format "%s. Please wait. Patience is a virtue!" (swift-development-get-project-root)) :attributes 'warning))
-      ;; Use compilation-mode for building
+          ;; Start progress notification
+          (when (fboundp 'swift-notification-progress-start)
+            (swift-notification-progress-start
+             :id 'spm-build
+             :title (format "Building %s" package-name)
+             :message "Compiling Swift package..."
+             :percent 0))
+          ;; Start async build
+          (async-shell-command-to-string
+           :process-name "swift-package-build"
+           :command "swift build"
+           :callback #'swift-development-check-for-spm-build-errors)
+          ;; Update progress to show we're working
+          (when (fboundp 'swift-notification-progress-update)
+            (swift-notification-progress-update 'spm-build
+                                                :percent 25
+                                                :message "Building...")))
+      ;; Use compilation-mode for building (non-periphery path)
       (let ((compilation-buffer-name-function (lambda (_) "*Swift Package Build*"))
             (compilation-scroll-output t))
-        (compile "swift build")
-        (message-with-color :tag "[ Package]" :text (format "Building %s..." (swift-development-get-project-root)) :attributes 'warning)))))
+        (swift-notification-send :message (format "Building %s..." package-name) :seconds 2)
+        (compile "swift build")))))
 
 (defun swift-development-test-swift-package-from-file ()
   "Test swift package module from current file location."

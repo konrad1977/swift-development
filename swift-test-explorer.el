@@ -44,6 +44,7 @@
 (declare-function xcode-build-config-build-app-command "xcode-build-config")
 (declare-function swift-notification-send "swift-notification")
 (declare-function periphery-run-test-parser "periphery")
+(declare-function periphery-run-parser "periphery")
 
 ;;; Customization
 
@@ -65,11 +66,6 @@
 
 (defcustom swift-test-auto-discover t
   "Automatically discover tests when opening the explorer."
-  :type 'boolean
-  :group 'swift-test-explorer)
-
-(defcustom swift-test-show-disabled t
-  "Show disabled/skipped tests in the explorer."
   :type 'boolean
   :group 'swift-test-explorer)
 
@@ -110,12 +106,6 @@
       (nerd-icons-faicon "nf-fa-minus_circle" :face 'swift-test-explorer-skipped-face)
     "⊘"))
 
-(defun swift-test-icon-target ()
-  "Get icon for test targets."
-  (if (fboundp 'nerd-icons-octicon)
-      (nerd-icons-octicon "nf-oct-package" :face 'swift-test-explorer-target-face)
-    "▣"))
-
 (defun swift-test-icon-file ()
   "Get icon for test files (Swift logo in orange)."
   (if (fboundp 'nerd-icons-devicon)
@@ -128,12 +118,6 @@
       (nerd-icons-codicon "nf-cod-symbol_class" :face 'swift-test-explorer-class-face)
     "◆"))
 
-(defun swift-test-icon-test ()
-  "Get icon for individual tests."
-  (if (fboundp 'nerd-icons-mdicon)
-      (nerd-icons-mdicon "nf-md-test_tube" :face 'swift-test-explorer-test-face)
-    "▷"))
-
 (defun swift-test-icon-collapsed ()
   "Get icon for collapsed nodes."
   "+")
@@ -142,10 +126,20 @@
   "Get icon for expanded nodes."
   "-")
 
+(defun swift-test-icon-spm ()
+  "Get icon for SPM (Swift Package Manager) packages."
+  "📦")
+
+(defun swift-test-icon-xcode ()
+  "Get icon for Xcode project targets."
+  (if (fboundp 'nerd-icons-devicon)
+      (nerd-icons-devicon "nf-dev-xcode" :face 'swift-test-explorer-xcode-face)
+    "🍎"))
+
 ;;; Faces
 
 (defface swift-test-explorer-target-face
-  '((t :inherit font-lock-keyword-face :weight bold))
+  '((t :inherit default :weight bold))
   "Face for test targets."
   :group 'swift-test-explorer)
 
@@ -189,6 +183,11 @@
   "Face for tests not yet run."
   :group 'swift-test-explorer)
 
+(defface swift-test-explorer-xcode-face
+  '((t :inherit default))
+  "Face for Xcode project icon."
+  :group 'swift-test-explorer)
+
 (defface swift-test-explorer-skipped-face
   '((t :inherit shadow :slant italic))
   "Face for skipped tests."
@@ -210,7 +209,9 @@
   duration     ; Test duration in seconds (if available)
   message      ; Error/failure message (if any)
   display-name ; Swift Testing display name from @Test("...") or @Suite("...")
-  func-name)   ; Original function name (for Swift Testing tests)
+  func-name    ; Original function name (for Swift Testing tests)
+  package-type ; 'spm for local SPM package, 'xcode for Xcode target, nil for unknown
+  package-root) ; Root directory for local SPM packages
 
 (defvar swift-test--report nil
   "Current test report - list of target nodes.")
@@ -238,6 +239,9 @@
 
 (defvar swift-test--scheme-cache (make-hash-table :test 'equal)
   "Hash table mapping project root to cached scheme.")
+
+(defvar swift-test--current-project-root nil
+  "The project root for the current test explorer state.")
 
 (defconst swift-test--spinner-frames '("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
   "Animation frames for running tests.")
@@ -270,12 +274,47 @@
   "Parse a test ID into (target class test) list."
   (split-string id "/" t))
 
+(defun swift-test--format-error-message (msg)
+  "Format error MSG for display, cleaning up multi-line comparison messages.
+Extracts the key assertion info and makes it more readable."
+  (when msg
+    (let ((cleaned msg))
+      ;; Replace literal newlines within quoted strings with a visual indicator
+      ;; XCTAssertEqual shows: ("line1\n\nline2") is not equal to ("line3\n\nline4")
+      (setq cleaned (replace-regexp-in-string "\n\n" " | " cleaned))
+      (setq cleaned (replace-regexp-in-string "\n" " " cleaned))
+      ;; Collapse multiple spaces
+      (setq cleaned (replace-regexp-in-string "  +" " " cleaned))
+      ;; Trim
+      (string-trim cleaned))))
+
+(defun swift-test--reset-state ()
+  "Reset all test explorer state for a fresh start."
+  (setq swift-test--report nil)
+  (setq swift-test--last-run-tests nil)
+  (setq swift-test--failed-tests nil)
+  (setq swift-test--running-tests nil)
+  (setq swift-test--line-to-node (make-hash-table))
+  (swift-test--stop-animation))
+
+(defun swift-test--check-project-changed ()
+  "Check if project has changed and reset state if needed."
+  (let ((current-root (swift-test--project-root)))
+    (unless (equal current-root swift-test--current-project-root)
+      ;; Project changed - reset everything
+      (swift-test--reset-state)
+      (setq swift-test--current-project-root current-root)
+      t)))  ; Return t if project changed
+
 ;;; Test Discovery
 
 (defun swift-test--find-test-files ()
-  "Find all Swift test files in the project."
+  "Find all Swift test files in the project.
+Excludes .build, DerivedData, and other build directories."
   (let* ((root (swift-test--project-root))
-         (files '()))
+         (files '())
+         ;; Directories to exclude
+         (excluded-dirs '(".build" "DerivedData" "build" "Build" ".swiftpm" "Pods" "Carthage")))
     ;; Find files matching common test patterns (using regexp, not glob)
     (dolist (pattern '("Tests\\.swift$" "Test\\.swift$" "Spec\\.swift$"))
       (setq files (append files
@@ -285,6 +324,13 @@
       (when (file-directory-p dir)
         (setq files (append files
                             (directory-files-recursively dir "\\.swift$")))))
+    ;; Filter out excluded directories
+    (setq files (cl-remove-if
+                 (lambda (f)
+                   (cl-some (lambda (excluded)
+                              (string-match-p (concat "/" excluded "/") f))
+                            excluded-dirs))
+                 files))
     ;; Remove duplicates and sort
     (sort (delete-dups files) #'string<)))
 
@@ -404,35 +450,71 @@ Returns a list of plists with :class, :test, :line, :type, :display-name, :suite
         (forward-line 1)))
     (nreverse tests)))
 
+(defun swift-test--detect-package-type (filepath)
+  "Detect if FILEPATH belongs to a local SPM package or Xcode target.
+Returns a plist with :type ('spm or 'xcode) and :root (package root for SPM)."
+  (let ((dir (file-name-directory filepath))
+        (project-root (file-truename (swift-test--project-root))))
+    (catch 'found
+      ;; Search upward for Package.swift
+      (while (and dir (not (string= dir "/")))
+        (let ((package-file (expand-file-name "Package.swift" dir)))
+          (if (file-exists-p package-file)
+              ;; Found Package.swift
+              (if (string= (file-truename dir) project-root)
+                  ;; It's the main project - could be pure SPM or Xcode with Package.swift
+                  (throw 'found (list :type 'xcode :root nil))
+                ;; It's a local package
+                (throw 'found (list :type 'spm :root dir)))
+            (setq dir (file-name-directory (directory-file-name dir))))))
+      ;; No Package.swift found - assume Xcode
+      (list :type 'xcode :root nil))))
+
 (defun swift-test--discover-tests ()
   "Discover all tests in the project and build the test report.
 Structure: target -> file -> class/suite -> test"
+  ;; Check if project changed and reset if needed
+  (swift-test--check-project-changed)
+  
   (let ((files (swift-test--find-test-files))
         (targets (make-hash-table :test 'equal))
         (root (swift-test--project-root)))
     
     (dolist (file files)
       ;; Determine target from file path
+      ;; Look for directory containing test files - usually named *Tests
+      ;; e.g., Bruce/BruceCore/Tests/BruceCoreTests/SomeTests.swift -> BruceCoreTests
       (let* ((relative-path (file-relative-name file root))
-             (target (or (and (string-match "^\\([^/]+\\)/" relative-path)
-                              (match-string 1 relative-path))
+             (path-parts (split-string relative-path "/" t))
+             ;; Find the directory that contains the test file (parent dir)
+             (parent-dir (file-name-nondirectory (directory-file-name (file-name-directory file))))
+             ;; Use parent directory if it ends with "Tests", otherwise look for *Tests in path
+             (target (or (and (string-match-p "Tests$" parent-dir) parent-dir)
+                         (cl-find-if (lambda (p) (string-match-p "Tests$" p)) (reverse path-parts))
+                         (car path-parts)
                          "Tests"))
              (filename (file-name-nondirectory file))
-             (tests (swift-test--parse-swift-file-for-tests file)))
+             (tests (swift-test--parse-swift-file-for-tests file))
+             ;; Detect package type for this file
+             (pkg-info (swift-test--detect-package-type file))
+             (pkg-type (plist-get pkg-info :type))
+             (pkg-root (plist-get pkg-info :root)))
         
         ;; Only process files that have tests
         (when tests
           (let* (;; Get or create target node
                  (target-node (or (gethash target targets)
-                                  (puthash target
-                                           (make-swift-test-node
-                                            :id target
-                                            :kind 'target
-                                            :name target
-                                            :status 'not-run
-                                            :expanded t
-                                            :children (make-hash-table :test 'equal))
-                                           targets)))
+                                  (let ((node (make-swift-test-node
+                                               :id target
+                                               :kind 'target
+                                               :name target
+                                               :status 'not-run
+                                               :expanded t
+                                               :children (make-hash-table :test 'equal)
+                                               :package-type pkg-type
+                                               :package-root pkg-root)))
+                                    (puthash target node targets)
+                                    node)))
                  (target-children (swift-test-node-children target-node))
                  ;; Get or create file node
                  (file-id (format "%s/%s" target filename))
@@ -592,10 +674,13 @@ Structure: target -> file -> class/suite -> test"
 \\{swift-test-explorer-mode-map}"
   :group 'swift-test-explorer
   :keymap swift-test-explorer-mode-map
-  (setq-local line-move-visual nil)
-  (setq-local truncate-lines t)
+  (setq-local line-move-visual t)
+  (setq-local truncate-lines nil)
+  (setq-local word-wrap t)
+  (setq-local wrap-prefix "        ")  ; Indent wrapped lines for readability
   (setq-local buffer-read-only t)
-  (setq-local revert-buffer-function #'swift-test-explorer-refresh))
+  (setq-local revert-buffer-function #'swift-test-explorer-refresh)
+  (visual-line-mode 1))
 
 (defun swift-test--get-status-icon (status)
   "Get the icon for STATUS."
@@ -635,6 +720,14 @@ Returns (total . passed)."
           (setq passed (+ passed (cdr counts))))))
     (cons total passed)))
 
+(defun swift-test--has-running-tests (node)
+  "Check if NODE or any of its children have running tests."
+  (if (eq (swift-test-node-kind node) 'test)
+      (eq (swift-test-node-status node) 'running)
+    ;; Container - check children
+    (cl-some #'swift-test--has-running-tests
+             (swift-test-node-children node))))
+
 (defun swift-test--render-node (node depth)
   "Render NODE at DEPTH level. Returns list of formatted lines."
   (let* ((kind (swift-test-node-kind node))
@@ -660,8 +753,16 @@ Returns (total . passed)."
     (let* ((expand-icon (if (and children (not (eq kind 'test)))
                             (if expanded (swift-test-icon-expanded) (swift-test-icon-collapsed))
                           " "))
+           ;; Package type icon for targets
+           (package-type (swift-test-node-package-type node))
+           (package-icon (when (eq kind 'target)
+                           (pcase package-type
+                             ('spm (swift-test-icon-spm))
+                             ('xcode (swift-test-icon-xcode))
+                             (_ nil))))
+           ;; For targets, use package-type icon instead of generic target icon
            (kind-icon (pcase kind
-                        ('target (swift-test-icon-target))
+                        ('target nil)  ; Will use package-icon instead
                         ('file (swift-test-icon-file))
                         ('class (swift-test-icon-class))
                         (_ "")))
@@ -698,21 +799,31 @@ Returns (total . passed)."
                                         (all-passed (swift-test-icon-passed))
                                         (any-run (swift-test-icon-failed))
                                         (t nil))))
-                     (concat indent
-                             (propertize expand-icon 'face 'shadow)
-                             " "
-                             (when (not (string-empty-p kind-icon))
-                               (concat kind-icon " "))  ; icon already has face from swift-test-icon-*
-                             (propertize shown-name 'face name-face)
-                             " "
-                             (propertize count-str 'face count-face)
-                             (when result-icon
-                               (concat " " (propertize result-icon 'face count-face))))))))
+                     (let ((is-running (swift-test--has-running-tests node))
+                           (spinner (nth swift-test--animation-frame swift-test--spinner-frames)))
+                       (concat indent
+                               (propertize expand-icon 'face 'shadow)
+                               " "
+                               ;; Show package type icon for targets, or kind-icon for other nodes
+                               (when package-icon
+                                 (concat package-icon " "))
+                               (when (and kind-icon (not (string-empty-p kind-icon)))
+                                 (concat kind-icon " "))  ; icon already has face from swift-test-icon-*
+                               (propertize shown-name 'face name-face)
+                               " "
+                               (propertize count-str 'face count-face)
+                                (cond
+                                 (is-running
+                                  (concat " " (propertize spinner 'face 'swift-test-explorer-running-face)))
+                                 (result-icon
+                                  (concat " " (propertize result-icon 'face count-face))))))))))
       
       (push (cons line node) lines)
       
       ;; Render error messages if test failed and has messages
       ;; error-message can be a string (legacy) or a list of strings
+      ;; Multi-line messages are formatted into a single readable line
+      ;; Visual-line-mode handles wrapping long messages nicely
       (when (and (eq kind 'test)
                  (eq status 'failed)
                  error-message)
@@ -720,11 +831,13 @@ Returns (total . passed)."
               (messages (if (listp error-message) error-message (list error-message))))
           ;; Render each error on its own line
           (dolist (msg messages)
-            (push (cons (concat error-indent
-                                (propertize "↳ " 'face 'swift-test-explorer-failed-face)
-                                (propertize msg 'face 'swift-test-explorer-failed-face))
-                        nil)  ; nil node - this is just a message line
-                  lines))))
+            ;; Format the message (handles multi-line, cleans up)
+            (let ((formatted (swift-test--format-error-message msg)))
+              (push (cons (concat error-indent
+                                  (propertize "↳ " 'face 'swift-test-explorer-failed-face)
+                                  (propertize formatted 'face 'swift-test-explorer-failed-face))
+                          nil)
+                    lines)))))
       
       ;; Reverse to get correct order (test line first, then error message)
       (setq lines (nreverse lines)))
@@ -765,9 +878,7 @@ Returns (total . passed)."
                   (insert (car rendered))
                   (insert "\n")
                   (puthash line-num (cdr rendered) swift-test--line-to-node)
-                  (cl-incf line-num))))
-            
-)
+                  (cl-incf line-num)))))
           
           (goto-char (min pos (point-max)))
           ;; Force redisplay
@@ -827,7 +938,7 @@ Returns (total . passed)."
   (swift-test--notify "Test explorer refreshed"))
 
 (defun swift-test-explorer-clear ()
-  "Clear all test results."
+  "Clear all test results (keeps test structure)."
   (interactive)
   (swift-test--walk-nodes
    (lambda (node)
@@ -837,6 +948,15 @@ Returns (total . passed)."
   (setq swift-test--failed-tests nil)
   (setq swift-test--last-run-tests nil)
   (swift-test--render-buffer))
+
+(defun swift-test-explorer-reset ()
+  "Reset test explorer completely (clears everything and rediscovers)."
+  (interactive)
+  (swift-test--reset-state)
+  (setq swift-test--current-project-root nil)
+  (swift-test--discover-tests)
+  (swift-test--render-buffer)
+  (swift-test--notify "Test explorer reset"))
 
 (defun swift-test-explorer-toggle-or-goto ()
   "Toggle node expansion or goto source at point.
@@ -905,9 +1025,86 @@ For files/classes/tests: jump to source location."
     (swift-test--run-node node)))
 
 (defun swift-test-explorer-run-all ()
-  "Run all tests."
+  "Run all tests using a scheme that includes all test targets.
+Prompts for scheme selection - choose your main app scheme or a test plan scheme."
   (interactive)
-  (swift-test--run-tests nil))
+  (let* ((root (swift-test--project-root))
+         (cached-all-scheme (gethash "all-tests" swift-test--scheme-cache))
+         (scheme (or cached-all-scheme
+                     (let* ((schemes (swift-test--available-schemes))
+                            (selected (completing-read "Select scheme for ALL tests: " schemes nil t)))
+                       (puthash "all-tests" selected swift-test--scheme-cache)
+                       selected))))
+    (swift-test--run-all-with-scheme scheme)))
+
+(defun swift-test--run-all-with-scheme (scheme)
+  "Run all tests using SCHEME without any -only-testing filters."
+  ;; Auto-show test explorer
+  (unless (get-buffer-window swift-test--buffer-name)
+    (swift-test-explorer-show))
+  
+  (setq swift-test--last-run-tests nil)
+  (setq swift-test--failed-tests nil)
+  ;; Mark all tests as running
+  (swift-test--walk-nodes
+   (lambda (node)
+     (when (eq (swift-test-node-kind node) 'test)
+       (setf (swift-test-node-status node) 'running))))
+  (swift-test--render-buffer)
+  (swift-test--start-animation)
+  
+  (let* ((root (swift-test--project-root))
+         (workspace-file (car (directory-files root t "\\.xcworkspace$")))
+         (project-file (car (directory-files root t "\\.xcodeproj$")))
+         (project-arg (cond
+                       (workspace-file (format "-workspace %s" (shell-quote-argument workspace-file)))
+                       (project-file (format "-project %s" (shell-quote-argument project-file)))
+                       (t "")))
+         (destination (swift-test--get-destination))
+         (command (mapconcat
+                   #'identity
+                   (list
+                    "xcodebuild test"
+                    (format "-scheme %s" (shell-quote-argument scheme))
+                    project-arg
+                    (format "-destination '%s'" destination)
+                    "-disable-concurrent-destination-testing"
+                    "-test-timeouts-enabled NO"
+                    "-parallel-testing-enabled NO")
+                   " ")))
+    
+    (swift-test--notify (format "Running all tests with scheme %s..." scheme))
+    
+    (let* ((output-buffer (generate-new-buffer " *swift-test-output*"))
+           (process (start-process-shell-command
+                     "swift-test"
+                     output-buffer
+                     command)))
+      
+      (set-process-sentinel
+       process
+       (lambda (proc _event)
+         (when (memq (process-status proc) '(exit signal))
+           (swift-test--stop-animation)
+           (let* ((output (with-current-buffer (process-buffer proc)
+                            (buffer-string)))
+                  (has-build-errors (swift-test--has-build-errors-p output)))
+             ;; If there are build errors, send to periphery for display
+             (when (and has-build-errors (fboundp 'periphery-run-parser))
+               (periphery-run-parser output))
+             ;; Always try to parse test results
+             (swift-test--parse-results output)
+             (swift-test--render-buffer)
+             (kill-buffer (process-buffer proc))
+             ;; Notify based on results
+             (cond
+              (has-build-errors
+               (swift-test--notify "Build failed - check *Periphery* buffer for errors"))
+              ((> (length swift-test--failed-tests) 0)
+               (swift-test--notify (format "Tests completed: %d failed"
+                                           (length swift-test--failed-tests))))
+              (t
+               (swift-test--notify "All tests passed!"))))))))))
 
 (defun swift-test-explorer-run-failed ()
   "Re-run failed tests."
@@ -1001,6 +1198,34 @@ For files/classes/tests: jump to source location."
   (let ((ids (swift-test--collect-test-ids node)))
     (swift-test--run-tests ids)))
 
+(defun swift-test--has-build-errors-p (output)
+  "Check if OUTPUT contains build errors (not test failures).
+Returns non-nil if there are compilation or build configuration errors."
+  (and output
+       (or
+        ;; Standard compiler errors: /path/file.swift:42:10: error: ...
+        (string-match-p ":[0-9]+:[0-9]+: error:" output)
+        ;; xcodebuild errors
+        (string-match-p "^xcodebuild: error:" output)
+        ;; Build failed markers
+        (string-match-p "\\*\\* BUILD FAILED \\*\\*" output)
+        (string-match-p "The following build commands failed:" output)
+        ;; Package resolution errors
+        (string-match-p "Could not resolve package dependencies" output)
+        ;; Missing SDK/platform
+        (string-match-p "SDK .* cannot be located" output)
+        (string-match-p "error:.*platform.*not found" output)
+        ;; Provisioning/signing errors
+        (string-match-p "error:.*provisioning profile" output)
+        (string-match-p "error:.*[Cc]ode [Ss]ign" output)
+        ;; Deployment target mismatch
+        (string-match-p "Compiling for iOS [0-9.]+, but module" output)
+        ;; Linker errors
+        (string-match-p "^ld: " output)
+        (string-match-p "Undefined symbol" output)
+        ;; Module not found
+        (string-match-p "No such module" output))))
+
 (defun swift-test--mark-tests-running (test-ids)
   "Mark TEST-IDS as running and clear previous error messages."
   (swift-test--walk-nodes
@@ -1032,6 +1257,21 @@ For files/classes/tests: jump to source location."
     (cancel-timer swift-test--animation-timer)
     (setq swift-test--animation-timer nil)))
 
+(defun swift-test--find-package-root-for-test (test-id)
+  "Find the Package.swift directory for a test ID if it's in a local package.
+Returns the package root directory or nil if not a local package."
+  (when test-id
+    (let* ((parts (swift-test--parse-test-id test-id))
+           (target-name (car parts))
+           (result nil))
+      ;; Find the target node and check its package-root
+      (swift-test--walk-nodes
+       (lambda (node)
+         (when (and (eq (swift-test-node-kind node) 'target)
+                    (string= (swift-test-node-name node) target-name))
+           (setq result (swift-test-node-package-root node)))))
+      result)))
+
 (defun swift-test--run-tests (test-ids)
   "Run tests with TEST-IDS (nil means all tests)."
   ;; Auto-show test explorer when running tests
@@ -1044,9 +1284,20 @@ For files/classes/tests: jump to source location."
   
   (let* ((root (swift-test--project-root))
          (is-spm (file-exists-p (expand-file-name "Package.swift" root)))
-         (command (if is-spm
-                      (swift-test--build-spm-command test-ids)
-                    (swift-test--build-xcode-command test-ids))))
+         ;; Check if this is a local package test
+         (local-package-root (and test-ids
+                                  (not is-spm)
+                                  (swift-test--find-package-root-for-test (car test-ids))))
+         (command (cond
+                   ;; Local SPM package inside Xcode project
+                   (local-package-root
+                    (swift-test--build-local-package-command test-ids local-package-root))
+                   ;; Pure SPM project (Package.swift at root)
+                   (is-spm
+                    (swift-test--build-spm-command test-ids))
+                   ;; Xcode project
+                   (t
+                    (swift-test--build-xcode-command test-ids)))))
     
     (swift-test--notify (format "Running %s..."
                                 (if test-ids
@@ -1064,15 +1315,25 @@ For files/classes/tests: jump to source location."
        (lambda (proc _event)
          (when (memq (process-status proc) '(exit signal))
            (swift-test--stop-animation)
-           (let ((output (with-current-buffer (process-buffer proc)
-                           (buffer-string))))
+           (let* ((output (with-current-buffer (process-buffer proc)
+                            (buffer-string)))
+                  (has-build-errors (swift-test--has-build-errors-p output)))
+             ;; If there are build errors, send to periphery for display
+             (when (and has-build-errors (fboundp 'periphery-run-parser))
+               (periphery-run-parser output))
+             ;; Always try to parse test results
              (swift-test--parse-results output)
              (swift-test--render-buffer)
              (kill-buffer (process-buffer proc))
-             (let ((failed-count (length swift-test--failed-tests)))
-               (if (> failed-count 0)
-                   (swift-test--notify (format "Tests completed: %d failed" failed-count))
-                 (swift-test--notify "All tests passed!"))))))))))
+             ;; Notify based on results
+             (cond
+              (has-build-errors
+               (swift-test--notify "Build failed - check *Periphery* buffer for errors"))
+              ((> (length swift-test--failed-tests) 0)
+               (swift-test--notify (format "Tests completed: %d failed"
+                                           (length swift-test--failed-tests))))
+              (t
+               (swift-test--notify "All tests passed!"))))))))))
 
 (defun swift-test--build-spm-command (test-ids)
   "Build swift test command for TEST-IDS."
@@ -1087,6 +1348,268 @@ For files/classes/tests: jump to source location."
                          "|"))
     "swift test"))
 
+(defun swift-test--build-local-package-command (test-ids package-root)
+  "Build xcodebuild test command for TEST-IDS in local PACKAGE-ROOT.
+Uses xcodebuild from the main project with the package's test scheme."
+  (let* ((root (swift-test--project-root))
+         (destination (swift-test--get-destination))
+         ;; Package name is the directory name (e.g., "BruceStyle")
+         (package-name (file-name-nondirectory (directory-file-name package-root)))
+         ;; Test target name
+         (test-target (format "%sTests" package-name))
+         ;; Check if there's a <PackageName>Tests scheme, otherwise use <PackageName>
+         (available-schemes (swift-test--available-schemes))
+         (test-scheme-name (format "%sTests" package-name))
+         (scheme (if (member test-scheme-name available-schemes)
+                     test-scheme-name
+                   package-name))
+         ;; Find workspace or project file
+         (workspace-file (car (directory-files root t "\\.xcworkspace$")))
+         (project-file (car (directory-files root t "\\.xcodeproj$")))
+         (project-arg (cond
+                       (workspace-file (format "-workspace %s" (shell-quote-argument workspace-file)))
+                       (project-file (format "-project %s" (shell-quote-argument project-file)))
+                       (t "")))
+         (filter (when test-ids
+                   (mapconcat (lambda (id)
+                                (let ((parts (swift-test--parse-test-id id)))
+                                  (format "-only-testing:%s/%s"
+                                          (nth 0 parts)
+                                          (nth 1 parts))))
+                              test-ids
+                              " "))))
+    ;; Ensure scheme is configured for testing before running
+    (unless (swift-test--ensure-scheme-configured-for-test scheme test-target package-root)
+      (error "Cannot run tests - scheme not configured"))
+    ;; Run from project root using the package's scheme
+    (format "xcodebuild test -scheme %s %s -destination '%s' -disable-concurrent-destination-testing -test-timeouts-enabled NO -parallel-testing-enabled NO%s"
+            (shell-quote-argument scheme)
+            project-arg
+            destination
+            (if filter (concat " " filter) ""))))
+
+;;; Scheme Configuration for Testing
+
+(defun swift-test--scheme-supports-testing-p (scheme)
+  "Check if SCHEME is configured for test action by examining the scheme file."
+  (let ((scheme-file (swift-test--find-scheme-file scheme)))
+    (when scheme-file
+      (with-temp-buffer
+        (insert-file-contents scheme-file)
+        ;; Check if TestAction has any Testables configured
+        (and (re-search-forward "<TestAction" nil t)
+             (re-search-forward "<Testables>" nil t)
+             (re-search-forward "<TestableReference" nil t))))))
+
+(defun swift-test--find-scheme-file (scheme)
+  "Find the .xcscheme file for SCHEME in the project."
+  (let* ((root (swift-test--project-root))
+         (workspace-file (car (directory-files root t "\\.xcworkspace$")))
+         (project-file (car (directory-files root t "\\.xcodeproj$")))
+         (search-paths (list
+                        ;; Shared schemes in workspace
+                        (when workspace-file
+                          (expand-file-name "xcshareddata/xcschemes" workspace-file))
+                        ;; Shared schemes in project
+                        (when project-file
+                          (expand-file-name "xcshareddata/xcschemes" project-file))
+                        ;; User schemes
+                        (when project-file
+                          (expand-file-name (format "xcuserdata/%s.xcuserdatad/xcschemes"
+                                                    (user-login-name))
+                                            project-file)))))
+    (cl-some (lambda (dir)
+               (when (and dir (file-directory-p dir))
+                 (let ((scheme-file (expand-file-name (format "%s.xcscheme" scheme) dir)))
+                   (when (file-exists-p scheme-file)
+                     scheme-file))))
+             search-paths)))
+
+(defun swift-test--create-scheme-with-tests (scheme test-target package-root)
+  "Create a new SCHEME file configured for TEST-TARGET in PACKAGE-ROOT.
+Returns t on success, nil on failure."
+  (let* ((root (swift-test--project-root))
+         (workspace-file (car (directory-files root t "\\.xcworkspace$")))
+         (schemes-dir (when workspace-file
+                        (expand-file-name "xcshareddata/xcschemes" workspace-file)))
+         (scheme-file (when schemes-dir
+                        (expand-file-name (format "%s.xcscheme" scheme) schemes-dir)))
+         ;; Container reference for the package
+         (package-name (file-name-nondirectory (directory-file-name package-root)))
+         (relative-package-path (file-relative-name package-root root)))
+    (unless schemes-dir
+      (swift-test--notify "Could not find workspace")
+      (cl-return-from swift-test--create-scheme-with-tests nil))
+    ;; Create xcschemes directory if it doesn't exist
+    (unless (file-directory-p schemes-dir)
+      (make-directory schemes-dir t))
+    ;; Write the scheme file
+    (with-temp-file scheme-file
+      (insert (format "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<Scheme
+   LastUpgradeVersion = \"1500\"
+   version = \"1.7\">
+   <BuildAction
+      parallelizeBuildables = \"YES\"
+      buildImplicitDependencies = \"YES\">
+      <BuildActionEntries>
+         <BuildActionEntry
+            buildForTesting = \"YES\"
+            buildForRunning = \"YES\"
+            buildForProfiling = \"YES\"
+            buildForArchiving = \"YES\"
+            buildForAnalyzing = \"YES\">
+            <BuildableReference
+               BuildableIdentifier = \"primary\"
+               BlueprintIdentifier = \"%s\"
+               BuildableName = \"%s\"
+               BlueprintName = \"%s\"
+               ReferencedContainer = \"container:%s\">
+            </BuildableReference>
+         </BuildActionEntry>
+      </BuildActionEntries>
+   </BuildAction>
+   <TestAction
+      buildConfiguration = \"Debug\"
+      selectedDebuggerIdentifier = \"Xcode.DebuggerFoundation.Debugger.LLDB\"
+      selectedLauncherIdentifier = \"Xcode.DebuggerFoundation.Launcher.LLDB\"
+      shouldUseLaunchSchemeArgsEnv = \"YES\"
+      shouldAutocreateTestPlan = \"YES\">
+      <Testables>
+         <TestableReference
+            skipped = \"NO\">
+            <BuildableReference
+               BuildableIdentifier = \"primary\"
+               BlueprintIdentifier = \"%s\"
+               BuildableName = \"%s.xctest\"
+               BlueprintName = \"%s\"
+               ReferencedContainer = \"container:%s\">
+            </BuildableReference>
+         </TestableReference>
+      </Testables>
+   </TestAction>
+   <LaunchAction
+      buildConfiguration = \"Debug\"
+      selectedDebuggerIdentifier = \"Xcode.DebuggerFoundation.Debugger.LLDB\"
+      selectedLauncherIdentifier = \"Xcode.DebuggerFoundation.Launcher.LLDB\"
+      launchStyle = \"0\"
+      useCustomWorkingDirectory = \"NO\"
+      ignoresPersistentStateOnLaunch = \"NO\"
+      debugDocumentVersioning = \"YES\"
+      debugServiceExtension = \"internal\"
+      allowLocationSimulation = \"YES\">
+   </LaunchAction>
+   <ProfileAction
+      buildConfiguration = \"Release\"
+      shouldUseLaunchSchemeArgsEnv = \"YES\"
+      savedToolIdentifier = \"\"
+      useCustomWorkingDirectory = \"NO\"
+      debugDocumentVersioning = \"YES\">
+   </ProfileAction>
+   <AnalyzeAction
+      buildConfiguration = \"Debug\">
+   </AnalyzeAction>
+   <ArchiveAction
+      buildConfiguration = \"Release\"
+      revealArchiveInOrganizer = \"YES\">
+   </ArchiveAction>
+</Scheme>
+"
+                      ;; Build target (the library)
+                      package-name
+                      package-name
+                      package-name
+                      relative-package-path
+                      ;; Test target
+                      test-target
+                      test-target
+                      test-target
+                      relative-package-path)))
+    (swift-test--notify (format "Created scheme %s with test target %s" scheme test-target))
+    t))
+
+(defun swift-test--add-test-target-to-scheme (scheme test-target)
+  "Add TEST-TARGET to SCHEME's test action.
+Returns t on success, nil on failure."
+  (let ((scheme-file (swift-test--find-scheme-file scheme)))
+    (if scheme-file
+        ;; Existing scheme file - modify it
+        (with-temp-buffer
+          (insert-file-contents scheme-file)
+          (goto-char (point-min))
+          ;; Find the TestAction section
+          (if (not (re-search-forward "<TestAction" nil t))
+              (progn
+                (swift-test--notify "Could not find TestAction in scheme")
+                nil)
+            ;; Check if Testables section exists
+            (if (re-search-forward "<Testables>" nil t)
+                ;; Add test target to existing Testables
+                (progn
+                  (insert (format "
+         <TestableReference
+            skipped = \"NO\">
+            <BuildableReference
+               BuildableIdentifier = \"primary\"
+               BlueprintIdentifier = \"%s\"
+               BuildableName = \"%s.xctest\"
+               BlueprintName = \"%s\"
+               ReferencedContainer = \"container:\">
+            </BuildableReference>
+         </TestableReference>"
+                                  test-target
+                                  test-target
+                                  test-target))
+                  (write-region (point-min) (point-max) scheme-file)
+                  (swift-test--notify (format "Added %s to %s scheme" test-target scheme))
+                  t)
+              ;; Need to create Testables section
+              (goto-char (point-min))
+              (when (re-search-forward "<TestAction[^>]*>" nil t)
+                (insert (format "
+      <Testables>
+         <TestableReference
+            skipped = \"NO\">
+            <BuildableReference
+               BuildableIdentifier = \"primary\"
+               BlueprintIdentifier = \"%s\"
+               BuildableName = \"%s.xctest\"
+               BlueprintName = \"%s\"
+               ReferencedContainer = \"container:\">
+            </BuildableReference>
+         </TestableReference>
+      </Testables>"
+                                test-target
+                                test-target
+                                test-target))
+                (write-region (point-min) (point-max) scheme-file)
+                (swift-test--notify (format "Added %s to %s scheme" test-target scheme))
+                t))))
+      ;; No scheme file exists - need to tell user to create it
+      nil)))
+
+(defun swift-test--ensure-scheme-configured-for-test (scheme test-target &optional package-root)
+  "Ensure SCHEME is configured to run TEST-TARGET.
+PACKAGE-ROOT is the path to the local package if applicable.
+Prompts user if configuration is needed."
+  (if (swift-test--scheme-supports-testing-p scheme)
+      t  ; Already configured
+    ;; Ask user if they want to configure
+    (if (y-or-n-p (format "Scheme '%s' is not configured for testing. Configure it now? " scheme))
+        (let ((scheme-file (swift-test--find-scheme-file scheme)))
+          (if scheme-file
+              ;; Modify existing scheme
+              (swift-test--add-test-target-to-scheme scheme test-target)
+            ;; No scheme file - create new one
+            (if package-root
+                (swift-test--create-scheme-with-tests scheme test-target package-root)
+              (progn
+                (swift-test--notify "Cannot create scheme - no package root provided")
+                nil))))
+      (progn
+        (swift-test--notify "Test cancelled - scheme not configured")
+        nil))))
+
 ;; Forward declaration for ios-simulator
 (declare-function ios-simulator-simulator-identifier "ios-simulator")
 
@@ -1100,16 +1623,42 @@ Uses the same simulator as the main build system."
       ;; Fallback to any iOS Simulator
       "platform=iOS Simulator,name=Any iOS Simulator Device")))
 
-(defun swift-test--get-scheme ()
-  "Get the scheme for testing, using cache, xcode-project, or auto-detect."
+(defun swift-test--get-scheme-for-target (target-name)
+  "Try to find a scheme matching TARGET-NAME."
+  (let ((schemes (swift-test--available-schemes)))
+    (cl-find-if (lambda (s) (string= s target-name)) schemes)))
+
+(defun swift-test--get-scheme (&optional target-name)
+  "Get the scheme for testing.
+If TARGET-NAME is provided, try to find a matching scheme first.
+Falls back to cached scheme for that target, or prompts user."
   (let ((root (swift-test--project-root)))
-    (or (gethash root swift-test--scheme-cache)
-        (and (fboundp 'xcode-project-scheme) (xcode-project-scheme))
-        ;; Auto-detect: use first available scheme and cache it
+    (or ;; First: if target specified, try to find matching scheme
+        (and target-name (swift-test--get-scheme-for-target target-name))
+        ;; Second: check our own cache for this specific target
+        (and target-name (gethash target-name swift-test--scheme-cache))
+        ;; Third: prompt user to select for this target (don't use general cache)
         (let ((schemes (swift-test--available-schemes)))
           (when schemes
-            (puthash root (car schemes) swift-test--scheme-cache)
-            (car schemes))))))
+            (let* ((test-schemes (cl-remove-if-not
+                                  (lambda (s) (string-match-p "Test" s))
+                                  schemes))
+                   (other-schemes (cl-remove-if
+                                   (lambda (s) (string-match-p "Test" s))
+                                   schemes))
+                   ;; Show all schemes, but put test schemes first
+                   (candidates (append test-schemes other-schemes))
+                   (prompt (if target-name
+                               (format "Select scheme for %s: " target-name)
+                             "Select test scheme: "))
+                   (selected (if (= (length candidates) 1)
+                                 (car candidates)
+                               (completing-read prompt candidates nil t))))
+              ;; Always cache by target name if provided
+              (when target-name
+                (puthash target-name selected swift-test--scheme-cache))
+              (swift-test--notify (format "Using scheme: %s" selected))
+              selected))))))
 
 (defun swift-test-set-scheme (scheme)
   "Set SCHEME as the cached scheme for test runs in current project."
@@ -1137,10 +1686,31 @@ Uses the same simulator as the main build system."
                              project-arg))))
         (split-string output "\n" t)))))
 
+(defun swift-test--is-local-package-target-p (target-name)
+  "Check if TARGET-NAME is a local SPM package test target.
+Returns non-nil if the target appears to be from a local package."
+  (when target-name
+    ;; Check if there's a node with this target that has package-type 'spm
+    (let ((is-spm nil))
+      (swift-test--walk-nodes
+       (lambda (node)
+         (when (and (eq (swift-test-node-kind node) 'target)
+                    (string= (swift-test-node-name node) target-name)
+                    (eq (swift-test-node-package-type node) 'spm))
+           (setq is-spm t))))
+      is-spm)))
+
 (defun swift-test--build-xcode-command (test-ids)
   "Build xcodebuild test command for TEST-IDS."
   (let* ((root (swift-test--project-root))
-         (scheme (swift-test--get-scheme))
+         ;; Extract target name from first test-id to find matching scheme
+         (target-name (when test-ids
+                        (car (swift-test--parse-test-id (car test-ids)))))
+         ;; For local packages, we need to use main app scheme but the package's test target
+         (is-local-package (and target-name
+                                (swift-test--is-local-package-target-p target-name)))
+         ;; For local packages, don't pass target-name to get-scheme (use main app scheme)
+         (scheme (swift-test--get-scheme (unless is-local-package target-name)))
          ;; Find workspace or project file
          (workspace-file (car (directory-files root t "\\.xcworkspace$")))
          (project-file (car (directory-files root t "\\.xcodeproj$")))
@@ -1203,15 +1773,31 @@ Uses the same simulator as the main build system."
       
       ;; Collect XCTest error messages
       ;; Format: /path/to/File.swift:42: error: -[TestClass testMethod] : XCTAssertEqual failed: ("1") is not equal to ("2")
-      ;; Also: /path:line: error: testMethod() : message (for newer format)
+      ;; Error messages can span multiple lines when comparing multi-line strings
+      ;; The message ends when we hit a new file:line: pattern or end of relevant section
       ;; Store as lists to support multiple errors per test
       (goto-char (point-min))
       (while (re-search-forward
-              "^[^:]+:[0-9]+: error: -\\[\\([^ ]+\\) \\([^]]+\\)\\] : \\(.+\\)$"
+              "^\\([^:\n]+\\):\\([0-9]+\\): error: -\\[\\([^ ]+\\) \\([^]]+\\)\\] : "
               nil t)
-        (let* ((full-class (match-string 1))
-               (test (match-string 2))
-               (error-msg (match-string 3))
+        (let* ((file-path (match-string 1))
+               (line-num (match-string 2))
+               (full-class (match-string 3))
+               (test (match-string 4))
+               (msg-start (point))
+               ;; Find the end of this error message
+               ;; It ends at the next file:line: pattern or next test marker
+               (msg-end (save-excursion
+                          (if (re-search-forward
+                               "^[^:\n]+:[0-9]+: \\(?:error\\|warning\\|note\\):\\|^Test \\(?:Case\\|case\\|Suite\\)" 
+                               nil t)
+                              (match-beginning 0)
+                            (point-max))))
+               (error-msg (string-trim (buffer-substring-no-properties msg-start msg-end)))
+               ;; Truncate very long messages but keep them readable
+               (error-msg (if (> (length error-msg) 500)
+                              (concat (substring error-msg 0 497) "...")
+                            error-msg))
                ;; Store with multiple key formats to ensure matching
                (class (if (string-match-p "\\." full-class)
                           (car (last (split-string full-class "\\.")))
@@ -1220,7 +1806,7 @@ Uses the same simulator as the main build system."
                (key2 (format "%s.%s" class test))
                (existing1 (gethash key1 error-messages))
                (existing2 (gethash key2 error-messages)))
-          (message "Found XCTest error: %s.%s -> %s" class test error-msg)
+          (message "Found XCTest error: %s.%s -> %s" class test (substring error-msg 0 (min 80 (length error-msg))))
           ;; Store as list - append to existing or create new
           (puthash key1 (append existing1 (list error-msg)) error-messages)
           (puthash key2 (append existing2 (list error-msg)) error-messages)))

@@ -1140,12 +1140,16 @@ This is the authoritative source - it asks xcodebuild directly."
      :scheme xcode-project--current-xcode-scheme)))
 
 (defun xcode-project-get-workspace-or-project ()
-  "Check if there is workspace or project."
+  "Check if there is workspace or project.
+Returns nil if neither workspace nor project is found (e.g., pure Swift Package)."
   (let ((workspace (xcode-project-workspace-name))
         (projectname (xcode-project-project-name)))
-    (if workspace
-        (format "-workspace %s.xcworkspace" (shell-quote-argument workspace))
-      (format "-project %s.xcodeproj" (shell-quote-argument projectname)))))
+    (cond
+     (workspace
+      (format "-workspace %s.xcworkspace" (shell-quote-argument workspace)))
+     (projectname
+      (format "-project %s.xcodeproj" (shell-quote-argument projectname)))
+     (t nil))))
 
 (defun xcode-project-get-configuration-list ()
   "Get list of project configurations."
