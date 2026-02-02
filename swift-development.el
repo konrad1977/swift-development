@@ -41,6 +41,7 @@
 (declare-function periphery-run-parser "periphery" (output))
 (declare-function periphery-run-test-parser "periphery" (output callback))
 (declare-function periphery-kill-buffer "periphery" ())
+(declare-function periphery-clear "periphery" ())
 (declare-function periphery-helper:filter-keep-beginning-paths "periphery-helper" (text))
 
 ;; Async shell commands (custom keyword-based interface from periphery)
@@ -818,6 +819,10 @@ When nil, uses faster synchronous check (may freeze Emacs briefly)."
   "Build project using xcodebuild (as RUN).
 If FORCE is nil, skip compilation if sources are unchanged.
 Uses async rebuild check if swift-development-use-async-rebuild-check is t."
+
+  ;; Clear periphery error list immediately at build start
+  (when (fboundp 'periphery-clear)
+    (periphery-clear))
 
   ;; Show immediate feedback - start progress bar right away
   (setq swift-development--current-build-progress 0)

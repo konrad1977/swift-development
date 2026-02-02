@@ -417,15 +417,20 @@ Project path: %s"
                    workspace-directory workspace-name workspace-path
                    project-directory project-name project-path))
 
-        ;; Try workspace first (preferred for CocoaPods projects), then project
-        (let ((schemes (or (when workspace-path
-                             (xcode-project-list-xcscheme-files workspace-path))
-                           (when project-path
-                             (xcode-project-list-xcscheme-files project-path)))))
-          ;; Return schemes or empty list if none found
-          ;; NOTE: xcodebuild -list fallback removed to avoid blocking Emacs
-          ;; If schemes are not found via file detection, user should check project setup
-          (or schemes
+        ;; Collect schemes from BOTH workspace AND project (not just one)
+        ;; This ensures we get app schemes from .xcodeproj even when .xcworkspace exists
+        (let* ((workspace-schemes (when workspace-path
+                                    (xcode-project-list-xcscheme-files workspace-path)))
+               (project-schemes (when project-path
+                                  (xcode-project-list-xcscheme-files project-path)))
+               ;; Combine and deduplicate schemes
+               (all-schemes (delete-dups (append workspace-schemes project-schemes))))
+          (when xcode-project-debug
+            (message "Workspace schemes: %s" workspace-schemes)
+            (message "Project schemes: %s" project-schemes)
+            (message "Combined schemes: %s" all-schemes))
+          ;; Return combined schemes or nil if none found
+          (or all-schemes
               (progn
                 (when xcode-project-debug
                   (message "Warning: No scheme files found. Check xcshareddata/xcschemes/ exists."))
@@ -1415,10 +1420,11 @@ Build folder is determined by xcodebuild, not by guessing."
         xcode-project--last-device-type nil
         swift-development--device-choice nil)
 
-  ;; 4. Clear swift-cache for build-settings (keep scheme cache for performance)
-  ;; Cache keys are "project-root::build-settings-..." so match with "::"
+  ;; 4. Clear swift-cache for build-settings, scheme-files, and xcodebuild-schemes
   (when (fboundp 'swift-cache-invalidate-pattern)
-    (swift-cache-invalidate-pattern "::build-settings-"))
+    (swift-cache-invalidate-pattern "::build-settings-")
+    (swift-cache-invalidate-pattern "::scheme-files")
+    (swift-cache-invalidate-pattern "::xcodebuild-schemes"))
 
   ;; 5. Reset project root
   (swift-project-reset-root)
