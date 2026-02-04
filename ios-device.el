@@ -17,6 +17,8 @@
 (require 'json)
 (require 'transient)
 (require 'swift-notification nil t)
+(require 'swift-cache)        ; Caching for device operations
+(require 'swift-async)        ; Robust async utilities
 
 (defgroup ios-device nil
   "Customization group for ios-device package."
@@ -39,6 +41,22 @@
 (defvar ios-device--current-install-command nil)
 (defvar ios-device--current-app-identifier nil)
 (defvar ios-device--current-buffer nil)
+
+;; Cache for connected device detection (system_profiler is slow)
+(defvar ios-device--connected-device-cache nil
+  "Cached result of system_profiler device detection.")
+(defvar ios-device--connected-device-cache-time nil
+  "Timestamp when device detection was cached.")
+(defconst ios-device--connected-device-cache-ttl 30
+  "Cache TTL for connected device in seconds (30 seconds).")
+
+;; Cache keys for swift-cache integration
+(defconst ios-device--cache-key-devices "ios-device::devices"
+  "Cache key for devicectl list devices output.")
+(defconst ios-device--cache-key-xctrace "ios-device::xctrace-devices"
+  "Cache key for xctrace device list.")
+(defconst ios-device--cache-ttl-devices 30
+  "Cache TTL for device lists in seconds.")
 
 (defun ios-device-format-id (id)
   "Format device id (as ID)."
@@ -114,11 +132,15 @@
     ios-device--current-device-id))
 
 (defun ios-device-connected-device-id ()
-  "Get the id of the connected device."
-  (let ((result
-         (string-trim
-          (shell-command-to-string "system_profiler SPUSBDataType | sed -n -E -e '/(iPhone|iPad)/,/Serial/s/ *Serial Number: *(.+)/\\1/p'"))))
-    (if (string= result "") nil result)))
+  "Get the id of the connected device (cached for 30 seconds).
+Uses system_profiler which is slow, so results are cached."
+  (swift-cache-with "ios-device::connected-id" ios-device--connected-device-cache-ttl
+    (let ((result (string-trim
+                   (or (swift-async-run-sync
+                        "system_profiler SPUSBDataType | sed -n -E -e '/(iPhone|iPad)/,/Serial/s/ *Serial Number: *(.+)/\\1/p'"
+                        :timeout 10)
+                       ""))))
+      (if (string= result "") nil result))))
 
 (defun ios-device-kill-buffer ()
   "Kill the ios-device buffer."
@@ -143,13 +165,26 @@
   "Reset the iOS device selection and state."
   (interactive)
   (ios-device-kill-buffer)
-  (setq ios-device--current-buffer-name nil)
-  (setq ios-device--current-device-id nil)
-  (setq ios-device--current-device-udid nil)
-  (setq ios-device--current-install-command nil)
-  (setq ios-device--current-app-identifier nil)
-  (setq ios-device--current-buffer nil)
+  (setq ios-device--current-buffer-name nil
+        ios-device--current-device-id nil
+        ios-device--current-device-udid nil
+        ios-device--current-install-command nil
+        ios-device--current-app-identifier nil
+        ios-device--current-buffer nil
+        ;; Clear device detection cache
+        ios-device--connected-device-cache nil
+        ios-device--connected-device-cache-time nil)
   (swift-notification-send :message "iOS device selection reset" :seconds 2))
+
+(defun ios-device-clear-cache ()
+  "Clear all device detection caches.
+Useful when connecting/disconnecting devices."
+  (interactive)
+  (setq ios-device--connected-device-cache nil
+        ios-device--connected-device-cache-time nil)
+  (swift-cache-invalidate ios-device--cache-key-devices)
+  (swift-cache-invalidate ios-device--cache-key-xctrace)
+  (message "iOS device cache cleared"))
 
 
 (defun ios-device-cleanup ()
@@ -192,23 +227,39 @@
 
 ;; Debug function to see raw output
 (defun ios-device-debug-output ()
-  "Show raw devicectl output for debugging."
+  "Show raw devicectl output for debugging.
+Uses async execution to avoid blocking."
   (interactive)
-  (let ((output (shell-command-to-string "xcrun devicectl list devices")))
-    (with-current-buffer (get-buffer-create "*iOS Devices*")
+  (let ((buffer (get-buffer-create "*iOS Devices*")))
+    (with-current-buffer buffer
       (erase-buffer)
       (insert "Connected iOS Devices:\n")
-      (insert (make-string 50 ?─) "\n\n")
-      (insert output)
-      (goto-char (point-min)))
-    (display-buffer "*iOS Devices*")))
+      (insert (make-string 50 ?-) "\n\n")
+      (insert "Loading...\n"))
+    (display-buffer buffer)
+    (swift-async-run
+     "xcrun devicectl list devices"
+     (lambda (output)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (erase-buffer)
+           (insert "Connected iOS Devices:\n")
+           (insert (make-string 50 ?-) "\n\n")
+           (insert (or output "No output from devicectl"))
+           (goto-char (point-min)))))
+     :timeout 10
+     :error-callback (lambda (err)
+                       (when (buffer-live-p buffer)
+                         (with-current-buffer buffer
+                           (erase-buffer)
+                           (insert "Error fetching devices:\n")
+                           (insert (or err "Unknown error"))))))))
 
 ;; Parse all devices from devicectl output
-(defun ios-device-parse-devices ()
-  "Parse devicectl output and return a list of all devices.
-Each device is represented as a plist with :name, :hostname, :identifier, :state, and :model."
-  (let ((output (shell-command-to-string "xcrun devicectl list devices"))
-        (devices '()))
+(defun ios-device--parse-devicectl-output (output)
+  "Parse devicectl OUTPUT and return list of device plists.
+Each device is a plist with :name, :hostname, :identifier, :state, and :model."
+  (let ((devices '()))
     (dolist (line (split-string output "\n"))
       (when (and (not (string-match "^Name\\|^-" line))
                  (not (string= (string-trim line) ""))
@@ -222,7 +273,15 @@ Each device is represented as a plist with :name, :hostname, :identifier, :state
                         :state (string-trim (nth 3 parts))
                         :model (string-trim (nth 4 parts)))
                   devices)))))
-    (reverse devices)))
+    (nreverse devices)))
+
+(defun ios-device-parse-devices ()
+  "Parse devicectl output and return a list of all devices.
+Each device is represented as a plist with :name, :hostname, :identifier, :state, and :model.
+Results are cached for 30 seconds to avoid repeated slow devicectl calls."
+  (swift-cache-with ios-device--cache-key-devices ios-device--cache-ttl-devices
+    (let ((output (swift-async-run-sync "xcrun devicectl list devices" :timeout 10)))
+      (ios-device--parse-devicectl-output (or output "")))))
 
 ;; Interactive device selection by name only
 (defun ios-device-choose-device ()
@@ -249,12 +308,10 @@ Each device is represented as a plist with :name, :hostname, :identifier, :state
             (when selected-device
               (plist-get selected-device :identifier)))))))))
 
-(defun ios-device-parse-xctrace-devices ()
-  "Parse xctrace output and return a list of physical iOS devices with UDIDs.
-Each device is a plist with :name, :version, and :udid.
-This returns the UDID format that xcodebuild expects."
-  (let ((output (shell-command-to-string "xcrun xctrace list devices 2>/dev/null"))
-        (devices '())
+(defun ios-device--parse-xctrace-output (output)
+  "Parse xctrace OUTPUT and return list of iOS device plists.
+Each device is a plist with :name, :version, and :udid."
+  (let ((devices '())
         (in-devices-section nil))
     (dolist (line (split-string output "\n"))
       ;; Track sections - only parse "== Devices ==" section
@@ -273,6 +330,15 @@ This returns the UDID format that xcodebuild expects."
           (when (string-match-p "iPhone\\|iPad" name)
             (push (list :name name :version version :udid udid) devices))))))
     (nreverse devices)))
+
+(defun ios-device-parse-xctrace-devices ()
+  "Parse xctrace output and return a list of physical iOS devices with UDIDs.
+Each device is a plist with :name, :version, and :udid.
+This returns the UDID format that xcodebuild expects.
+Results are cached for 30 seconds."
+  (swift-cache-with ios-device--cache-key-xctrace ios-device--cache-ttl-devices
+    (let ((output (swift-async-run-sync "xcrun xctrace list devices 2>/dev/null" :timeout 10)))
+      (ios-device--parse-xctrace-output (or output "")))))
 
 (defun ios-device-get-udid-for-name (device-name)
   "Get the UDID (xcodebuild format) for DEVICE-NAME."
@@ -301,32 +367,6 @@ This returns the UDID format that xcodebuild expects, not the CoreDevice UUID."
               (setq ios-device--current-device-udid
                     (ios-device-get-udid-for-name selected-name)))))))))
 
-;; Get first iPhone UUID
-(defun ios-device-get-iphone-id ()
-  "Get the UUID of the first iPhone device found."
-  (let ((devices (ios-device-parse-devices)))
-    (let ((iphone (seq-find (lambda (device)
-                              (string-match "iPhone" (plist-get device :model)))
-                            devices)))
-      (when iphone
-        (plist-get iphone :identifier)))))
-
-;; Alternative awk approach for debugging
-(defun ios-device-awk-test ()
-  "Test different awk approaches to see what works."
-  (let ((cmd1 "xcrun devicectl list devices | awk '/iPhone/ {print NF, $0}'")
-        (cmd2 "xcrun devicectl list devices | awk '/iPhone/ {for(i=1;i<=NF;i++) print i, $i}'"))
-    (list :field-count (shell-command-to-string cmd1)
-          :all-fields (shell-command-to-string cmd2))))
-
-;; Simple function using sed instead of awk
-(defun ios-device-get-iphone-uuid-sed ()
-  "Get iPhone UUID using sed instead of awk."
-  (let ((result (string-trim
-                 (shell-command-to-string
-                  "xcrun devicectl list devices | grep iPhone | sed -E 's/.*([0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}).*/\\1/'"))))
-    (if (string= result "") nil result)))
-
 (cl-defun ios-device-launch-for-debug (&key device-id app-identifier)
   "Launch app on device in stopped state for debugging.
 DEVICE-ID is the device UUID, APP-IDENTIFIER is the bundle ID.
@@ -338,7 +378,7 @@ Returns the process ID (PID) on success, nil on failure."
                           (shell-quote-argument json-file)))
          (pid nil))
     (unwind-protect
-        (let ((output (shell-command-to-string command)))
+        (let ((output (swift-async-run-sync command :timeout 15)))
           (when ios-device-debug
             (message "Device launch command: %s" command)
             (message "Device launch output: %s" output))
@@ -516,16 +556,22 @@ With optional APP-FILTER, only show logs from that app bundle ID."
     (unless device-id
       (user-error "No device connected or selected"))
     (swift-notification-send :message "Taking screenshot..." :seconds 2)
-    (let ((result (shell-command-to-string
-                   (format "xcrun devicectl device capture screenshot --device %s --output %s"
-                           (shell-quote-argument device-id)
-                           (shell-quote-argument filename)))))
-      (if (file-exists-p filename)
-          (progn
-            (swift-notification-send :message (format "Screenshot saved to %s" filename) :seconds 3)
-            (when (y-or-n-p "Open screenshot? ")
-              (start-process "open-screenshot" nil "open" filename)))
-        (swift-notification-send :message (format "Screenshot failed: %s" result) :seconds 4)))))
+    (let ((cmd (format "xcrun devicectl device capture screenshot --device %s --output %s"
+                       (shell-quote-argument device-id)
+                       (shell-quote-argument filename))))
+      (swift-async-run cmd
+                       (lambda (_output)
+                         (if (file-exists-p filename)
+                             (progn
+                               (swift-notification-send :message (format "Screenshot saved to %s" filename) :seconds 3)
+                               (when (y-or-n-p "Open screenshot? ")
+                                 (start-process "open-screenshot" nil "open" filename)))
+                           (swift-notification-send :message "Screenshot failed" :seconds 4)))
+                       :timeout 15
+                       :error-callback (lambda (err)
+                                         (swift-notification-send
+                                          :message (format "Screenshot failed: %s" err)
+                                          :seconds 4))))))
 
 ;;; Transient Menu
 

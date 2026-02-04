@@ -17,7 +17,8 @@
 (require 'cl-lib)
 (require 'ansi-color)
 (require 'transient)
-(require 'swift-cache nil t)
+(require 'swift-cache)
+(require 'swift-async)  ; Robust async utilities
 
 (with-eval-after-load 'periphery-helper
  (require 'periphery-helper))
@@ -262,8 +263,17 @@ When non-nil, apply syntax highlighting to log messages."
 (defconst ios-simulator--cache-ttl 300
   "Deprecated: Now using swift-cache. Cache TTL in seconds (5 minutes).")
 
-(defvar ios-simulator-ready-hook nil
-  "Hook run when the simulator is ready for app installation.")
+;; SDK/arch caching - these values rarely change (only on Xcode updates)
+(defvar ios-simulator--sdk-version-cache nil
+  "Cached SDK version string.")
+(defvar ios-simulator--sdk-version-cache-time nil
+  "Timestamp when SDK version was cached.")
+(defvar ios-simulator--arch-cache nil
+  "Cached architecture string.")
+(defvar ios-simulator--arch-cache-time nil
+  "Timestamp when architecture was cached.")
+(defconst ios-simulator--sdk-cache-ttl 3600
+  "Cache TTL for SDK/arch values in seconds (1 hour).")
 
 (defvar-local current-root-folder-simulator nil)
 
@@ -298,7 +308,23 @@ This is called on `kill-emacs-hook' to ensure proper cleanup."
   (setq ios-simulator--cached-devices nil
         ios-simulator--cache-timestamp nil
         ios-simulator--target-simulators nil)
+  ;; Clear SDK/arch cache
+  (setq ios-simulator--sdk-version-cache nil
+        ios-simulator--sdk-version-cache-time nil
+        ios-simulator--arch-cache nil
+        ios-simulator--arch-cache-time nil)
   (swift-notification-send :message "iOS Simulator global state cleaned up" :seconds 2))
+
+(defun ios-simulator-clear-sdk-cache ()
+  "Clear the SDK/arch cache.
+Useful after updating Xcode or switching SDK versions."
+  (interactive)
+  (setq ios-simulator--sdk-version-cache nil
+        ios-simulator--sdk-version-cache-time nil
+        ios-simulator--arch-cache nil
+        ios-simulator--arch-cache-time nil)
+  (when (fboundp 'swift-notification-send)
+    (swift-notification-send :message "SDK cache cleared" :seconds 2)))
 
 ;; Register cleanup on Emacs exit
 (add-hook 'kill-emacs-hook #'ios-simulator-cleanup-global-state)
@@ -356,17 +382,18 @@ With prefix argument CHOOSE-NEW-SIMULATOR, also select a new simulator."
     (ios-simulator-choose-simulator)))
 
 (defun ios-simulator-current-sdk-version ()
-  "Get the current simulator sdk-version."
-  (string-trim (shell-command-to-string "xcrun --sdk iphonesimulator --show-sdk-version")))
-
-;;;###autoload
-(defun ios-simulator-sdk-path ()
-  "Get the current simulator sdk-path."
-  (string-trim (shell-command-to-string "xcrun --show-sdk-path --sdk iphonesimulator")))
+  "Get the current simulator sdk-version (cached for 1 hour)."
+  (swift-cache-with "ios-simulator::sdk-version" ios-simulator--sdk-cache-ttl
+    (string-trim
+     (or (swift-async-run-sync "xcrun --sdk iphonesimulator --show-sdk-version" :timeout 5)
+         ""))))
 
 (defun ios-simulator-current-arch ()
-  "Get the current arch."
-  (string-trim (shell-command-to-string "clang -print-target-triple")))
+  "Get the current arch (cached for 1 hour)."
+  (swift-cache-with "ios-simulator::arch" ios-simulator--sdk-cache-ttl
+    (string-trim
+     (or (swift-async-run-sync "clang -print-target-triple" :timeout 5)
+         ""))))
 
 (defun ios-simulator-shut-down-all ()
   "Shut down all simulators."
@@ -449,8 +476,10 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
                :command (list "xcrun" "simctl" "terminate" current-sim-id current-app-id)
                :noquery t
                :sentinel (lambda (proc event)
-                           ;; Install immediately after termination
-                           (ios-simulator-install-app
+                           ;; Only proceed when process has actually exited
+                           (when (memq (process-status proc) '(exit signal))
+                             ;; Install immediately after termination
+                             (ios-simulator-install-app
                             :simulatorID current-sim-id
                             :build-folder xcode-project--current-build-folder
                             :appname current-app-name
@@ -467,7 +496,7 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
                                            :simulatorName current-sim-name
                                            :simulatorID current-sim-id
                                            :buffer launch-buffer
-                                           :terminate-running current-terminate-first)))))))
+                                           :terminate-running current-terminate-first))))))))
             ;; Install directly without terminating
             (ios-simulator-install-app
              :simulatorID current-sim-id
@@ -509,6 +538,13 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
     (when (fboundp 'swift-notification-progress-update)
       (swift-notification-progress-update 'swift-build :percent 75 :message "Installing app..."))
 
+    ;; Kill any existing installation process to prevent duplicates
+    (when (and ios-simulator--installation-process
+               (process-live-p ios-simulator--installation-process))
+      (when ios-simulator-debug
+        (message "Killing existing installation process"))
+      (delete-process ios-simulator--installation-process))
+
     ;; Direct process creation without buffer
     (setq ios-simulator--installation-process
           (make-process
@@ -520,32 +556,39 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
                            (progn
                              (when ios-simulator-debug
                                (message "Installation process event: %s" event))
-                             ;; Handle all process exit events (finished, exited abnormally, etc.)
-                             (when (memq (process-status process) '(exit signal))
-                               (if (= 0 (process-exit-status process))
-                                   (progn
-                                     (when (fboundp 'xcode-project-notify)
-                                       (xcode-project-notify
-                                        :message (format "%s installed"
-                                                         (propertize appname 'face 'success))
-                                        :seconds 2
-                                        :reset t))
-                                     ;; Update progress bar - installation complete
-                                     (when (fboundp 'swift-notification-progress-update)
-                                       (swift-notification-progress-update 'swift-build :percent 85 :message "Installed"))
-                                     (when callback (funcall callback)))
-                                 (progn
-                                   (when (fboundp 'xcode-project-notify)
-                                     (xcode-project-notify
-                                      :message (format "Installation failed: %s"
-                                                       (propertize appname 'face 'error))
-                                      :seconds 3
-                                      :reset t))
-                                   ;; Cancel progress bar on failure
-                                   (when (fboundp 'swift-notification-progress-cancel)
-                                     (swift-notification-progress-cancel 'swift-build))
-                                   (message "App installation failed with exit code: %d"
-                                            (process-exit-status process))))))
+                              ;; Handle all process exit events (finished, exited abnormally, etc.)
+                              (when (memq (process-status process) '(exit signal))
+                                (if (= 0 (process-exit-status process))
+                                    (progn
+                                      ;; Use run-with-timer to avoid "call-process invoked recursively"
+                                      ;; when knockknock notifications use call-process internally
+                                      (run-with-timer
+                                       0 nil
+                                       (lambda ()
+                                         (when (fboundp 'xcode-project-notify)
+                                           (xcode-project-notify
+                                            :message (format "%s installed"
+                                                             (propertize appname 'face 'success))
+                                            :seconds 2
+                                            :reset t))
+                                         (when (fboundp 'swift-notification-progress-update)
+                                           (swift-notification-progress-update 'swift-build :percent 85 :message "Installed"))))
+                                      (when callback (funcall callback)))
+                                  (progn
+                                    ;; Use run-with-timer here too for consistency
+                                    (run-with-timer
+                                     0 nil
+                                     (lambda ()
+                                       (when (fboundp 'xcode-project-notify)
+                                         (xcode-project-notify
+                                          :message (format "Installation failed: %s"
+                                                           (propertize appname 'face 'error))
+                                          :seconds 3
+                                          :reset t))
+                                       (when (fboundp 'swift-notification-progress-cancel)
+                                         (swift-notification-progress-cancel 'swift-build))))
+                                    (message "App installation failed with exit code: %d"
+                                             (process-exit-status process))))))
                          (error
                           (message "Error in installation sentinel: %s" (error-message-string install-err)))))))))
 
@@ -694,42 +737,28 @@ Prompts for simulator selection and boots it."
 (cl-defun ios-simulator-is-simulator-app-running (&key callback)
   "Check if simulator is running.
 If CALLBACK provided, run asynchronously."
-  (if callback
-      (make-process
-       :name "check-simulator"
-       :command (list "sh" "-c" "ps ax | grep -v grep | grep Simulator.app")
-       :noquery t
-       :buffer " *check-simulator-temp*"
-       :sentinel (lambda (proc event)
-                   (when (string= event "finished\n")
-                     (let ((buf (process-buffer proc)))
-                       (when (buffer-live-p buf)
-                         (let ((output (with-current-buffer buf (buffer-string))))
-                           (kill-buffer buf)
-                           (funcall callback (not (string= "" output)))))))))
-    ;; Synchronous fallback
-    (let ((output (shell-command-to-string "ps ax | grep -v grep | grep Simulator.app")))
-      (not (string= "" output)))))
+  (let ((cmd "ps ax | grep -v grep | grep Simulator.app"))
+    (if callback
+        (swift-async-run cmd
+                         (lambda (output)
+                           (funcall callback (and output (not (string= "" output)))))
+                         :timeout 3)
+      ;; Synchronous with timeout
+      (let ((output (swift-async-run-sync cmd :timeout 3)))
+        (and output (not (string= "" output)))))))
 
 (cl-defun ios-simulator-simulator-name-from (&key id &key callback)
   "Get simulator name (as ID).
 If CALLBACK provided, run asynchronously."
-  (if callback
-      (make-process
-       :name "simulator-name"
-       :command (list "sh" "-c" (format "xcrun simctl list devices | grep %s | awk -F \"(\" '{ print $1 }'" (shell-quote-argument id)))
-       :noquery t
-       :buffer " *simulator-name-temp*"
-       :sentinel (lambda (proc event)
-                   (when (string= event "finished\n")
-                     (let ((buf (process-buffer proc)))
-                       (when (buffer-live-p buf)
-                         (let ((result (string-trim (with-current-buffer buf (buffer-string)))))
-                           (kill-buffer buf)
-                           (funcall callback result)))))))
-    ;; Synchronous fallback
-    (string-trim
-     (shell-command-to-string (format "xcrun simctl list devices | grep %s | awk -F \"(\" '{ print $1 }'" (shell-quote-argument id))))))
+  (let ((cmd (format "xcrun simctl list devices | grep %s | awk -F \"(\" '{ print $1 }'"
+                     (shell-quote-argument id))))
+    (if callback
+        (swift-async-run cmd
+                         (lambda (output)
+                           (funcall callback (string-trim (or output ""))))
+                         :timeout 5)
+      ;; Synchronous with timeout
+      (string-trim (or (swift-async-run-sync cmd :timeout 5) "")))))
 
 (defun ios-simulator-available-simulators ()
   "List available simulators with iOS version displayed."
@@ -868,15 +897,6 @@ Calls CALLBACK with version list."
     (let* ((choices (seq-map (lambda (item) item) languageList))
            (choice (completing-read title choices)))
       (car (cdr (assoc choice choices))))))
-
-(cl-defun ios-simulator-build-selection-menu (&key title &key list)
-  "Builds a widget menu from (as TITLE as LIST)."
-  (if (<= (length list) 1)
-      (elt list 0)
-    (progn
-      (let* ((choices (seq-map (lambda (item) item) list))
-             (choice (completing-read title choices)))
-        (cdr (assoc choice choices))))))
 
 (cl-defun ios-simulator-simulator-identifier (&key callback)
   "Get the booted simulator id or fetch a suitable one. If CALLBACK provided, run asynchronously."
@@ -1136,23 +1156,15 @@ Returns list of (name . id) pairs."
 (cl-defun ios-simulator-booted-simulator (&key callback)
   "Get booted simulator if any. If CALLBACK provided, run asynchronously."
   (if callback
-      (make-process
-       :name "booted-simulator"
-       :command (list "sh" "-c" ios-simulator-get-booted-simulator-command)
-       :noquery t
-       :buffer " *booted-simulator-temp*"
-       :sentinel (lambda (proc event)
-                   (when (string= event "finished\n")
-                     (let ((buf (process-buffer proc)))
-                       (when (buffer-live-p buf)
-                         (let ((device-id (string-trim (with-current-buffer buf (buffer-string)))))
-                           (kill-buffer buf)
-                           (funcall callback (if (string= "" device-id) nil device-id))))))))
-    ;; Synchronous fallback
-    (let ((device-id (shell-command-to-string ios-simulator-get-booted-simulator-command)))
-      (if (not (string= "" device-id))
-          (string-trim device-id)
-        nil))))
+      (swift-async-run ios-simulator-get-booted-simulator-command
+                       (lambda (output)
+                         (let ((device-id (string-trim (or output ""))))
+                           (funcall callback (if (string= "" device-id) nil device-id))))
+                       :timeout 5)
+    ;; Synchronous with timeout
+    (let ((device-id (swift-async-run-sync ios-simulator-get-booted-simulator-command :timeout 5)))
+      (when (and device-id (not (string= "" device-id)))
+        (string-trim device-id)))))
 
 (defun ios-simulator-terminate-current-app ()
   "Terminate the current app running in simulator."
@@ -1253,25 +1265,16 @@ If TERMINATE-RUNNING is non-nil, terminate any running instance before launching
       (set-process-query-on-exit-flag process nil))))
 
 (defun ios-simulator-run-command-and-get-json (command)
-  "Run a shell COMMAND and return the JSON output as a string.
-Note: Prefer `ios-simulator-parse-json-safe' for better error handling."
+  "Run a shell COMMAND and return the JSON output.
+Uses timeout protection to prevent hangs."
   (condition-case err
-      (let* ((json-output (shell-command-to-string command))
-             (json-data (json-read-from-string json-output)))
+      (let* ((json-output (swift-async-run-sync command :timeout 5))
+             (json-data (and json-output (json-read-from-string json-output))))
         json-data)
     (error
      (when ios-simulator-debug
        (message "JSON parse error in command '%s': %s" command (error-message-string err)))
      nil)))
-
-(defun ios-simulator-json-get (json &rest keys)
-  "Safely get nested value from JSON using KEYS.
-Returns nil if any key in path doesn't exist or JSON is nil."
-  (when json
-    (let ((value json))
-      (while (and keys value)
-        (setq value (cdr (assoc (pop keys) value))))
-      value)))
 
 (defun ios-simulator-parse-json-safe (command &optional error-message)
   "Run COMMAND and parse JSON with proper error handling.
@@ -1286,25 +1289,18 @@ ERROR-MESSAGE is an optional custom error message."
      (cons nil (format "JSON parse error: %s" (error-message-string err))))))
 
 (defun ios-simulator-run-command-and-get-json-async (command callback)
-  "Run a shell COMMAND asynchronously and call CALLBACK with parsed JSON data."
-  (make-process
-   :name "simctl-json"
-   :command (list "sh" "-c" command)
-   :noquery t
-   :buffer " *simctl-json-temp*"
-   :sentinel (lambda (proc event)
-               (when (string= event "finished\n")
-                 (let ((buf (process-buffer proc)))
-                   (when (buffer-live-p buf)
-                     (let ((json-data (condition-case err
-                                          (json-read-from-string
-                                           (with-current-buffer buf (buffer-string)))
-                                        (error
-                                         (message "Failed to parse JSON: %s" err)
-                                         nil))))
-                       (kill-buffer buf)
-                       (when callback
-                         (funcall callback json-data)))))))))
+  "Run a shell COMMAND asynchronously and call CALLBACK with parsed JSON data.
+Uses timeout and proper cleanup handling."
+  (swift-async-run
+   command
+   callback
+   :timeout 10
+   :parse-json t
+   :error-callback (lambda (err)
+                     (when ios-simulator-debug
+                       (message "simctl async error: %s" err))
+                     (when callback
+                       (funcall callback nil)))))
 
 (defun ios-simulator-run-command-and-get-json-simple (command)
   "Run a shell COMMAND and return JSON. Simple synchronous version with timeout.
@@ -1412,12 +1408,17 @@ The command should be fast (<0.3s) but we add a 5s timeout as safety measure."
 (defun ios-simulator-appcontainer ()
   "Get the app container of the current app (as SIMULATORID, APPIDENTIFIER)."
   (interactive)
-  (if-let* ((identifier xcode-project--current-app-identifier)
-           (id current-simulator-id)
-           (command (shell-command-to-string (format "xcrun simctl get_app_container %s %s data"
-                                                     (shell-quote-argument id)
-                                                     (shell-quote-argument identifier)))))
-      (async-shell-command (concat "open " (shell-quote-argument (string-trim command))))))
+  (when-let* ((identifier xcode-project--current-app-identifier)
+              (id current-simulator-id))
+    (let ((cmd (format "xcrun simctl get_app_container %s %s data"
+                       (shell-quote-argument id)
+                       (shell-quote-argument identifier))))
+      (swift-async-run cmd
+                       (lambda (output)
+                         (when (and output (not (string-empty-p output)))
+                           (async-shell-command
+                            (concat "open " (shell-quote-argument (string-trim output))))))
+                       :timeout 5))))
 
 (defun ios-simulator-fetch-available-simulators ()
   "List available simulators, using persistent device-cache if valid."
@@ -1832,18 +1833,6 @@ TERMINATE-FIRST: Whether to terminate existing app instance"
     (message "Shutdown simulator: %s" (plist-get info :name))))
 
 ;;;###autoload
-(defun ios-simulator-test-two-step-selection ()
-  "Test the new two-step selection process."
-  (interactive)
-  (let ((ios-simulator-debug t))
-    (message "Testing two-step simulator selection:")
-    (message "Available iOS versions: %s" (string-join (ios-simulator-available-ios-versions) ", "))
-    (message "Example: Devices for iOS 17.2:")
-    (let ((devices (ios-simulator-devices-for-ios-version "17.2")))
-      (dolist (device devices)
-        (message "  - %s" (car device))))))
-
-;;;###autoload
 (defun ios-simulator-setup-hooks ()
   "Setup hooks for iOS simulator functionality."
   ;; Support both swift-mode and swift-ts-mode
@@ -2081,25 +2070,35 @@ CELLULAR: cellular bars 0-4"
   "List all apps installed on the current simulator."
   (interactive)
   (let* ((sim-id (or current-simulator-id "booted"))
-         (output (shell-command-to-string
-                  (format "xcrun simctl listapps %s 2>/dev/null" sim-id)))
+         (cmd (format "xcrun simctl listapps %s 2>/dev/null" sim-id))
          (buffer (get-buffer-create "*Simulator Apps*")))
     (with-current-buffer buffer
       (erase-buffer)
       (insert "Installed Apps on Simulator\n")
       (insert "===========================\n\n")
-      ;; Parse the plist output to show app names and bundle IDs
-      (let ((apps '()))
-        (with-temp-buffer
-          (insert output)
-          (goto-char (point-min))
-          (while (re-search-forward "CFBundleIdentifier.*?=.*?\"\\([^\"]+\\)\"" nil t)
-            (push (match-string 1) apps)))
-        (dolist (app (nreverse apps))
-          (insert (format "  • %s\n" app)))))
+      (insert "Loading...\n"))
     (display-buffer buffer)
-    (message "Found %d apps" (with-current-buffer buffer
-                               (count-lines (point-min) (point-max))))))
+    (swift-async-run
+     cmd
+     (lambda (output)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (erase-buffer)
+           (insert "Installed Apps on Simulator\n")
+           (insert "===========================\n\n")
+           ;; Parse the plist output to show app names and bundle IDs
+           (let ((apps '()))
+             (with-temp-buffer
+               (insert (or output ""))
+               (goto-char (point-min))
+               (while (re-search-forward "CFBundleIdentifier.*?=.*?\"\\([^\"]+\\)\"" nil t)
+                 (push (match-string 1) apps)))
+             (if apps
+                 (dolist (app (nreverse apps))
+                   (insert (format "  - %s\n" app)))
+               (insert "No apps found\n")))
+           (message "Found %d apps" (1- (count-lines (point-min) (point-max)))))))
+     :timeout 10)))
 
 (defun ios-simulator-uninstall-app (bundle-id)
   "Uninstall app with BUNDLE-ID from the current simulator."
@@ -2127,10 +2126,9 @@ CONTAINER-TYPE can be: app, data, groups, or a specific group identifier."
          (completing-read "Container type: " '("app" "data" "groups") nil t "data")))
   (let* ((sim-id (or current-simulator-id "booted"))
          (type (or container-type "data"))
-         (path (string-trim
-                (shell-command-to-string
-                 (format "xcrun simctl get_app_container %s %s %s 2>/dev/null"
-                         sim-id bundle-id type)))))
+         (cmd (format "xcrun simctl get_app_container %s %s %s 2>/dev/null"
+                      sim-id bundle-id type))
+         (path (string-trim (or (swift-async-run-sync cmd :timeout 5) ""))))
     (if (and path (not (string-empty-p path)) (file-exists-p path))
         (progn
           (message "Container path: %s" path)
@@ -2230,8 +2228,8 @@ CONTAINER-TYPE can be: app, data, groups, or a specific group identifier."
   "Copy the simulator's clipboard to Emacs kill-ring."
   (interactive)
   (let* ((sim-id (or current-simulator-id "booted"))
-         (text (shell-command-to-string
-                (format "xcrun simctl pbpaste %s" sim-id))))
+         (cmd (format "xcrun simctl pbpaste %s" sim-id))
+         (text (or (swift-async-run-sync cmd :timeout 3) "")))
     (kill-new text)
     (message "Copied from simulator: %s" (truncate-string-to-width text 50))))
 

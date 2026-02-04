@@ -14,6 +14,7 @@
 
 (require 'cl-lib)
 (require 'json)
+(require 'swift-async)
 
 ;; Optional dependency
 (defvar mode-line-hud-available-p (require 'mode-line-hud nil t)
@@ -57,7 +58,7 @@ Falls back to running xcodebuild if settings not available."
       (let* ((default-directory root)
              (command (format "xcodebuild -showBuildSettings %s -scheme %s -derivedDataPath .build 2>/dev/null | grep -E '^ *BUILD_DIR = ' | head -1 | sed 's/.*= //'"
                               workspace (shell-quote-argument scheme))))
-        (setq build-dir (string-trim (shell-command-to-string command)))))
+        (setq build-dir (string-trim (or (swift-async-run-sync command :timeout 15) "")))))
     
     ;; Extract build root from build-dir
     ;; BUILD_DIR is like: /path/to/project/.build/Build/Products

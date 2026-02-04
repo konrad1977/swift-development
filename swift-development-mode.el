@@ -89,7 +89,7 @@ This is a convenience setting that sets `swift-file-watcher-show-indicator'."
     (define-key map (kbd "C-c r s") #'code-refactor-split-function-list)
 
     ;; Periphery & Search
-    (define-key map (kbd "C-x p t") #'periphery-toggle-buffer)
+    (define-key map (kbd "C-x p t") #'swift-development--periphery-toggle-buffer)
     (define-key map (kbd "C-c C-f") #'periphery-search-dwiw-rg)
 
     map)

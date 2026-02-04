@@ -68,13 +68,6 @@
   :type 'boolean
   :group 'swiftui-preview)
 
-(defcustom swiftui-preview-use-separate-build-folder nil
-  "If non-nil, use a separate build folder for preview builds.
-This prevents preview builds from invalidating the main build cache.
-Currently not working properly with xcodebuild."
-  :type 'boolean
-  :group 'swiftui-preview)
-
 (defcustom swiftui-preview-debug nil
   "Enable debug messages for SwiftUI preview."
   :type 'boolean

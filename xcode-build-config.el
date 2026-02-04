@@ -186,9 +186,6 @@ Captures file path, line number, and column number."
   :type 'string
   :group 'xcode-build-config)
 
-(defvar xcode-build-config-optimization-level 'fast
-  "Build optimization level.")
-
 ;;; ============================================================================
 ;;; Internal Variables
 ;;; ============================================================================

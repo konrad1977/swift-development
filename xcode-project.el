@@ -22,7 +22,8 @@
 (require 'xcode-clean nil t)       ; Cleaning utilities (optional)
 (require 'periphery nil t)
 (require 'periphery-helper nil t)
-(require 'swift-cache nil t)  ; Optional - graceful fallback if not available
+(require 'swift-cache)   ; Caching system
+(require 'swift-async)   ; Robust async utilities
 
 ;; Legacy compatibility - now using swift-notification
 (defvar mode-line-hud-available-p swift-notification--mode-line-hud-available-p
@@ -93,8 +94,6 @@ This is a compatibility wrapper - prefer using `xcode-project-notify' directly."
   "Buffer-local build output folder path.")
 (defvar-local xcode-project--current-is-xcode-project nil
   "Buffer-local flag indicating if current project is an Xcode project.")
-(defvar-local xcode-project--current-local-device-id nil
-  "Buffer-local device ID for physical device builds.")
 (defvar-local xcode-project--current-errors-or-warnings nil
   "Buffer-local errors or warnings from last build.")
 (defvar-local xcode-project--last-device-type nil
@@ -117,66 +116,37 @@ This is a compatibility wrapper - prefer using `xcode-project-notify' directly."
 
 ;;; Async command execution infrastructure
 
-(cl-defun xcode-project-run-command-async (command callback &key cache-key cache-ttl error-callback)
+(defcustom xcode-project-async-timeout 30
+  "Default timeout in seconds for async xcode commands."
+  :type 'integer
+  :group 'xcode-project-xcodebuild)
+
+(cl-defun xcode-project-run-command-async (command callback &key cache-key cache-ttl error-callback timeout)
   "Run shell COMMAND asynchronously and call CALLBACK with parsed JSON result.
 CALLBACK receives the parsed JSON data (or nil if parsing fails).
 ERROR-CALLBACK is called on process errors if provided.
-If CACHE-KEY is provided, results are cached with CACHE-TTL (default 300s)."
-  ;; Check cache first
-  (when cache-key
-    (let ((cached (swift-cache-get cache-key)))
-      (when cached
-        (when xcode-project-debug
-          (message "xcode-project-run-command-async: Cache hit for %s" cache-key))
-        (funcall callback cached)
-        (cl-return-from xcode-project-run-command-async nil))))
+If CACHE-KEY is provided, results are cached with CACHE-TTL (default 300s).
+TIMEOUT specifies seconds before killing the process (default `xcode-project-async-timeout').
 
-  ;; Kill any existing process with same cache-key
-  (when cache-key
-    (let ((existing-proc (gethash cache-key xcode-project--async-processes)))
-      (when (and existing-proc (process-live-p existing-proc))
-        (when xcode-project-debug
-          (message "xcode-project-run-command-async: Killing existing process for %s" cache-key))
-        (delete-process existing-proc))))
-
-  (let* ((output-buffer (generate-new-buffer " *xcode-async-output*"))
-         (proc (make-process
-                :name "xcode-async"
-                :buffer output-buffer
-                :command (list shell-file-name shell-command-switch command)
-                :sentinel
-                (lambda (process event)
-                  (when xcode-project-debug
-                    (message "xcode-project-run-command-async: Process event: %s" (string-trim event)))
-                  (when (memq (process-status process) '(exit signal))
-                    ;; Remove from active processes
-                    (when cache-key
-                      (remhash cache-key xcode-project--async-processes))
-                    (if (and (eq (process-status process) 'exit)
-                             (= (process-exit-status process) 0))
-                        (let ((json-data nil))
-                          (with-current-buffer output-buffer
-                            (goto-char (point-min))
-                            (condition-case err
-                                (setq json-data (json-read))
-                              (error
-                               (when xcode-project-debug
-                                 (message "xcode-project-run-command-async: JSON parse error: %s"
-                                          (error-message-string err))))))
-                          ;; Cache the result if cache-key provided
-                          (when (and cache-key json-data)
-                            (swift-cache-set cache-key json-data (or cache-ttl 300)))
-                          (kill-buffer output-buffer)
-                          (funcall callback json-data))
-                      ;; Process failed
-                      (kill-buffer output-buffer)
-                      (if error-callback
-                          (funcall error-callback event)
-                        (funcall callback nil))))))))
-    ;; Track the process
-    (when cache-key
-      (puthash cache-key proc xcode-project--async-processes))
-    proc))
+Features:
+- Proper timeout handling (prevents hangs)
+- Separate stderr capture (better error diagnostics)
+- Automatic buffer cleanup (no memory leaks)
+- Output size guard (prevents huge allocations)"
+  (swift-async-run
+   command
+   (lambda (json-data)
+     (funcall callback json-data))
+   :timeout (or timeout xcode-project-async-timeout)
+   :error-callback (or error-callback
+                       (lambda (err)
+                         (when xcode-project-debug
+                           (message "xcode-project-run-command-async error: %s" err))
+                         (funcall callback nil)))
+   :cache-key cache-key
+   :cache-ttl (or cache-ttl 300)
+   :parse-json t
+   :process-key cache-key))
 
 (defun xcode-project-warm-cache ()
   "Warm up xcode-project caches asynchronously.
@@ -205,14 +175,6 @@ to avoid blocking when they're needed later."
                     (message "xcode-project-warm-cache: Build settings cached")))
                 :config nil)))))))))
 
-(defun xcode-project-warm-cache-if-needed ()
-  "Warm cache if not already done for current project.
-Safe to call multiple times - will only warm once per project."
-  (let* ((project-root (xcode-project-project-root))
-         (warm-key (when project-root (format "%s::cache-warming" project-root))))
-    (when (and warm-key (not (gethash warm-key xcode-project--cache-warmed-projects)))
-      (xcode-project-warm-cache))))
-
 (defgroup xcode-project-xcodebuild nil
   "REPL."
   :tag "xcode-project-xcodebuild"
@@ -238,19 +200,20 @@ Safe to call multiple times - will only warm once per project."
   :group 'xcode-project)
 
 (defun xcode-project-get-app-path ()
-  "Get the path to Xcode.app/ (with trailing slash) using xcode-select."
-  (let ((developer-path (string-trim (shell-command-to-string "xcode-select -p"))))
-    (cond
-     ;; Extract Xcode.app path from developer path and add trailing slash
-     ((string-match "\\(.*/Xcode\\.app\\)" developer-path)
-      (concat (match-string 1 developer-path) "/"))
-     
-     ;; Fallback to standard location if it exists
-     ((file-exists-p "/Applications/Xcode.app")
-      "/Applications/Xcode.app/")
-     
-     ;; Return nil if not found
-     (t nil))))
+  "Get the path to Xcode.app/ (with trailing slash) using xcode-select.
+Result is cached for 1 hour since Xcode path rarely changes."
+  (swift-cache-with "xcode-app-path" 3600
+    (let* ((developer-path (string-trim
+                            (swift-async-run-sync "xcode-select -p" :timeout 5)))
+           (result
+            (cond
+             ((and developer-path
+                   (string-match "\\(.*/Xcode\\.app\\)" developer-path))
+              (concat (match-string 1 developer-path) "/"))
+             ((file-exists-p "/Applications/Xcode.app")
+              "/Applications/Xcode.app/")
+             (t nil))))
+      result)))
 
 (defun xcode-project-accessibility-inspector ()
   "Launch the Accessibility Inspector."
@@ -438,14 +401,17 @@ Project path: %s"
 
 (defun xcode-project-run-command-and-get-json (command)
   "Run a shell COMMAND and return the JSON output.
-Returns nil if command fails or produces invalid JSON."
-  (let* ((json-output (shell-command-to-string command)))
+Returns nil if command fails or produces invalid JSON.
+Uses timeout protection to prevent hangs."
+  (let* ((json-output (swift-async-run-sync command :timeout 10)))
     (when xcode-project-debug
       (message "Command: %s" command)
-      (message "JSON output length: %d" (length json-output))
-      (message "JSON output preview: %s" (substring json-output 0 (min 200 (length json-output)))))
+      (message "JSON output length: %d" (length (or json-output "")))
+      (when json-output
+        (message "JSON output preview: %s" (substring json-output 0 (min 200 (length json-output))))))
     ;; Check if output is empty or whitespace only
-    (if (or (string-empty-p json-output)
+    (if (or (null json-output)
+            (string-empty-p json-output)
             (string-match-p "\\`[[:space:]]*\\'" json-output))
         (progn
           (when xcode-project-debug
@@ -882,6 +848,83 @@ This should be used for user-facing messages and UI, not for shell commands."
       (error "No scheme selected")
     (xcode-project--clean-display-name xcode-project--current-xcode-scheme)))
 
+;;; Scheme Filtering and Selection
+
+(defun xcode-project-filter-test-schemes (schemes)
+  "Filter SCHEMES to exclude test-related schemes (those ending with 'Tests').
+Returns schemes suitable for build/run operations."
+  (cl-remove-if
+   (lambda (scheme)
+     (string-match-p "Tests$" scheme))
+   schemes))
+
+(defun xcode-project-select-scheme ()
+  "Interactively select a scheme for build/run operations.
+Test schemes (ending with 'Tests') are filtered out.
+Sets `xcode-project--current-xcode-scheme' and saves to settings."
+  (interactive)
+  (let* ((all-schemes (or (xcode-project-get-scheme-list)
+                          (xcode-project-get-schemes-from-xcodebuild)))
+         (filtered-schemes (xcode-project-filter-test-schemes all-schemes)))
+    (if (null filtered-schemes)
+        (progn
+          (xcode-project-notify
+           :message (propertize "No app schemes found (only test schemes exist)" 'face 'warning)
+           :seconds 3)
+          ;; Fall back to all schemes if no app schemes found
+          (xcode-project--handle-scheme-selection all-schemes))
+      (let ((selected (xcode-project-build-menu :title "Select scheme for build/run: "
+                                                 :list filtered-schemes)))
+        (when selected
+          (setq xcode-project--current-xcode-scheme selected)
+          (when (fboundp 'swift-project-settings-load-for-scheme)
+            (swift-project-settings-load-for-scheme (xcode-project-project-root) selected))
+          ;; Save to settings
+          (when (fboundp 'swift-project-settings-capture-from-variables)
+            (swift-project-settings-capture-from-variables (xcode-project-project-root)))
+          (xcode-project-notify
+           :message (format "Build scheme: %s"
+                            (propertize (xcode-project--clean-display-name selected) 'face 'success))
+           :seconds 2
+           :reset t))
+        selected))))
+
+(defun xcode-project-select-test-scheme ()
+  "Interactively select a scheme for testing operations.
+Shows ALL schemes (including test schemes) since some tests need the app scheme.
+Saves the selection to :test-scheme in settings (separate from build scheme)."
+  (interactive)
+  (let* ((all-schemes (or (xcode-project-get-scheme-list)
+                          (xcode-project-get-schemes-from-xcodebuild)))
+         (project-root (xcode-project-project-root)))
+    (if (null all-schemes)
+        (progn
+          (xcode-project-notify
+           :message (propertize "No schemes found!" 'face 'error)
+           :seconds 3)
+          nil)
+      (let ((selected (xcode-project-build-menu :title "Select scheme for testing: "
+                                                 :list all-schemes)))
+        (when selected
+          ;; Save as test-scheme (separate from build scheme)
+          (when (fboundp 'swift-project-settings-set-test-scheme)
+            (swift-project-settings-set-test-scheme project-root selected))
+          (xcode-project-notify
+           :message (format "Test scheme: %s"
+                            (propertize (xcode-project--clean-display-name selected) 'face 'success))
+           :seconds 2
+           :reset t))
+        selected))))
+
+(defun xcode-project-get-test-scheme ()
+  "Get the test scheme, prompting if not set.
+Uses saved :test-scheme from settings, falling back to prompt."
+  (let* ((project-root (xcode-project-project-root))
+         (saved-scheme (when (fboundp 'swift-project-settings-test-scheme)
+                         (swift-project-settings-test-scheme project-root))))
+    (or saved-scheme
+        (xcode-project-select-test-scheme))))
+
 (defun xcode-project-fetch-or-load-build-configuration ()
   "Get the build configuration from the scheme file."
   (unless xcode-project--current-build-configuration
@@ -1063,22 +1106,6 @@ This is the authoritative source - it asks xcodebuild directly."
              (funcall callback result-folder)))
          :config config :sdk sdk)))))
 
-(defun xcode-project-get-build-products-directory ()
-  "Get the base build products directory path."
-  (let* ((project-root (file-name-as-directory (xcode-project-project-root)))
-         (local-build-dir (concat project-root ".build/Build/Products/")))
-    (if (file-exists-p local-build-dir)
-        local-build-dir
-      ;; Fallback to derived data path
-      (let ((derived-path (xcode-project-derived-data-path)))
-        (when derived-path
-          (cond
-           ;; If derived path ends with .build, append Build/Products
-           ((string-suffix-p ".build" derived-path)
-            (concat derived-path "/Build/Products/"))
-           ;; Otherwise use the path as-is with Build/Products
-           (t (concat (file-name-as-directory derived-path) "Build/Products/"))))))))
-
 ;; NOTE: xcode-project-auto-detect-build-folder was removed.
 ;; Build folder detection is now handled by swift-project-settings-fetch-build-info
 ;; which queries xcodebuild directly instead of guessing from folder names.
@@ -1156,14 +1183,6 @@ Returns nil if neither workspace nor project is found (e.g., pure Swift Package)
       (format "-project %s.xcodeproj" (shell-quote-argument projectname)))
      (t nil))))
 
-(defun xcode-project-get-configuration-list ()
-  "Get list of project configurations."
-  (let* ((default-directory (xcode-project-project-root))
-         (json (swift-development-get-buildconfiguration-json))
-         (project (assoc 'project json))
-         (result (cdr (assoc 'configurations project))))
-    result))
-
 (defun xcode-project-get-buildconfiguration-json ()
   "Return a cached version or load the build configuration."
   (unless xcode-project--current-buildconfiguration-json-data
@@ -1173,14 +1192,6 @@ Returns nil if neither workspace nor project is found (e.g., pure Swift Package)
             (let ((default-directory project-dir))
               (xcode-project-run-command-and-get-json (concat xcodebuild-list-config-command " 2>/dev/null"))))))
   xcode-project--current-buildconfiguration-json-data)
-
-(defun xcode-project-get-target-list ()
-  "Get list of project targets."
-  (let* ((default-directory (xcode-project-project-root))
-         (json (xcode-project-get-buildconfiguration-json))
-         (project (assoc 'project json))
-         (targets (cdr (assoc 'targets project))))
-    targets))
 
 (defun xcode-project-is-xcodeproject ()
   "Check if it's an Xcode project."
@@ -1393,7 +1404,8 @@ Shows that multi-project support is enabled via buffer-local variables."
 (defun xcode-project-reset ()
   "Reset project configuration.
 Prompts for device/simulator choice, then scheme, then fetches build info.
-Build folder is determined by xcodebuild, not by guessing."
+Build folder is determined by xcodebuild, not by guessing.
+Uses filtered scheme list (excludes test schemes) for build/run operations."
   (interactive)
   ;; 1. Cancel pending timers
   (when xcode-project--periphery-debounce-timer
@@ -1415,7 +1427,6 @@ Build folder is determined by xcodebuild, not by guessing."
         xcode-project--current-xcode-scheme nil
         xcode-project--current-buildconfiguration-json-data nil
         xcode-project--current-errors-or-warnings nil
-        xcode-project--current-local-device-id nil
         xcode-project--current-is-xcode-project nil
         xcode-project--last-device-type nil
         swift-development--device-choice nil)
@@ -1437,8 +1448,8 @@ Build folder is determined by xcodebuild, not by guessing."
     (let ((choice (completing-read "Run on: " '("Simulator" "Physical Device") nil t)))
       (setq swift-development--device-choice (string= choice "Physical Device")))
     
-    ;; 6b. Select scheme
-    (xcode-project-scheme)
+    ;; 6b. Select scheme using filtered list (excludes test schemes)
+    (xcode-project-select-scheme)
     
     ;; 6c. Clear build-settings cache AFTER scheme selection to ensure fresh fetch
     ;; Cache keys are formatted as "project-root::build-settings-scheme-config-sdk"
@@ -1506,18 +1517,65 @@ Automatically builds the app if sources have changed."
         (when (fboundp 'swift-development-needs-rebuild-p)
           (if (swift-development-needs-rebuild-p)
               (progn
-                (swift-notification-send :message "Building before debugging..." :seconds 2)
+                ;; Start progress for build + debug
+                (when (fboundp 'swift-notification-progress-start)
+                  (swift-notification-progress-start
+                   :id 'debug-session
+                   :title "Debug"
+                   :message "Building for debugging..."
+                   :percent 0))
                 (swift-development-compile-app)
                 ;; Wait a moment for build to complete
                 ;; TODO: Better synchronization with build completion
-                (sit-for 1))
-            (swift-notification-send :message "App up-to-date, launching debugger..." :seconds 2)))
+                (sit-for 1)
+                ;; Cancel build progress - setup-dape will start its own
+                (when (fboundp 'swift-notification-progress-cancel)
+                  (swift-notification-progress-cancel 'debug-session)))
+            ;; App is up to date - just show a quick message
+            (swift-notification-send :message "App up-to-date, starting debugger..." :seconds 2)))
         (xcode-project-setup-dape))
     (error
+     (when (fboundp 'swift-notification-progress-cancel)
+       (swift-notification-progress-cancel 'debug-session))
      (swift-notification-send :message (format "Debug error: %s" (error-message-string err))
                               :seconds 5)
      (message "Please ensure a scheme is selected and the project is properly configured")
      (signal (car err) (cdr err)))))
+
+(defun xcode-project--setup-dape-progress-hooks ()
+  "Setup hooks to track dape debugger state and update progress accordingly."
+  (let ((attached-hook-fn nil)
+        (stopped-hook-fn nil)
+        (quit-hook-fn nil))
+    ;; Define hook functions that remove themselves after running
+    (setq attached-hook-fn
+          (lambda ()
+            (when (fboundp 'swift-notification-progress-update)
+              (swift-notification-progress-update 'debug-session
+                                                  :percent 90
+                                                  :message "Debugger connected, waiting for stop..."))
+            (remove-hook 'dape-on-initialized-hooks attached-hook-fn)))
+    
+    (setq stopped-hook-fn
+          (lambda (_conn)
+            ;; Debugger has stopped (attached and ready)
+            (when (fboundp 'swift-notification-progress-finish)
+              (swift-notification-progress-finish 'debug-session "Debugging"))
+            (remove-hook 'dape-on-stopped-hooks stopped-hook-fn)))
+    
+    (setq quit-hook-fn
+          (lambda (_conn)
+            ;; Debugger quit/disconnected - cancel progress if still active
+            (when (fboundp 'swift-notification-progress-cancel)
+              (swift-notification-progress-cancel 'debug-session))
+            (remove-hook 'dape-on-initialized-hooks attached-hook-fn)
+            (remove-hook 'dape-on-stopped-hooks stopped-hook-fn)
+            (remove-hook 'dape-on-quit-hooks quit-hook-fn)))
+    
+    ;; Add hooks
+    (add-hook 'dape-on-initialized-hooks attached-hook-fn)
+    (add-hook 'dape-on-stopped-hooks stopped-hook-fn)
+    (add-hook 'dape-on-quit-hooks quit-hook-fn)))
 
 (defun xcode-project-setup-dape ()
   "Setup and start dape for iOS debugging.
@@ -1525,6 +1583,21 @@ Automatically detects whether to debug on simulator or physical device
 based on `swift-development--device-choice'."
   (interactive)
   (require 'dape)
+  
+  ;; Fix: asm-mode doesn't support hideshow but dape/codelldb may trigger it
+  ;; when displaying disassembly. Add a no-op entry to prevent errors.
+  (with-eval-after-load 'hideshow
+    (unless (assq 'asm-mode hs-special-modes-alist)
+      (add-to-list 'hs-special-modes-alist '(asm-mode nil nil nil nil))))
+  
+  ;; Start progress notification
+  (when (fboundp 'swift-notification-progress-start)
+    (swift-notification-progress-start
+     :id 'debug-session
+     :title "Debugging"
+     :message "Preparing debug session..."
+     :percent 0))
+  
   ;; Ensure scheme and project root are loaded first
   (xcode-project-scheme)
   (xcode-project-project-root)
@@ -1541,6 +1614,12 @@ based on `swift-development--device-choice'."
                                           "codelldb"))
          (lldb-path "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Versions/A/LLDB"))
 
+    ;; Update progress
+    (when (fboundp 'swift-notification-progress-update)
+      (swift-notification-progress-update 'debug-session
+                                          :percent 20
+                                          :message "Configuring debugger..."))
+
     (if is-device
         ;; Physical device debugging
         (xcode-project-setup-dape-device app-bundle-id project-cwd codelldb-path lldb-path)
@@ -1555,6 +1634,13 @@ CODELLDB-PATH is path to the CodeLLDB adapter.
 LLDB-PATH is path to LLDB framework."
   (let ((simulator-id (or (ignore-errors (ios-simulator-simulator-identifier))
                           (error "Failed to get simulator ID"))))
+    
+    ;; Update progress - launching app
+    (when (fboundp 'swift-notification-progress-update)
+      (swift-notification-progress-update 'debug-session
+                                          :percent 40
+                                          :message "Launching app on simulator..."))
+    
     (add-to-list 'dape-configs
                  `(ios-simulator
                    modes (swift-mode swift-ts-mode)
@@ -1588,12 +1674,22 @@ LLDB-PATH is path to LLDB framework."
                    :type "lldb"
                    :request "attach"
                    :cwd "."))
+    
+    ;; Update progress - attaching debugger
+    (when (fboundp 'swift-notification-progress-update)
+      (swift-notification-progress-update 'debug-session
+                                          :percent 70
+                                          :message "Attaching debugger..."))
+    
     ;; Start dape with simulator configuration
-    (swift-notification-send :message (format "Starting debugger on simulator: %s" simulator-id)
-                             :seconds 3)
     (let ((config (copy-tree (cdr (assq 'ios-simulator dape-configs)))))
       (if config
-          (dape config)
+          (progn
+            ;; Setup hook to finish progress when dape actually attaches
+            (xcode-project--setup-dape-progress-hooks)
+            (dape config))
+        (when (fboundp 'swift-notification-progress-cancel)
+          (swift-notification-progress-cancel 'debug-session))
         (error "Failed to setup simulator dape configuration")))))
 
 (defun xcode-project-setup-dape-device (app-bundle-id project-cwd codelldb-path lldb-path)
@@ -1612,26 +1708,38 @@ LLDB-PATH is path to LLDB framework (unused for device, kept for signature)."
 
     ;; Check if lldb-dap exists
     (unless (file-executable-p lldb-dap-path)
+      (when (fboundp 'swift-notification-progress-cancel)
+        (swift-notification-progress-cancel 'debug-session))
       (error "lldb-dap not found at %s. Device debugging requires Xcode 16+" lldb-dap-path))
 
     ;; First, terminate any existing instance
-    (swift-notification-send :message (format "Terminating app on %s..." device-name)
-                             :seconds 2)
-    (shell-command-to-string
+    (when (fboundp 'swift-notification-progress-update)
+      (swift-notification-progress-update 'debug-session
+                                          :percent 30
+                                          :message (format "Terminating app on %s..." device-name)))
+    (swift-async-run-sync
      (format "xcrun devicectl device process terminate --device %s %s 2>/dev/null"
              (shell-quote-argument device-id)
-             (shell-quote-argument app-bundle-id)))
+             (shell-quote-argument app-bundle-id))
+     :timeout 10)
 
     ;; Launch app in stopped state and get PID
-    (swift-notification-send :message (format "Launching app on %s for debugging..." device-name)
-                             :seconds 2)
+    (when (fboundp 'swift-notification-progress-update)
+      (swift-notification-progress-update 'debug-session
+                                          :percent 50
+                                          :message (format "Launching app on %s..." device-name)))
     (let ((pid (ios-device-launch-for-debug :device-id device-id
                                             :app-identifier app-bundle-id)))
       (unless pid
+        (when (fboundp 'swift-notification-progress-cancel)
+          (swift-notification-progress-cancel 'debug-session))
         (error "Failed to launch app on device. Make sure the app is installed"))
 
-      (swift-notification-send :message (format "Attaching debugger to PID %s..." pid)
-                               :seconds 3)
+      ;; Update progress - attaching debugger
+      (when (fboundp 'swift-notification-progress-update)
+        (swift-notification-progress-update 'debug-session
+                                            :percent 70
+                                            :message (format "Attaching debugger to PID %s..." pid)))
 
       ;; Setup dape config for device using lldb-dap with device commands
       ;; lldb-dap is Xcode's native DAP server that supports device debugging
@@ -1655,7 +1763,12 @@ LLDB-PATH is path to LLDB framework (unused for device, kept for signature)."
       ;; Start dape with device configuration
       (let ((config (copy-tree (cdr (assq 'ios-device dape-configs)))))
         (if config
-            (dape config)
+            (progn
+              ;; Setup hook to finish progress when dape actually attaches
+              (xcode-project--setup-dape-progress-hooks)
+              (dape config))
+          (when (fboundp 'swift-notification-progress-cancel)
+            (swift-notification-progress-cancel 'debug-session))
           (error "Failed to setup device dape configuration"))))))
 
 
@@ -2188,10 +2301,10 @@ Also checks for and handles compile.lock errors that can halt builds."
   "Kill all xcodebuild processes system-wide.
 Returns the number of processes killed."
   (interactive)
-  (let ((killed-count 0))
+  (let ((killed-count 0)
+        (pgrep-output (swift-async-run-sync "pgrep -f xcodebuild" :timeout 3)))
     ;; Kill all xcodebuild processes
-    (dolist (pid (split-string 
-                  (shell-command-to-string "pgrep -f xcodebuild") "\n" t))
+    (dolist (pid (split-string (or pgrep-output "") "\n" t))
       (when (string-match-p "^[0-9]+$" pid)
         (condition-case nil
             (progn
@@ -2204,14 +2317,14 @@ Returns the number of processes killed."
     (when (> killed-count 0)
       (run-with-timer 3 nil
                       (lambda ()
-                        (dolist (pid (split-string 
-                                      (shell-command-to-string "pgrep -f xcodebuild") "\n" t))
-                          (when (string-match-p "^[0-9]+$" pid)
-                            (condition-case nil
-                                (progn
-                                  (call-process "kill" nil nil nil "-KILL" pid)
-                                  (message "Force killed stubborn xcodebuild process %s" pid))
-                              (error nil)))))))
+                        (let ((pgrep-output (swift-async-run-sync "pgrep -f xcodebuild" :timeout 3)))
+                          (dolist (pid (split-string (or pgrep-output "") "\n" t))
+                            (when (string-match-p "^[0-9]+$" pid)
+                              (condition-case nil
+                                  (progn
+                                    (call-process "kill" nil nil nil "-KILL" pid)
+                                    (message "Force killed stubborn xcodebuild process %s" pid))
+                                (error nil))))))))
     
     (when (called-interactively-p 'interactive)
       (if (> killed-count 0)
@@ -2286,6 +2399,10 @@ Returns the number of processes killed."
    [("i" "Show project info" xcode-project-show-project-info)
     ("D" "Debug build folder" xcode-project-debug-build-folder-detection)
     ("s" "Build status" xcode-project-build-status)]]
+  ["Scheme Selection"
+   [("S" "Select build scheme" xcode-project-select-scheme)
+    ("T" "Select test scheme" xcode-project-select-test-scheme)]
+   [("r" "Reset project state" xcode-project-reset)]]
   ["Build Control"
    [("k" "Interrupt build" xcode-project-interrupt-build)
     ("K" "Kill all xcodebuild" xcode-project-kill-all-xcodebuild-processes)
@@ -2294,8 +2411,7 @@ Returns the number of processes killed."
     ("g" "Toggle debug mode" xcode-project-toggle-debug)]]
   ["Cache Management"
    [("c" "Clear build folder cache" xcode-project-clear-build-folder-cache)
-    ("C" "Cache diagnostics" xcode-project-cache-diagnostics)]
-   [("r" "Reset project state" xcode-project-reset)]]
+    ("C" "Cache diagnostics" xcode-project-cache-diagnostics)]]
   ["Build Server (LSP)"
    [("b" "Regenerate BSP config" xcodebuildserver-regenerate-configuration)
     ("B" "Ensure build_root" xcodebuildserver-ensure-build-root)]]

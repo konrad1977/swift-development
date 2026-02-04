@@ -8,11 +8,18 @@
 
 ;;; Commentary:
 
-;; Provides comprehensive error handling and recovery for Swift/Xcode development
+;; DEPRECATED: This module is not currently integrated with the build system.
+;; It provides error handling infrastructure (error logging, retry logic,
+;; environment validation) but these features are not connected to the
+;; actual build and run commands in swift-development.el.
+;;
+;; The error handling in swift-development.el uses condition-case directly.
+;; This module may be integrated in the future or removed.
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'swift-async)
 
 (defgroup swift-error-handler nil
   "Error handling for Swift development tools."
@@ -204,18 +211,17 @@ Note: This is now non-blocking and uses timers for delays."
   (let ((issues '()))
     
     ;; Check Xcode installation
-    (condition-case nil
-        (shell-command-to-string "xcode-select -p")
-      (error (push "Xcode command line tools not installed" issues)))
+    (unless (swift-async-run-sync "xcode-select -p" :timeout 5)
+      (push "Xcode command line tools not installed" issues))
     
     ;; Check simulator availability
-    (when (string-empty-p (shell-command-to-string "xcrun simctl list devices available"))
-      (push "No available simulators found" issues))
+    (let ((simctl-output (swift-async-run-sync "xcrun simctl list devices available" :timeout 10)))
+      (when (or (null simctl-output) (string-empty-p simctl-output))
+        (push "No available simulators found" issues)))
     
     ;; Check Swift version
-    (condition-case nil
-        (shell-command-to-string "swift --version")
-      (error (push "Swift not found in PATH" issues)))
+    (unless (swift-async-run-sync "swift --version" :timeout 5)
+      (push "Swift not found in PATH" issues))
     
     ;; Report results
     (if issues
@@ -224,7 +230,7 @@ Note: This is now non-blocking and uses timers for delays."
             (erase-buffer)
             (insert "Swift Development Environment Issues:\n\n")
             (dolist (issue issues)
-              (insert (format "• %s\n" issue)))
+              (insert (format "- %s\n" issue)))
             (insert "\nSuggested fixes:\n")
             (when (member "Xcode command line tools not installed" issues)
               (insert "  Run: xcode-select --install\n"))

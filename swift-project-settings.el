@@ -19,6 +19,7 @@
 ;;
 ;; Settings File Format (.swift-development/settings):
 ;; (:scheme "Bruce (Development)"
+;;  :test-scheme "KYCTests"              ; Separate scheme for testing
 ;;  :device-name "iPhone 15 Pro"
 ;;  :device-id "ABC-123"
 ;;  :platform "iOS Simulator"
@@ -487,6 +488,24 @@ IMPORTANT: Device-specific settings are ONLY saved to scheme-specific files."
         (when swift-project-settings-debug
           (message "[Settings] Saved last-scheme: %s (cleaned base settings)" current-scheme))))))
 
+;;; Test Scheme Management
+
+(defun swift-project-settings-test-scheme (project-root)
+  "Get the saved test scheme for PROJECT-ROOT.
+Returns nil if no test scheme has been saved."
+  (let ((settings (swift-project-settings-load project-root nil)))
+    (plist-get settings :test-scheme)))
+
+(defun swift-project-settings-set-test-scheme (project-root scheme)
+  "Set SCHEME as the test scheme for PROJECT-ROOT.
+This is saved to the base settings file (not scheme-specific)."
+  (let ((settings (or (swift-project-settings-load project-root nil) (list))))
+    (setq settings (plist-put settings :test-scheme scheme))
+    (swift-project-settings-save project-root settings nil)
+    (when swift-project-settings-debug
+      (message "[Settings] Saved test-scheme: %s" scheme))
+    scheme))
+
 ;;; Diagnostics
 
 (defun swift-project-settings-show-diagnostics ()
@@ -521,10 +540,14 @@ IMPORTANT: Device-specific settings are ONLY saved to scheme-specific files."
           (insert (format "Scheme Settings File: %s\n"
                          (swift-project-settings--settings-file project-root last-scheme))))
 
+        ;; Show test-scheme from base settings (separate from build scheme)
+        (let ((test-scheme (plist-get base-settings :test-scheme)))
+          (insert (format "\nTest Scheme: %s\n" (or test-scheme "(not set)"))))
+
         (if settings
             (progn
-              (insert "\n=== Current Settings ===\n")
-              (insert (format "Scheme: %s\n" (or (plist-get settings :scheme) last-scheme)))
+              (insert "\n=== Current Build Settings ===\n")
+              (insert (format "Build Scheme: %s\n" (or (plist-get settings :scheme) last-scheme)))
               (insert (format "Device Name: %s\n" (plist-get settings :device-name)))
               (insert (format "Device ID: %s\n" (plist-get settings :device-id)))
               (insert (format "Platform: %s\n" (plist-get settings :platform)))

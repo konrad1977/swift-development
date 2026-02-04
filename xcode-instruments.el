@@ -14,6 +14,7 @@
 ;;; Code:
 
 (require 'transient)
+(require 'swift-async)
 (require 'xcode-project nil t)
 (require 'ios-simulator nil t)
 (require 'ios-device nil t)
@@ -61,14 +62,24 @@ Set to 0 for unlimited recording."
 (defun xcode-instruments-list-templates ()
   "List available Instruments templates."
   (interactive)
-  (let ((output (shell-command-to-string "xcrun xctrace list templates 2>/dev/null")))
-    (with-current-buffer (get-buffer-create "*Instruments Templates*")
+  (let ((buffer (get-buffer-create "*Instruments Templates*")))
+    (with-current-buffer buffer
       (erase-buffer)
       (insert "Available Instruments Templates:\n")
       (insert "================================\n\n")
-      (insert output)
-      (goto-char (point-min))
-      (display-buffer (current-buffer)))))
+      (insert "Loading...\n"))
+    (display-buffer buffer)
+    (swift-async-run
+     "xcrun xctrace list templates 2>/dev/null"
+     (lambda (output)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (erase-buffer)
+           (insert "Available Instruments Templates:\n")
+           (insert "================================\n\n")
+           (insert (or output "Failed to list templates"))
+           (goto-char (point-min)))))
+     :timeout 10)))
 
 ;;;###autoload
 (defun xcode-instruments-run (template)

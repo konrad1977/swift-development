@@ -75,16 +75,22 @@
     (ignore attributes)  ; Suppress unused variable warning
     (message "%s %s" (or tag "") (or text ""))))
 
-(unless (fboundp 'periphery-toggle-buffer)
-  (defun periphery-toggle-buffer ()
-    "Fallback when periphery is not installed."
-    (interactive)
+;; Declare periphery functions - they will be loaded on demand
+(declare-function periphery-toggle-buffer "periphery" nil)
+(declare-function periphery-transient "periphery" nil)
+
+(defun swift-development--periphery-toggle-buffer ()
+  "Toggle periphery buffer, or show message if not available."
+  (interactive)
+  (if (fboundp 'periphery-toggle-buffer)
+      (call-interactively #'periphery-toggle-buffer)
     (message "Periphery package is not installed")))
 
-(unless (fboundp 'periphery-transient)
-  (defun periphery-transient ()
-    "Fallback when periphery is not installed."
-    (interactive)
+(defun swift-development--periphery-transient ()
+  "Open periphery transient menu, or show message if not available."
+  (interactive)
+  (if (fboundp 'periphery-transient)
+      (call-interactively #'periphery-transient)
     (message "Periphery package is not installed")))
 
 (defgroup swift-additions nil
@@ -732,9 +738,13 @@ Returns a cons cell (PROCESS . LOG-BUFFER) where LOG-BUFFER accumulates the buil
                                                         (insert "\nBUILD SUCCEEDED\n"))))
                                                   ;; Update progress to 60% (build done, ready for install)
                                                   (setq swift-development--current-build-progress 60)
-                                                  (when (fboundp 'swift-notification-progress-update)
-                                                    (swift-notification-progress-update
-                                                     'swift-build :percent 60 :message "Build complete"))
+                                                  ;; Use run-with-timer to avoid "call-process recursively"
+                                                  (run-with-timer
+                                                   0 nil
+                                                   (lambda ()
+                                                     (when (fboundp 'swift-notification-progress-update)
+                                                       (swift-notification-progress-update
+                                                        'swift-build :percent 60 :message "Build complete"))))
                                                   ;; Run xcode-build-server parse asynchronously
                                                   (swift-development-run-xcode-build-server-parse output)
                                                   (when (and callback (functionp callback))
@@ -742,9 +752,12 @@ Returns a cons cell (PROCESS . LOG-BUFFER) where LOG-BUFFER accumulates the buil
                                                   (swift-development-cleanup))
                                               (progn
                                                 (setq swift-development--last-build-succeeded 'failed)
-                                                ;; Cancel progress bar on failure
-                                                (when (fboundp 'swift-notification-progress-cancel)
-                                                  (swift-notification-progress-cancel 'swift-build))
+                                                ;; Cancel progress bar on failure (use timer to avoid recursive call-process)
+                                                (run-with-timer
+                                                 0 nil
+                                                 (lambda ()
+                                                   (when (fboundp 'swift-notification-progress-cancel)
+                                                     (swift-notification-progress-cancel 'swift-build))))
                                                 (when (buffer-live-p output-buffer)
                                                   (with-current-buffer output-buffer
                                                     (let ((inhibit-read-only t))
@@ -782,25 +795,29 @@ Returns a cons cell (PROCESS . LOG-BUFFER) where LOG-BUFFER accumulates the buil
                                           (goto-char (point-max))
                                           (recenter -1))))))
                                 ;; Update progress bar based on build phase (only if going forward)
-                                (when (fboundp 'swift-notification-progress-update)
-                                  (let ((new-progress nil)
-                                        (new-message nil))
-                                    (cond
-                                     ((string-match-p "Compiling\\|CompileC\\|CompileSwift" string)
-                                      (setq new-progress 15 new-message "Compiling..."))
-                                     ((string-match-p "Linking\\|Ld " string)
-                                      (setq new-progress 40 new-message "Linking..."))
-                                     ((string-match-p "CodeSign\\|Signing" string)
-                                      (setq new-progress 50 new-message "Signing..."))
-                                     ((string-match-p "Touch\\|CpResource\\|ProcessInfoPlist" string)
-                                      (setq new-progress 55 new-message "Finishing...")))
-                                    ;; Only update if new progress is higher than current
-                                    (when (and new-progress
-                                               (> new-progress swift-development--current-build-progress))
-                                      (setq swift-development--current-build-progress new-progress)
-                                      (swift-notification-progress-update 'swift-build
-                                                                          :percent new-progress
-                                                                          :message new-message))))
+                                ;; Use run-with-timer to avoid "call-process recursively" in filter
+                                (let ((new-progress nil)
+                                      (new-message nil))
+                                  (cond
+                                   ((string-match-p "Compiling\\|CompileC\\|CompileSwift" string)
+                                    (setq new-progress 15 new-message "Compiling..."))
+                                   ((string-match-p "Linking\\|Ld " string)
+                                    (setq new-progress 40 new-message "Linking..."))
+                                   ((string-match-p "CodeSign\\|Signing" string)
+                                    (setq new-progress 50 new-message "Signing..."))
+                                   ((string-match-p "Touch\\|CpResource\\|ProcessInfoPlist" string)
+                                    (setq new-progress 55 new-message "Finishing...")))
+                                  ;; Only update if new progress is higher than current
+                                  (when (and new-progress
+                                             (> new-progress swift-development--current-build-progress))
+                                    (setq swift-development--current-build-progress new-progress)
+                                    (run-with-timer
+                                     0 nil
+                                     (lambda ()
+                                       (when (fboundp 'swift-notification-progress-update)
+                                         (swift-notification-progress-update 'swift-build
+                                                                             :percent new-progress
+                                                                             :message new-message))))))
                                 ;; Call update callback if provided
                                 (when (and update-callback (functionp update-callback))
                                   (funcall update-callback string))))
@@ -1234,17 +1251,10 @@ Excludes paths matching patterns in swift-development-ignore-paths."
          (patterns (swift-development--build-find-patterns))
          (excludes (swift-development--build-find-excludes))
          (find-cmd (format "find . \\( %s \\) %s -type f" patterns excludes)))
-    (if (and cache-key (fboundp 'swift-cache-with))
-        (swift-cache-with cache-key swift-development-cache-ttl
-          (let ((default-directory project-root))
-            (split-string
-             (shell-command-to-string find-cmd)
-             "\n" t)))
-      ;; Fallback without cache
-      (let ((default-directory (xcode-project-project-root)))
-        (split-string
-         (shell-command-to-string find-cmd)
-         "\n" t)))))
+    (swift-cache-with cache-key swift-development-cache-ttl
+      (let ((default-directory project-root)
+            (output (swift-async-run-sync find-cmd :timeout 30)))
+        (split-string (or output "") "\n" t)))))
 
 (defun swift-development-find-all-source-files-async (callback)
   "Find all source files in project asynchronously.
@@ -1275,25 +1285,17 @@ Excludes paths matching patterns in swift-development-ignore-paths."
   "Run find command asynchronously and call CALLBACK with results.
 PROJECT-ROOT is the root directory, FIND-CMD is the find command.
 CACHE-KEY if non-nil will be used to cache results."
-  (let ((default-directory project-root)
-        (output-buffer (generate-new-buffer " *swift-find-temp*")))
-    (make-process
-     :name "swift-find-files"
-     :command (list "sh" "-c" find-cmd)
-     :noquery t
-     :buffer output-buffer
-     :sentinel
-     (lambda (proc _event)
-       (when (eq (process-status proc) 'exit)
-         (when (buffer-live-p (process-buffer proc))
-           (with-current-buffer (process-buffer proc)
-             (let ((files (split-string (buffer-string) "\n" t)))
-               (when (and cache-key (fboundp 'swift-cache-set))
-                 (swift-cache-set cache-key files 60))
-               (when swift-development-debug
-                 (message "Found %d source files asynchronously" (length files)))
-               (funcall callback files)))
-           (kill-buffer (process-buffer proc))))))))
+  (let ((default-directory project-root))
+    (swift-async-run
+     find-cmd
+     (lambda (output)
+       (let ((files (split-string (or output "") "\n" t)))
+         (when cache-key
+           (swift-cache-set cache-key files 60))
+         (when swift-development-debug
+           (message "Found %d source files asynchronously" (length files)))
+         (funcall callback files)))
+     :timeout 30)))
 
 
 (defun swift-development-get-built-app-path ()
@@ -1328,7 +1330,7 @@ Uses find + stat for fast detection (0.1-0.5s for 1000+ files)."
          (cmd (format "find . \\( %s \\) %s -exec stat -f \"%%m %%N\" {} + 2>/dev/null | sort -rn | head -1"
                      patterns
                      (or ignore-patterns "")))
-         (output (string-trim (shell-command-to-string cmd))))
+         (output (string-trim (or (swift-async-run-sync cmd :timeout 10) ""))))
 
     (when swift-development-debug
       (message "[Last-Modified] Command: %s" cmd)
@@ -1657,9 +1659,9 @@ Returns the configuration name or 'Debug' as fallback."
   "Try to detect a reasonable configuration from available build settings."
   (condition-case nil
       (let* ((project-root (xcode-project-project-root))
-             (output (shell-command-to-string
-                      (format "cd '%s' && xcodebuild -list -json 2>/dev/null | grep -A 10 configurations"
-                              project-root))))
+             (cmd (format "cd '%s' && xcodebuild -list -json 2>/dev/null | grep -A 10 configurations"
+                          project-root))
+             (output (or (swift-async-run-sync cmd :timeout 10) "")))
         ;; Look for common development configurations
         (cond
          ((string-match "Release (Development)" output) "Release (Development)")
@@ -2319,7 +2321,7 @@ This is the fastest way to rebuild after small changes."
       ;; Swift toolchain
       (princ "\nSwift Toolchain:\n")
       (princ "---------------\n")
-      (let ((swift-version (shell-command-to-string "swift --version")))
+      (let ((swift-version (or (swift-async-run-sync "swift --version" :timeout 5) "Unknown")))
         (princ swift-version))
 
       ;; System info
@@ -2667,7 +2669,7 @@ even when some files have errors, showing all errors at once."
     ("X" "Clear DerivedData" swift-development-clear-derived-data)
     ("R" "Reset all" swift-development-reset)]]
   ["Windows"
-   [("W p" "Toggle Periphery" periphery-toggle-buffer)
+   [    ("W p" "Toggle Periphery" swift-development--periphery-toggle-buffer)
     ("W o" "Toggle Build Output" swift-development-toggle-build-output-buffer)
     ("W s" "Toggle Simulator Log" ios-simulator-toggle-buffer)]]
   ["Packages"
@@ -2682,14 +2684,16 @@ even when some files have errors, showing all errors at once."
    [("v" "Preview..." swiftui-preview-transient)
     ("x" "Xcode Project..." xcode-project-transient)
     ("f" "Refactor..." swift-refactor-transient)
-    ("E" "Errors (Periphery)..." periphery-transient)
+    ("E" "Errors (Periphery)..." swift-development--periphery-transient)
     ("S" "Settings..." swift-development-settings-transient)]]
   ["Quick Settings"
    [("D" "Toggle debug" swift-development-toggle-debug)
     ("A" "Toggle analysis" swift-development-toggle-analysis-mode)
     ("T" "Toggle device/sim" swift-development-toggle-device-choice)
     ("O" "Toggle build output" swift-development-toggle-build-output)
-    ("e" "Toggle continue after errors" swift-development-toggle-continue-after-errors)]]
+    ("e" "Toggle continue after errors" swift-development-toggle-continue-after-errors)]
+   [("M-s" "Select build scheme" xcode-project-select-scheme)
+    ("M-t" "Select test scheme" xcode-project-select-test-scheme)]]
   [("Q" "Quit" transient-quit-one)])
 
 (provide 'swift-development)

@@ -8,7 +8,12 @@
 
 ;;; Commentary:
 
-;; Run project using Xcode with optimized build settings
+;; DEPRECATED: This module is not currently integrated with the main build system.
+;; It provides functions to control Xcode.app via AppleScript, but the main build
+;; workflow uses xcodebuild directly (see swift-development.el).
+;;
+;; These functions are kept for users who prefer building through Xcode.app UI.
+;; WARNING: All functions use synchronous shell commands which block Emacs.
 
 ;;; Code:
 

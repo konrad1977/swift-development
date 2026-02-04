@@ -8,13 +8,21 @@
 
 ;;; Commentary:
 
-;; Provides SwiftUI preview, test coverage, and other advanced features
+;; DEPRECATED: This module is experimental and not integrated with the main package.
+;; It provides SwiftUI preview, test coverage, and other advanced features that
+;; are either not complete or have been implemented elsewhere.
+;;
+;; For SwiftUI preview, use swiftui-preview.el instead.
+;; For test features, use swift-test-explorer.el instead.
+;;
+;; This module may be removed in a future version.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'xcode-project nil t)
 (require 'swift-cache nil t)
+(require 'swift-async nil t)
 
 (defgroup swift-features nil
   "Advanced features for Swift development."
@@ -86,10 +94,14 @@
     (if (file-exists-p result-bundle)
         (progn
           (message "Parsing coverage results...")
-          (let ((coverage-output 
-                 (shell-command-to-string 
-                  (format "xcrun xcresulttool get --format json --path %s" result-bundle))))
-            (swift-features-display-coverage-summary coverage-output)))
+          (let ((cmd (format "xcrun xcresulttool get --format json --path %s" result-bundle)))
+            (if (fboundp 'swift-async-run)
+                (swift-async-run cmd
+                                 #'swift-features-display-coverage-summary
+                                 :timeout 30)
+              ;; Fallback if swift-async not loaded
+              (swift-features-display-coverage-summary
+               (shell-command-to-string cmd)))))
       (message "No test results found"))))
 
 (defun swift-features-display-coverage-summary (json-output)
