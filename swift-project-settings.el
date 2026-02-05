@@ -440,11 +440,12 @@ IMPORTANT: Device-specific settings are ONLY saved to scheme-specific files."
                  current-simulator-id)
         (setq settings (plist-put settings :device-id current-simulator-id)))
 
-      ;; Always save platform - not just when device-choice is t
-      (setq settings (plist-put settings :platform
-                                (if swift-development--device-choice
-                                    "Physical Device"
-                                  "iOS Simulator")))
+      ;; Save platform - but only if a choice has been made (not 'unset)
+      (unless (eq swift-development--device-choice 'unset)
+        (setq settings (plist-put settings :platform
+                                  (if (eq swift-development--device-choice t)
+                                      "Physical Device"
+                                    "iOS Simulator"))))
 
       (when xcode-project--current-build-configuration
         (setq settings (plist-put settings :build-config xcode-project--current-build-configuration)))
@@ -592,7 +593,8 @@ Returns relative filename or nil."
   "Fetch build info from xcodebuild for PROJECT-ROOT, SCHEME and SDK.
 SDK should be \"iphonesimulator\" or \"iphoneos\".
 Calls CALLBACK with the updated settings plist when done.
-Extracts: TARGET_BUILD_DIR, PRODUCT_NAME, PRODUCT_BUNDLE_IDENTIFIER.
+Extracts: TARGET_BUILD_DIR, PRODUCT_NAME, PRODUCT_BUNDLE_IDENTIFIER,
+IPHONEOS_DEPLOYMENT_TARGET, SWIFT_MODULE_NAME, ENABLE_TESTABILITY.
 
 This is the ONLY source of truth for build paths. No guessing."
   (unless swift-project-settings--fetch-in-progress
@@ -644,11 +646,14 @@ This is the ONLY source of truth for build paths. No guessing."
                  
                  (if (and json-data (> (length json-data) 0))
                      (let* ((build-settings (let-alist (seq-elt json-data 0) .buildSettings))
-                            (target-build-dir (alist-get 'BUILT_PRODUCTS_DIR build-settings))
-                            (product-name (alist-get 'PRODUCT_NAME build-settings))
-                            (bundle-id (alist-get 'PRODUCT_BUNDLE_IDENTIFIER build-settings))
-                            (build-config (alist-get 'CONFIGURATION build-settings))
-                            (app-path (when (and target-build-dir product-name)
+                             (target-build-dir (alist-get 'BUILT_PRODUCTS_DIR build-settings))
+                             (product-name (alist-get 'PRODUCT_NAME build-settings))
+                             (bundle-id (alist-get 'PRODUCT_BUNDLE_IDENTIFIER build-settings))
+                             (build-config (alist-get 'CONFIGURATION build-settings))
+                             (deployment-target (alist-get 'IPHONEOS_DEPLOYMENT_TARGET build-settings))
+                             (swift-module-name (alist-get 'SWIFT_MODULE_NAME build-settings))
+                             (enable-testability (alist-get 'ENABLE_TESTABILITY build-settings))
+                             (app-path (when (and target-build-dir product-name)
                                         (expand-file-name 
                                          (concat product-name ".app")
                                          target-build-dir)))
@@ -666,10 +671,17 @@ This is the ONLY source of truth for build paths. No guessing."
                          (setq updated (plist-put updated :product-name product-name)))
                        (when bundle-id
                          (setq updated (plist-put updated :bundle-id bundle-id)))
-                       (when build-config
-                         (setq updated (plist-put updated :build-config build-config)))
-                       (when app-path
-                         (setq updated (plist-put updated :app-path app-path)))
+                        (when build-config
+                          (setq updated (plist-put updated :build-config build-config)))
+                        (when deployment-target
+                          (setq updated (plist-put updated :deployment-target deployment-target)))
+                        (when swift-module-name
+                          (setq updated (plist-put updated :swift-module-name swift-module-name)))
+                        (when enable-testability
+                          (setq updated (plist-put updated :enable-testability
+                                                   (equal enable-testability "YES"))))
+                        (when app-path
+                          (setq updated (plist-put updated :app-path app-path)))
                        
                        ;; Save to disk
                        (swift-project-settings-save project-root updated scheme)
@@ -716,6 +728,24 @@ Returns nil if not cached."
   "Get cached product name for PROJECT-ROOT and SCHEME."
   (let ((settings (swift-project-settings-load project-root scheme)))
     (plist-get settings :product-name)))
+
+(defun swift-project-settings-get-deployment-target (project-root scheme)
+  "Get cached iOS deployment target for PROJECT-ROOT and SCHEME.
+Returns version string like \"17.6\" or nil if not cached."
+  (let ((settings (swift-project-settings-load project-root scheme)))
+    (plist-get settings :deployment-target)))
+
+(defun swift-project-settings-get-swift-module-name (project-root scheme)
+  "Get cached Swift module name for PROJECT-ROOT and SCHEME.
+Returns module name string or nil if not cached."
+  (let ((settings (swift-project-settings-load project-root scheme)))
+    (plist-get settings :swift-module-name)))
+
+(defun swift-project-settings-get-testability (project-root scheme)
+  "Get cached testability setting for PROJECT-ROOT and SCHEME.
+Returns t if ENABLE_TESTABILITY=YES, nil otherwise."
+  (let ((settings (swift-project-settings-load project-root scheme)))
+    (plist-get settings :enable-testability)))
 
 (provide 'swift-project-settings)
 ;;; swift-project-settings.el ends here

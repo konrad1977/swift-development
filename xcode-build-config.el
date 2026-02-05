@@ -77,6 +77,16 @@ For hot reload with Inject/InjectionIII, set to '(\"-Xlinker\" \"-interposable\"
   :type 'boolean
   :group 'xcode-build-config)
 
+(defcustom xcode-build-config-enable-testability t
+  "Enable testability for @testable imports in SwiftUI previews.
+When non-nil, modules are built with ENABLE_TESTABILITY=YES which allows
+accessing internal types via @testable import.  This is required for
+SwiftUI preview to work with internal (non-public) views.
+Enabled by default to avoid needing a double-build on first preview.
+Note: Enabling this may slightly increase build time and binary size."
+  :type 'boolean
+  :group 'xcode-build-config)
+
 (defcustom xcode-build-config-skip-package-resolution 'auto
   "Control Swift package dependency resolution during builds.
 - 'auto: Automatically detect if packages need resolution (recommended)
@@ -519,7 +529,8 @@ If FOR-DEVICE is non-nil, setup for device build (with signing), otherwise for s
     (insert "ENABLE_BITCODE = NO\n")
     (insert "CODE_SIGNING_REQUIRED = NO\n")
     (insert "CODE_SIGN_IDENTITY = \"\"\n")
-    (insert "ENABLE_TESTABILITY = NO\n")
+    (insert (format "ENABLE_TESTABILITY = %s\n"
+                    (if xcode-build-config-enable-testability "YES" "NO")))
     (insert "ENABLE_PREVIEWS = NO\n")
     (insert "ENABLE_ADDRESS_SANITIZER = NO\n")
     (insert "ENABLE_THREAD_SANITIZER = NO\n")
@@ -636,7 +647,9 @@ DERIVED-PATH is the derived data path."
                         "SWIFTPM_ENABLE_BUILD_CACHES=1"
                         "COMPILER_INDEX_STORE_ENABLE=NO"
                         "ONLY_ACTIVE_ARCH=YES"
-                        "ENABLE_TESTABILITY=NO"
+                        (if xcode-build-config-enable-testability
+                            "ENABLE_TESTABILITY=YES"
+                          "ENABLE_TESTABILITY=NO")
                         "ENABLE_BITCODE=NO"
                         "DEBUG_INFORMATION_FORMAT=dwarf"
                         "RUN_CLANG_STATIC_ANALYZER=NO"
@@ -677,7 +690,9 @@ DERIVED-PATH is the derived data path."
     "SWIFTPM_ENABLE_BUILD_CACHES=1"
     "COMPILER_INDEX_STORE_ENABLE=NO"
     "ONLY_ACTIVE_ARCH=YES"
-    "ENABLE_TESTABILITY=NO"
+    ,(if xcode-build-config-enable-testability
+         "ENABLE_TESTABILITY=YES"
+       "ENABLE_TESTABILITY=NO")
     "ENABLE_BITCODE=NO"
     "DEBUG_INFORMATION_FORMAT=dwarf"
     ;; Conservative optimizations that shouldn't break packages

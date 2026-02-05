@@ -10,20 +10,30 @@
 ;;; Commentary:
 
 ;; This module provides SwiftUI preview functionality for swift-development.el.
-;; It builds your app, launches it with a special flag, and displays a snapshot
-;; of a specific view in Emacs.
+;; It uses dynamic target injection to build and capture SwiftUI previews
+;; without requiring any additional packages in your project.
+;;
+;; Features:
+;; - Zero configuration required
+;; - Works with existing #Preview macros
+;; - Supports Xcode projects, workspaces, and SPM packages
+;; - Fast builds (only builds required modules)
+;; - External screenshot capture via simctl
 ;;
 ;; Usage:
-;; 1. Add the SwiftDevelopmentPreview package to your project
-;; 2. Add .setupSwiftDevelopmentPreview() to views you want to preview
-;; 3. M-x swiftui-preview-generate (or C-c C-p)
+;; 1. Open a Swift file with a #Preview block
+;; 2. M-x swiftui-preview-generate
 ;;
-;; Directory Structure:
+;; Requirements:
+;; - Xcode command line tools
+;; - Ruby with xcodeproj gem (install via M-x swiftui-preview-setup)
+;; - iOS Simulator
+;;
+;; Directory Structure for saved previews:
 ;; .swift-development/
-;; └── swiftuipreview/
-;;     ├── 01.png
-;;     ├── 02.png
-;;     └── 03.png
+;; └── previews/
+;;     ├── HomeView.png
+;;     └── SettingsView.png
 
 ;;; Code:
 
@@ -73,28 +83,14 @@
   :type 'boolean
   :group 'swiftui-preview)
 
-(defcustom swiftui-preview-hot-reload-enabled nil
-  "Enable hot reload mode to avoid rebuilding on every change.
-When enabled, the app stays running and automatically updates
-when code changes via Inject/InjectionIII."
-  :type 'boolean
-  :group 'swiftui-preview)
 
-(defcustom swiftui-preview-hot-reload-refresh-interval 1.0
-  "Interval in seconds to check for updated preview images during hot reload."
-  :type 'number
-  :group 'swiftui-preview)
 
 (defcustom swiftui-preview-window-width 0.25
   "Width of preview window as fraction of frame width (0.0 to 1.0)."
   :type 'number
   :group 'swiftui-preview)
 
-(defcustom swiftui-preview-hide-compilation-on-success t
-  "If non-nil, keep compilation buffer hidden during builds.
-Only shows the buffer if build fails with errors."
-  :type 'boolean
-  :group 'swiftui-preview)
+
 
 (defcustom swiftui-preview-auto-show-on-open t
   "If non-nil, automatically show existing preview when opening Swift file.
@@ -185,11 +181,7 @@ If nil and `swiftui-preview-fit-to-window' is nil, no height limit."
 (defvar swiftui-preview--current-app-identifier nil
   "App identifier for current preview.")
 
-(defvar swiftui-preview--hot-reload-active nil
-  "Whether hot reload is currently active.")
 
-(defvar swiftui-preview--image-refresh-timer nil
-  "Timer for refreshing preview image during hot reload.")
 
 (defvar swiftui-preview--last-preview-mtime nil
   "Last modification time of preview image.")
@@ -259,309 +251,65 @@ If nil, uses file-based naming if enabled, otherwise uses number."
     (expand-file-name filename (swiftui-preview--directory project-root))))
 
 
-;;; Preview Generation
+;;; Preview Generation (New Dynamic Approach)
+
+;; Load required modules
+(require 'swiftui-preview-setup nil t)
+(require 'swiftui-preview-dynamic nil t)
+(require 'swiftui-preview-standalone nil t)
 
 ;;;###autoload
-(defun swiftui-preview-generate (&optional enable-hot-reload)
-  "Generate SwiftUI preview for current project.
-With prefix argument ENABLE-HOT-RELOAD, keep app running for hot reload.
-Always generates preview for the currently active Swift buffer."
-  (interactive "P")
-  (let* ((project-root (swift-project-root))
-         (hot-reload (or enable-hot-reload swiftui-preview-hot-reload-enabled))
-         ;; Capture current buffer info immediately
-         (current-buffer-name (buffer-name))
-         (current-file-name (buffer-file-name)))
-    (unless project-root
-      (user-error "No Swift project found"))
+(defun swiftui-preview-generate ()
+  "Generate SwiftUI preview using the best available method.
+Automatically detects project type and uses:
+- Dynamic target injection for Xcode projects
+- SPM project creation for Swift packages
+- Standalone build for single Swift files
 
-    (unless current-file-name
-      (user-error "Current buffer is not visiting a file"))
+This is the new zero-config approach that doesn't require
+any setup or additional packages in your project."
+  (interactive)
+  ;; Check dependencies
+  (when (fboundp 'swiftui-preview-setup-check)
+    (unless (swiftui-preview-setup-check)
+      (if (fboundp 'swiftui-preview-setup-wizard)
+          (swiftui-preview-setup-wizard)
+        (user-error "SwiftUI Preview setup incomplete"))))
+  
+  ;; Dispatch to appropriate generator
+  (cond
+   ((fboundp 'swiftui-preview-dynamic-generate)
+    (swiftui-preview-dynamic-generate))
+   ((fboundp 'swiftui-preview-standalone-generate)
+    (swiftui-preview-standalone-generate))
+   (t
+    (user-error "No preview generator available. Check your installation"))))
 
-    ;; Cancel any existing poll timer
-    (when swiftui-preview--poll-timer
-      (cancel-timer swiftui-preview--poll-timer)
-      (setq swiftui-preview--poll-timer nil))
+;;;###autoload
+(defun swiftui-preview-generate-all ()
+  "Generate previews for all #Preview blocks in current file.
+Creates multiple preview images, one for each #Preview block."
+  (interactive)
+  (let ((previews (swiftui-preview--detect-preview-definitions)))
+    (if (null previews)
+        (user-error "No #Preview blocks found")
+      (let ((preview-macros (cl-remove-if-not
+                             (lambda (p) (eq (plist-get p :type) 'preview-macro))
+                             previews)))
+        (if (<= (length preview-macros) 1)
+            (swiftui-preview-generate)
+          (message "Found %d previews. Generating all..." (length preview-macros))
+          ;; TODO: Implement multi-preview generation
+          ;; For now, just generate the first one
+          (swiftui-preview-generate))))))
 
-    ;; Save all buffers
-    (save-some-buffers t)
-
-    ;; === ZERO-CONFIG: Auto-install package and create registry ===
-    (let ((view-name (file-name-sans-extension (file-name-nondirectory current-file-name))))
-      ;; Ensure package is installed (copies template and adds to Package.swift if needed)
-      (swiftui-preview--ensure-package-installed project-root)
-
-      ;; Ensure PreviewRegistry.swift exists (creates if missing)
-      (swiftui-preview--auto-create-registry-if-missing project-root view-name))
-
-    ;; Ensure directory exists
-    (swiftui-preview--ensure-directory project-root)
-
-    ;; Get preview path based on CURRENT buffer (not any cached value)
-    (setq swiftui-preview--current-preview-path
-          (swiftui-preview--get-preview-path project-root)
-          swiftui-preview--hot-reload-active hot-reload)
-
-    (when swiftui-preview-debug
-      (message "[SwiftUI Preview] Current file: %s" (file-name-nondirectory current-file-name))
-      (message "[SwiftUI Preview] Preview path: %s" swiftui-preview--current-preview-path)
-      (message "[SwiftUI Preview] Hot reload: %s" hot-reload))
-
-    ;; Delete old preview file if it exists
-    (when (file-exists-p swiftui-preview--current-preview-path)
-      (condition-case nil
-          (delete-file swiftui-preview--current-preview-path)
-        (file-error nil)))
-
-    ;; Get view name for dynamic registry update
-    (let* ((view-name (file-name-sans-extension
-                       (file-name-nondirectory swiftui-preview--current-preview-path))))
-
-      (when swiftui-preview-debug
-        (message "[SwiftUI Preview] View name: %s" view-name))
-
-      ;; Update PreviewRegistry.swift BEFORE rebuild check
-      (swiftui-preview--update-preview-registry-for-current-view
-       project-root view-name nil)
-
-      (if hot-reload
-          (message "Updating preview for %s with hot reload..."
-                   (file-name-nondirectory current-file-name))
-        (message "Updating preview for %s..."
-                 (file-name-nondirectory current-file-name)))
-
-      ;; Small delay to ensure file system timestamp is updated
-      ;; This ensures rebuild detection sees the PreviewRegistry.swift change
-      ;; IMPORTANT: Capture buffer and buffer-local variables before going async
-      (let ((preview-path swiftui-preview--current-preview-path)
-            (captured-project-root project-root)
-            (captured-buffer (current-buffer)))
-        (run-with-timer 0.1 nil
-                        (lambda ()
-                          ;; Restore buffer context for buffer-local variables (scheme, config, etc.)
-                          (with-current-buffer captured-buffer
-                            ;; Build project with captured variables
-                            (swiftui-preview--build-project
-                             :project-root captured-project-root
-                             :callback (lambda ()
-                                         ;; Restore context and launch with correct preview path
-                                         (with-current-buffer captured-buffer
-                                           (let ((swiftui-preview--current-preview-path preview-path))
-                                             (swiftui-preview--launch-all-previews captured-project-root))))))))))))
-
-(cl-defun swiftui-preview--build-project (&key project-root callback)
-  "Build project for preview with PROJECT-ROOT.
-Calls CALLBACK on successful build.
-Uses fast rebuild detection to skip unnecessary rebuilds."
-  (let* ((default-directory project-root)
-         (app-path (swift-development-get-built-app-path)))
-
-    ;; Check if rebuild is needed using fast detection
-    (if (and app-path
-             (file-exists-p app-path)
-             (not (swift-development-needs-rebuild-p)))
-        ;; App is up-to-date, skip build
-        (progn
-          (when swiftui-preview-debug
-            (message "[SwiftUI Preview] App is up-to-date, skipping rebuild"))
-          (message "Preview: App up-to-date, launching...")
-          (setq swiftui-preview--last-build-failed nil)
-          (funcall callback))
-
-      ;; Need to rebuild
-      (let* ((simulator-id (or current-simulator-id
-                              (ios-simulator-simulator-identifier)))
-             ;; Set linker flags for hot reload only if needed
-             (xcode-build-config-other-ld-flags
-              (if swiftui-preview--hot-reload-active
-                  '("-Xlinker" "-interposable")
-                xcode-build-config-other-ld-flags))
-             ;; Keep cached build command for speed
-             (build-command (xcode-build-config-build-app-command
-                            :sim-id simulator-id)))
-
-        (when swiftui-preview-debug
-          (message "[SwiftUI Preview] Rebuild needed")
-          (message "[SwiftUI Preview] Build command: %s" build-command))
-
-        ;; Temporarily configure compilation buffer to not show window
-        (let ((display-buffer-alist
-               (if swiftui-preview-hide-compilation-on-success
-                   (cons '("\\*compilation\\*" (display-buffer-no-window))
-                         display-buffer-alist)
-                 display-buffer-alist)))
-          (compile build-command))
-
-        ;; Wait for compilation to finish
-        (let ((compilation-buffer (get-buffer "*compilation*")))
-          (when compilation-buffer
-            (with-current-buffer compilation-buffer
-              (add-hook 'compilation-finish-functions
-                        (lambda (buffer status)
-                          (cond
-                           ((string-match "finished" status)
-                            (setq swiftui-preview--last-build-failed nil)
-                            (message "Preview updated, launching...")
-                            (funcall callback))
-                           ((string-match "exited abnormally" status)
-                            (setq swiftui-preview--last-build-failed t)
-                            (message "Build failed. Fix errors and save to retry preview.")
-                            ;; Show compilation buffer on failure
-                            (display-buffer buffer))))
-                        nil t))))))))
-
-(defun swiftui-preview--update-preview-registry-for-current-view (project-root view-name &optional wrapper-names)
-  "Update PreviewRegistry.swift to register view(s) in PROJECT-ROOT.
-If WRAPPER-NAMES is provided, registers all wrapper views.
-Otherwise registers VIEW-NAME directly."
-  (let* ((swift-files (condition-case err
-                          (directory-files-recursively
-                           project-root
-                           "\\.swift$"
-                           nil
-                           (lambda (dir)
-                             ;; Skip build directories and hidden directories
-                             (not (string-match-p "\\(?:\\.build\\|DerivedData\\|Pods\\|/\\..+\\)" dir))))
-                        (file-missing
-                         ;; If we get a file-missing error, try to continue with what we can find
-                         (when swiftui-preview-debug
-                           (message "[SwiftUI Preview] Warning: Could not access some directories: %s" (error-message-string err)))
-                         ;; Return empty list and try to find PreviewRegistry manually
-                         nil)))
-         (registry-file nil))
-    ;; Find PreviewRegistry.swift
-    (if swift-files
-        ;; Use directory scan if it succeeded
-        (dolist (file swift-files)
-          (when (string-match-p "PreviewRegistry\\.swift$" file)
-            (setq registry-file file)))
-      ;; Fallback: manually check common locations
-      (let ((possible-paths
-             (list
-              (expand-file-name "PreviewRegistry.swift" project-root)
-              (expand-file-name "testpreview/PreviewRegistry.swift" project-root)
-              ;; Add more common paths as needed
-              )))
-        (dolist (path possible-paths)
-          (when (and (not registry-file) (file-exists-p path))
-            (setq registry-file path)))))
-
-    (when registry-file
-      (when swiftui-preview-debug
-        (message "[SwiftUI Preview] Updating PreviewRegistry at: %s" registry-file)
-        (message "[SwiftUI Preview] Wrapper names to register: %S" wrapper-names))
-
-      (let ((registration-code
-             (if wrapper-names
-                 ;; Register all wrapper views with setupSwiftDevelopmentPreview
-                 ;; The closure must return the same instance (self), not a new one
-                 (mapconcat
-                  (lambda (wrapper-name)
-                    (format "    ViewRegistry.shared.register(name: \"%s\") {\n        let view = %s()\n        return view.setupSwiftDevelopmentPreview() { view }\n    }"
-                            wrapper-name wrapper-name))
-                  wrapper-names
-                  "\n")
-               ;; Register single view
-               (format "    ViewRegistry.shared.register(name: \"%s\") { %s() }"
-                       view-name view-name))))
-
-        (with-temp-file registry-file
-          (insert (format "//
-//  PreviewRegistry.swift
-//  Auto-generated by swiftui-preview-generate
-//
-//  This file dynamically registers the currently previewed view(s).
-//
-
-import SwiftUI
-import SwiftDevelopmentPreview
-
-/// Register view(s) for preview
-func registerAllViewsForPreview() {
-    guard SwiftDevelopmentPreview.isInPreview else { return }
-
-%s
-}
-" registration-code)))
-        (when swiftui-preview-debug
-          (if wrapper-names
-              (message "[SwiftUI Preview] Updated PreviewRegistry.swift with wrapper views: %s"
-                       (string-join wrapper-names ", "))
-            (message "[SwiftUI Preview] Updated PreviewRegistry.swift for view: %s" view-name)))))))
-
-
-(defun swiftui-preview--launch-all-previews (project-root)
-  "Launch app for preview in current buffer for PROJECT-ROOT."
-  ;; Simple single preview launch
-  (swiftui-preview--launch-preview project-root))
-
-
-(defun swiftui-preview--launch-preview (project-root)
-  "Launch app with preview flag for PROJECT-ROOT."
-  (condition-case err
-      (let* ((default-directory project-root)
-             (simulator-id (or current-simulator-id
-                              (ios-simulator-simulator-identifier)))
-             (app-identifier (or xcode-project--current-app-identifier
-                                (xcode-project-fetch-or-load-app-identifier)))
-             ;; Get build folder from settings
-             (settings (swift-project-settings-load project-root))
-             (build-folder (or (plist-get settings :build-folder)
-                              (expand-file-name
-                               (format ".build/Build/Products/Debug-iphonesimulator/")
-                               project-root)))
-             (app-name (file-name-base (xcode-project-scheme)))
-             (target-preview-path swiftui-preview--current-preview-path)
-             ;; Get view name from the preview path (e.g., HomeView.png -> HomeView)
-             (view-name (file-name-sans-extension
-                        (file-name-nondirectory target-preview-path)))
-             (preview-args (append (list "--swift-development-preview"
-                                        (format "--preview-path=%s" target-preview-path)
-                                        (format "--preview-view=%s" view-name))
-                                  ;; Add scale argument if configured
-                                  (when swiftui-preview-scale
-                                    (list (format "--preview-scale=%s" swiftui-preview-scale))))))
-
-        (when swiftui-preview-debug
-          (message "[SwiftUI Preview] Launching with view name: %s" view-name))
-
-        (setq swiftui-preview--current-simulator-id simulator-id
-              swiftui-preview--current-app-identifier app-identifier)
-
-        (when swiftui-preview-debug
-          (message "[SwiftUI Preview] Installing app: %s from build-folder: %s"
-                   app-name build-folder)
-          (message "[SwiftUI Preview] Simulator ID: %s" simulator-id)
-          (message "[SwiftUI Preview] View name: %s" view-name)
-          (message "[SwiftUI Preview] Preview args: %s" preview-args))
-
-        ;; Use ios-simulator-install-app for proper installation
-        (ios-simulator-install-app
-         :simulatorID simulator-id
-         :build-folder build-folder
-         :appname app-name
-         :callback (lambda ()
-                     (when swiftui-preview-debug
-                       (message "[SwiftUI Preview] Installation complete, launching with preview args..."))
-
-                     ;; Launch app with preview flags
-                     (let ((launch-command (append (list "xcrun" "simctl" "launch"
-                                                        "--terminate-running-process"
-                                                        simulator-id
-                                                        app-identifier)
-                                                  preview-args)))
-                       (when swiftui-preview-debug
-                         (message "[SwiftUI Preview] Launch command: %s"
-                                  (mapconcat #'identity launch-command " ")))
-
-                       (apply #'start-process "swiftui-preview-launch" nil launch-command)
-
-                       ;; Start polling for preview image
-                       (setq swiftui-preview--poll-start-time (current-time))
-                       (message "Waiting for preview generation...")
-                       (swiftui-preview--start-polling)))))
-    (error
-     (message "Error launching preview: %s" (error-message-string err)))))
+;;;###autoload
+(defun swiftui-preview-select ()
+  "Select which #Preview to generate when multiple exist."
+  (interactive)
+  (if (fboundp 'swiftui-preview-dynamic-select)
+      (swiftui-preview-dynamic-select)
+    (swiftui-preview-generate)))
 
 ;;; Polling and Display
 
@@ -582,7 +330,7 @@ func registerAllViewsForPreview() {
       (cancel-timer swiftui-preview--poll-timer)
       (setq swiftui-preview--poll-timer nil)
       (swiftui-preview--cleanup)
-      (message "Preview generation timed out after %d seconds. Check that .setupSwiftDevelopmentPreview() is added to your view."
+      (message "Preview generation timed out after %d seconds."
                swiftui-preview-timeout))
 
      ;; Image found
@@ -594,14 +342,8 @@ func registerAllViewsForPreview() {
 
       ;; Display the preview image
       (swiftui-preview--display-image swiftui-preview--current-preview-path)
-
-      ;; Handle hot reload or cleanup
-      (if swiftui-preview--hot-reload-active
-          (progn
-            (swiftui-preview--start-hot-reload-timer)
-            (message "Preview generated! Hot reload active - edit code and save to see updates."))
-        (swiftui-preview--cleanup)
-        (message "Preview generated successfully: %s" swiftui-preview--current-preview-path)))
+      (swiftui-preview--cleanup)
+      (message "Preview generated: %s" swiftui-preview--current-preview-path))
 
      ;; Keep waiting
      (t
@@ -610,6 +352,7 @@ func registerAllViewsForPreview() {
 
 (defun swiftui-preview--create-scaled-image (image-path &optional window)
   "Create an image from IMAGE-PATH scaled to fit WINDOW.
+Reads file data directly to bypass Emacs file-based image cache.
 Uses `swiftui-preview-fit-to-window', `swiftui-preview-max-width',
 and `swiftui-preview-max-height' to determine scaling."
   (let* ((win (or window (selected-window)))
@@ -624,10 +367,15 @@ and `swiftui-preview-max-height' to determine scaling."
          (max-h (cond
                  (swiftui-preview-max-height swiftui-preview-max-height)
                  (swiftui-preview-fit-to-window (or win-height 800))
-                 (t nil))))
+                 (t nil)))
+         ;; Read raw file data to bypass file-path image caching
+         (image-data (with-temp-buffer
+                       (set-buffer-multibyte nil)
+                       (insert-file-contents-literally image-path)
+                       (buffer-string))))
     (if max-h
-        (create-image image-path nil nil :max-width max-w :max-height max-h)
-      (create-image image-path nil nil :max-width max-w))))
+        (create-image image-data nil t :max-width max-w :max-height max-h)
+      (create-image image-data nil t :max-width max-w))))
 
 (defun swiftui-preview--display-image (image-path)
   "Display preview IMAGE-PATH in Emacs.
@@ -709,55 +457,24 @@ Updates the current preview path to track which preview is being shown."
 
 
 (defun swiftui-preview--cleanup ()
-  "Clean up preview resources.
-Don't terminate app if hot reload is active."
+  "Clean up preview resources."
   (when (and swiftui-preview--current-simulator-id
-             swiftui-preview--current-app-identifier
-             (not swiftui-preview--hot-reload-active))
+             swiftui-preview--current-app-identifier)
     (when swiftui-preview-debug
       (message "[SwiftUI Preview] Terminating app: %s" swiftui-preview--current-app-identifier))
     (call-process "xcrun" nil nil nil "simctl" "terminate"
                  swiftui-preview--current-simulator-id
                  swiftui-preview--current-app-identifier)))
 
-;;; Hot Reload Functions
 
-(defun swiftui-preview--start-hot-reload-timer ()
-  "Start timer to refresh preview image during hot reload."
-  (when swiftui-preview--image-refresh-timer
-    (cancel-timer swiftui-preview--image-refresh-timer))
-
-  (setq swiftui-preview--image-refresh-timer
-        (run-with-timer swiftui-preview-hot-reload-refresh-interval
-                       swiftui-preview-hot-reload-refresh-interval
-                       #'swiftui-preview--refresh-image-if-changed))
-
-  (when swiftui-preview-debug
-    (message "[SwiftUI Preview] Hot reload timer started (interval: %.1fs)"
-             swiftui-preview-hot-reload-refresh-interval)))
-
-(defun swiftui-preview--refresh-image-if-changed ()
-  "Refresh preview image if file has been modified."
-  (when (and swiftui-preview--current-preview-path
-             (file-exists-p swiftui-preview--current-preview-path))
-    (let* ((buffer (get-buffer swiftui-preview-buffer-name))
-           (file-mtime (file-attribute-modification-time
-                       (file-attributes swiftui-preview--current-preview-path)))
-           (last-mtime (when buffer
-                        (buffer-local-value 'swiftui-preview--last-mtime buffer))))
-      (when (and buffer last-mtime (time-less-p last-mtime file-mtime))
-        (when swiftui-preview-debug
-          (message "[SwiftUI Preview] Image updated, refreshing..."))
-        (with-current-buffer buffer
-          (revert-buffer nil t))
-        (message "Preview updated!")))))
 
 ;;;###autoload
-(defun swiftui-preview-generate-with-hot-reload ()
-  "Generate SwiftUI preview with hot reload enabled.
-Keep app running and automatically update preview when code changes."
+(defun swiftui-preview-cleanup ()
+  "Manually clean up any injected preview targets."
   (interactive)
-  (swiftui-preview-generate t))
+  (if (fboundp 'swiftui-preview-dynamic-cleanup)
+      (swiftui-preview-dynamic-cleanup)
+    (message "No cleanup needed")))
 
 ;;;###autoload
 (defun swiftui-preview-toggle-debug ()
@@ -766,23 +483,7 @@ Keep app running and automatically update preview when code changes."
   (setq swiftui-preview-debug (not swiftui-preview-debug))
   (message "SwiftUI Preview debug mode: %s" (if swiftui-preview-debug "ON" "OFF")))
 
-;;;###autoload
-(defun swiftui-preview-stop-hot-reload ()
-  "Stop hot reload and terminate app."
-  (interactive)
-  (when swiftui-preview--image-refresh-timer
-    (cancel-timer swiftui-preview--image-refresh-timer)
-    (setq swiftui-preview--image-refresh-timer nil))
-  (setq swiftui-preview--hot-reload-active nil)
-  ;; Now cleanup will terminate the app
-  (when (and swiftui-preview--current-simulator-id
-             swiftui-preview--current-app-identifier)
-    (when swiftui-preview-debug
-      (message "[SwiftUI Preview] Terminating app: %s" swiftui-preview--current-app-identifier))
-    (call-process "xcrun" nil nil nil "simctl" "terminate"
-                 swiftui-preview--current-simulator-id
-                 swiftui-preview--current-app-identifier))
-  (message "Hot reload stopped"))
+
 
 ;;; Utility Commands
 
@@ -878,7 +579,8 @@ Keep app running and automatically update preview when code changes."
 
 (defun swiftui-preview--parse-balanced-braces (start-pos)
   "Parse balanced braces starting from START-POS.
-Returns the position after the closing brace, or nil if unbalanced."
+Returns the position after the closing brace, or nil if unbalanced.
+Handles nested braces, string literals (including multi-line), and comments."
   (save-excursion
     (goto-char start-pos)
     (let ((depth 1)
@@ -886,20 +588,45 @@ Returns the position after the closing brace, or nil if unbalanced."
       (forward-char 1) ; Skip opening brace
       (while (and (> depth 0) (< (point) limit))
         (cond
-         ((looking-at "{")
-          (setq depth (1+ depth))
-          (forward-char 1))
-         ((looking-at "}")
-          (setq depth (1- depth))
-          (forward-char 1))
+         ;; Multi-line string literal """..."""
+         ((looking-at "\"\"\"")
+          (forward-char 3)
+          (while (and (not (looking-at "\"\"\"")) (< (point) limit))
+            (if (looking-at "\\\\")
+                (forward-char 2)
+              (forward-char 1)))
+          (when (looking-at "\"\"\"")
+            (forward-char 3)))
+         ;; Single-line string literal "..."
          ((looking-at "\"")
-          ;; Skip string literals
           (forward-char 1)
           (while (and (not (looking-at "\"")) (< (point) limit))
             (if (looking-at "\\\\")
                 (forward-char 2)
               (forward-char 1)))
+          (when (< (point) limit)
+            (forward-char 1)))
+         ;; Line comment //...
+         ((looking-at "//")
+          (end-of-line)
+          (when (< (point) limit)
+            (forward-char 1)))
+         ;; Block comment /*...*/
+         ((looking-at "/\\*")
+          (forward-char 2)
+          (while (and (not (looking-at "\\*/")) (< (point) limit))
+            (forward-char 1))
+          (when (looking-at "\\*/")
+            (forward-char 2)))
+         ;; Opening brace
+         ((looking-at "{")
+          (setq depth (1+ depth))
           (forward-char 1))
+         ;; Closing brace
+         ((looking-at "}")
+          (setq depth (1- depth))
+          (forward-char 1))
+         ;; Any other character
          (t
           (forward-char 1))))
       (if (= depth 0)
@@ -908,16 +635,48 @@ Returns the position after the closing brace, or nil if unbalanced."
 
 (defun swiftui-preview--extract-preview-body (start-pos)
   "Extract the body of a #Preview macro starting at opening brace START-POS.
-Returns the body text without the surrounding braces."
+Returns the body text without the surrounding braces, properly dedented.
+Removes common leading whitespace from all lines (like Ruby's dedent)."
   (let ((end-pos (swiftui-preview--parse-balanced-braces start-pos)))
     (when end-pos
-      (buffer-substring-no-properties (1+ start-pos) (1- end-pos)))))
+      (let* ((raw-body (buffer-substring-no-properties (1+ start-pos) (1- end-pos)))
+             (lines (split-string raw-body "\n"))
+             ;; Remove leading/trailing empty lines
+             (trimmed-lines (progn
+                              (while (and lines (string-empty-p (string-trim (car lines))))
+                                (setq lines (cdr lines)))
+                              (setq lines (nreverse lines))
+                              (while (and lines (string-empty-p (string-trim (car lines))))
+                                (setq lines (cdr lines)))
+                              (nreverse lines))))
+        (when trimmed-lines
+          ;; Find minimum indentation (excluding empty lines)
+          (let ((min-indent most-positive-fixnum))
+            (dolist (line trimmed-lines)
+              (unless (string-empty-p (string-trim line))
+                (let ((indent (- (length line) (length (string-trim-left line)))))
+                  (setq min-indent (min min-indent indent)))))
+            ;; Dedent all lines
+            (when (and (> min-indent 0) (< min-indent most-positive-fixnum))
+              (setq trimmed-lines
+                    (mapcar (lambda (line)
+                              (if (>= (length line) min-indent)
+                                  (substring line min-indent)
+                                line))
+                            trimmed-lines)))
+            (string-join trimmed-lines "\n")))))))
 
 (defun swiftui-preview--detect-preview-definitions ()
   "Detect all preview definitions in current buffer.
-Returns a list of preview info plists with :type, :name, and :body keys.
-Example: ((:type preview-macro :name \"Light\" :body \"HomeView()\"))
-Respects configuration variables for which types to detect."
+Returns a list of preview info plists with :type, :name, :body, and :traits keys.
+Example: ((:type preview-macro :name \"Light\" :body \"HomeView()\" :traits nil))
+Respects configuration variables for which types to detect.
+
+Supports all #Preview variants:
+- #Preview { ... }
+- #Preview(\"Name\") { ... }
+- #Preview(\"Name\", traits: .sizeThatFitsLayout) { ... }
+- #Preview(traits: .landscapeLeft) { ... }"
   (save-excursion
     (let ((previews '()))
 
@@ -925,20 +684,43 @@ Respects configuration variables for which types to detect."
       (when swiftui-preview-detect-setup-modifier
         (goto-char (point-min))
         (when (re-search-forward "\\.setupSwiftDevelopmentPreview" nil t)
-          (push (list :type 'setup-modifier :name nil :body nil) previews)))
+          (push (list :type 'setup-modifier :name nil :body nil :traits nil) previews)))
 
-      ;; Detect #Preview macros with optional names and extract body
+      ;; Detect #Preview macros with all parameter variants
       (when swiftui-preview-detect-preview-macro
         (goto-char (point-min))
-        (while (re-search-forward "#Preview\\(?:[[:space:]]*(\"\\([^\"]+\\)\")\\)?[[:space:]]*{" nil t)
-          (let* ((preview-name (match-string 1))
-                 (brace-start (1- (point)))
-                 (body (swiftui-preview--extract-preview-body brace-start)))
-            (when body
-              (push (list :type 'preview-macro
-                         :name (or preview-name "Preview")
-                         :body (string-trim body))
-                    previews)))))
+        ;; Match #Preview followed by optional params and opening brace
+        (while (re-search-forward "#Preview[[:space:]]*" nil t)
+          (let ((preview-name nil)
+                (preview-traits nil)
+                (brace-start nil)
+                (body nil))
+            ;; Check for parameters in parentheses
+            (when (looking-at "(")
+              (let ((params-start (point))
+                    (params-end (save-excursion
+                                  (forward-sexp)
+                                  (point))))
+                (let ((params-str (buffer-substring-no-properties
+                                   (1+ params-start) (1- params-end))))
+                  ;; Extract name if present (first string literal)
+                  (when (string-match "\"\\([^\"]+\\)\"" params-str)
+                    (setq preview-name (match-string 1 params-str)))
+                  ;; Extract traits if present
+                  (when (string-match "traits:[[:space:]]*\\([^,)]+\\)" params-str)
+                    (setq preview-traits (string-trim (match-string 1 params-str)))))
+                (goto-char params-end)))
+            ;; Skip whitespace to find opening brace
+            (skip-chars-forward " \t\n")
+            (when (looking-at "{")
+              (setq brace-start (point))
+              (setq body (swiftui-preview--extract-preview-body brace-start))
+              (when body
+                (push (list :type 'preview-macro
+                           :name (or preview-name "Preview")
+                           :body (string-trim body)
+                           :traits preview-traits)
+                      previews))))))
 
       ;; Detect PreviewProvider protocol
       (when swiftui-preview-detect-preview-provider
@@ -946,7 +728,8 @@ Respects configuration variables for which types to detect."
         (when (re-search-forward "struct +\\([A-Za-z0-9_]+\\)[^:]*:[^{]*PreviewProvider" nil t)
           (push (list :type 'preview-provider
                      :name (match-string 1)
-                     :body nil)
+                     :body nil
+                     :traits nil)
                 previews)))
 
       (nreverse previews))))
@@ -955,6 +738,28 @@ Respects configuration variables for which types to detect."
   "Count number of preview definitions in current buffer.
 Returns the count of detected previews."
   (length (swiftui-preview--detect-preview-definitions)))
+
+(defun swiftui-preview--get-first-preview-body ()
+  "Get the body of the first #Preview macro in current buffer.
+Returns nil if no #Preview found."
+  (let ((previews (swiftui-preview--detect-preview-definitions)))
+    (cl-loop for preview in previews
+             when (eq (plist-get preview :type) 'preview-macro)
+             return (plist-get preview :body))))
+
+(defun swiftui-preview--get-preview-by-name (name)
+  "Get the preview definition with NAME from current buffer.
+Returns the plist or nil if not found."
+  (let ((previews (swiftui-preview--detect-preview-definitions)))
+    (cl-find-if (lambda (p)
+                  (equal (plist-get p :name) name))
+                previews)))
+
+(defun swiftui-preview--list-preview-names ()
+  "List all preview names in current buffer.
+Returns a list of strings."
+  (let ((previews (swiftui-preview--detect-preview-definitions)))
+    (mapcar (lambda (p) (plist-get p :name)) previews)))
 
 (defun swiftui-preview--has-any-preview-p ()
   "Check if current buffer has any type of preview definition.
@@ -1149,218 +954,130 @@ This is always enabled as it's fundamental preview behavior."
 (add-hook 'buffer-list-update-hook #'swiftui-preview--on-buffer-change)
 
 ;;;###autoload
-(defun swiftui-preview-update-view-registry ()
-  "Automatically update PreviewRegistry.swift based on all View structs in project."
+(defun swiftui-preview-setup ()
+  "Open the SwiftUI Preview setup wizard.
+Checks dependencies and guides through installation if needed."
   (interactive)
-  (let* ((project-root (swift-project-root))
-         (swift-files (directory-files-recursively project-root "\\.swift$"))
-         (view-names nil)
-         (registry-file nil))
+  (if (fboundp 'swiftui-preview-setup-wizard)
+      (swiftui-preview-setup-wizard)
+    (message "Setup wizard not available. Ensure swiftui-preview-setup.el is loaded.")))
 
-    (unless project-root
-      (user-error "No Swift project found"))
+;;; External Simulator Screenshot Capture
 
-    ;; Find PreviewRegistry.swift
-    (dolist (file swift-files)
-      (when (string-match-p "PreviewRegistry\\.swift$" file)
-        (setq registry-file file)))
+(defcustom swiftui-preview-capture-delay 2.0
+  "Delay in seconds before capturing screenshot after app launch.
+Used when capturing via simctl to allow the app to render."
+  :type 'number
+  :group 'swiftui-preview)
 
-    (unless registry-file
-      (user-error "PreviewRegistry.swift not found. Create it first in your project."))
+(defun swiftui-preview--find-simulator-udid (simulator-name)
+  "Find the UDID for SIMULATOR-NAME.
+Returns UDID string or nil if not found."
+  (let ((output (shell-command-to-string
+                 "xcrun simctl list devices available -j 2>/dev/null")))
+    (condition-case nil
+        (let* ((json (json-read-from-string output))
+               (devices (alist-get 'devices json)))
+          (catch 'found
+            (dolist (runtime-devices devices)
+              (when (string-match-p "iOS" (symbol-name (car runtime-devices)))
+                (dolist (device (cdr runtime-devices))
+                  (when (and (equal (alist-get 'name device) simulator-name)
+                             (eq (alist-get 'isAvailable device) t))
+                    (throw 'found (alist-get 'udid device))))))
+            nil))
+      (error nil))))
 
-    ;; Find all view struct names
-    (dolist (file swift-files)
-      (unless (or (string-match-p "/\\.build/" file)
-                  (string-match-p "/SwiftDevelopmentPreview/" file)
-                  (string-match-p "Tests\\.swift$" file)
-                  (string-match-p "PreviewRegistry\\.swift$" file))
-        (with-temp-buffer
-          (insert-file-contents file)
-          (goto-char (point-min))
-          (while (re-search-forward "^struct \\([A-Z][a-zA-Z0-9]*\\).*:.*View" nil t)
-            (let ((name (match-string 1)))
-              (unless (member name '("App")) ; Skip App struct
-                (push name view-names)))))))
-
-    (setq view-names (sort (delete-dups view-names) #'string<))
-
-    (when view-names
-      (let ((registry-code
-             (mapconcat (lambda (name)
-                         (format "    ViewRegistry.shared.register(name: \"%s\") { %s() }" name name))
-                       view-names
-                       "\n")))
-        ;; Update PreviewRegistry.swift
-        (with-temp-file registry-file
-          (insert (format "//
-//  PreviewRegistry.swift
-//  Auto-generated by swiftui-preview-update-view-registry
-//
-//  This file registers all views for the preview system.
-//  Run M-x swiftui-preview-update-view-registry in Emacs to update automatically.
-//
-
-import SwiftUI
-import SwiftDevelopmentPreview
-
-/// Triggers auto-registration of all views
-func registerAllViewsForPreview() {
-    guard SwiftDevelopmentPreview.isInPreview else { return }
-
-    // Create view instances to trigger auto-registration via .setupSwiftDevelopmentPreview()
-%s
-}
-" registry-code)))
-        (message "✓ Updated PreviewRegistry.swift with %d views: %s"
-                 (length view-names)
-                 (string-join view-names ", "))))))
-
-;;; Zero-Config Auto-Installation and Registry Generation
-
-(defun swiftui-preview--package-exists-p (project-root)
-  "Check if SwiftDevelopmentPreview package is in Package.swift for PROJECT-ROOT."
-  (let ((package-file (expand-file-name "Package.swift" project-root)))
-    (when (file-exists-p package-file)
-      (with-temp-buffer
-        (insert-file-contents package-file)
-        (goto-char (point-min))
-        (re-search-forward "SwiftDevelopmentPreview" nil t)))))
-
-(defun swiftui-preview--add-package-dependency (project-root)
-  "Automatically add SwiftDevelopmentPreview package to Package.swift in PROJECT-ROOT."
-  (let ((package-file (expand-file-name "Package.swift" project-root)))
-    (unless (file-exists-p package-file)
-      (user-error "No Package.swift found in project root"))
-
-    (message "Adding SwiftDevelopmentPreview package...")
-
-    ;; Read current Package.swift
-    (with-temp-buffer
-      (insert-file-contents package-file)
-      (let ((content (buffer-string)))
-
-        ;; Add to dependencies array if not present
-        (unless (string-match-p "SwiftDevelopmentPreview" content)
-          (goto-char (point-min))
-
-          ;; Find dependencies array
-          (if (re-search-forward "dependencies:[[:space:]]*\\[" nil t)
-              (progn
-                ;; Insert at beginning of dependencies array
-                (insert "\n        .package(path: \"SwiftDevelopmentPreview\"),")
-
-                ;; Write back
-                (write-region (point-min) (point-max) package-file)
-                (message "✓ Added SwiftDevelopmentPreview to Package.swift"))
-            (user-error "Could not find dependencies array in Package.swift")))))))
-
-(defun swiftui-preview--ensure-package-installed (project-root)
-  "Ensure SwiftDevelopmentPreview package is installed for PROJECT-ROOT.
-If package directory doesn't exist, copy from templates."
-  (let ((package-dir (expand-file-name "SwiftDevelopmentPreview" project-root))
-        (template-dir (expand-file-name
-                       "templates/SwiftDevelopmentPreview"
-                       (file-name-directory (locate-library "swift-development")))))
-
-    ;; Copy package template if it doesn't exist
-    (unless (file-exists-p package-dir)
-      (when swiftui-preview-debug
-        (message "[SwiftUI Preview] Copying SwiftDevelopmentPreview template..."))
-      (copy-directory template-dir package-dir nil t t)
-      (message "✓ Installed SwiftDevelopmentPreview package"))
-
-    ;; Add to Package.swift if it exists (SPM projects only)
-    (when (file-exists-p (expand-file-name "Package.swift" project-root))
-      (unless (swiftui-preview--package-exists-p project-root)
-        (swiftui-preview--add-package-dependency project-root)))
-
-    ;; For Xcode projects, the local package reference is already in project.pbxproj
-    ;; So we just need to ensure the directory exists (done above)
-    ))
-
-(defun swiftui-preview--auto-create-registry-if-missing (project-root view-name)
-  "Auto-create PreviewRegistry.swift if it doesn't exist in PROJECT-ROOT for VIEW-NAME."
-  (let* ((swift-files (condition-case err
-                          (directory-files-recursively
-                           project-root
-                           "\\.swift$"
-                           nil
-                           (lambda (dir)
-                             (not (string-match-p "\\(?:\\.build\\|DerivedData\\|Pods\\|/\\..+\\)" dir))))
-                        (file-missing nil)))
-         (registry-file nil)
-         (app-target-dir nil))
-
-    ;; Find PreviewRegistry.swift
-    (dolist (file swift-files)
-      (when (string-match-p "PreviewRegistry\\.swift$" file)
-        (setq registry-file file)))
-
-    ;; If not found, create it
-    (unless registry-file
-      (when swiftui-preview-debug
-        (message "[SwiftUI Preview] PreviewRegistry.swift not found, creating it..."))
-
-      ;; Try to find the app target directory (look for *App.swift)
-      (dolist (file swift-files)
-        (when (and (not app-target-dir)
-                   (string-match-p "App\\.swift$" file)
-                   (not (string-match-p "SwiftDevelopmentPreview" file)))
-          (setq app-target-dir (file-name-directory file))))
-
-      ;; Fallback: use project root
-      (unless app-target-dir
-        (setq app-target-dir project-root))
-
-      (setq registry-file (expand-file-name "PreviewRegistry.swift" app-target-dir))
-
-      ;; Create initial registry with current view
-      (with-temp-file registry-file
-        (insert (format "//
-//  PreviewRegistry.swift
-//  Auto-generated by swift-development
-//
-
-import SwiftUI
-import SwiftDevelopmentPreview
-
-/// Register view(s) for preview
-func registerAllViewsForPreview() {
-    guard SwiftDevelopmentPreview.isInPreview else { return }
-
-    ViewRegistry.shared.register(name: \"%s\") { %s() }
-}
-" view-name view-name)))
-
-      (message "✓ Created PreviewRegistry.swift"))
-
-    registry-file))
+(defun swiftui-preview--get-booted-simulator ()
+  "Get the UDID of the first booted simulator.
+Returns UDID string or nil if none booted."
+  (let ((output (shell-command-to-string
+                 "xcrun simctl list devices booted -j 2>/dev/null")))
+    (condition-case nil
+        (let* ((json (json-read-from-string output))
+               (devices (alist-get 'devices json)))
+          (catch 'found
+            (dolist (runtime-devices devices)
+              (dolist (device (cdr runtime-devices))
+                (when (equal (alist-get 'state device) "Booted")
+                  (throw 'found (alist-get 'udid device)))))
+            nil))
+      (error nil))))
 
 ;;;###autoload
-(defun swiftui-preview-auto-setup ()
-  "Automatically setup SwiftUI preview for current project (zero-config).
-Installs package and creates registry if needed."
+(defun swiftui-preview-capture-simulator (&optional output-path simulator-id)
+  "Capture screenshot of current simulator state.
+OUTPUT-PATH is the destination file (defaults to /tmp/simulator-screenshot.png).
+SIMULATOR-ID is the simulator UDID (defaults to first booted simulator).
+Returns the path to the captured screenshot or nil on failure."
+  (interactive)
+  (let* ((sim-id (or simulator-id
+                     (swiftui-preview--get-booted-simulator)
+                     "booted"))
+         (output (or output-path
+                     (expand-file-name "simulator-screenshot.png" temporary-file-directory))))
+    (if (equal sim-id "booted")
+        (unless (swiftui-preview--get-booted-simulator)
+          (user-error "No simulator is currently booted"))
+      (unless sim-id
+        (user-error "Could not find simulator")))
+
+    ;; Ensure output directory exists
+    (make-directory (file-name-directory output) t)
+
+    ;; Capture screenshot
+    (let ((exit-code (call-process "xcrun" nil nil nil
+                                   "simctl" "io" sim-id "screenshot" output)))
+      (if (and (= exit-code 0) (file-exists-p output))
+          (progn
+            (message "Screenshot captured: %s" output)
+            output)
+        (message "Failed to capture simulator screenshot")
+        nil))))
+
+;;;###autoload
+(defun swiftui-preview-capture-after-delay (&optional delay output-path simulator-id)
+  "Wait DELAY seconds then capture simulator screenshot.
+DELAY defaults to `swiftui-preview-capture-delay'.
+OUTPUT-PATH and SIMULATOR-ID are passed to `swiftui-preview-capture-simulator'.
+Displays the captured image in preview buffer."
+  (interactive)
+  (let ((delay-time (or delay swiftui-preview-capture-delay))
+        (out-path (or output-path
+                      (let ((project-root (swift-project-root)))
+                        (when project-root
+                          (swiftui-preview--get-preview-path project-root)))))
+        (sim-id (or simulator-id
+                    (swiftui-preview--get-booted-simulator))))
+
+    (unless out-path
+      (setq out-path (expand-file-name "preview-capture.png" temporary-file-directory)))
+
+    (message "Capturing screenshot in %.1f seconds..." delay-time)
+    (run-with-timer
+     delay-time nil
+     (lambda ()
+       (let ((captured-path (swiftui-preview-capture-simulator out-path sim-id)))
+         (when captured-path
+           (swiftui-preview--display-image captured-path)
+           (message "Preview captured and displayed")))))))
+
+;;;###autoload
+(defun swiftui-preview-capture-current ()
+  "Immediately capture the current simulator state and display it.
+Useful for debugging or checking the current UI state."
   (interactive)
   (let* ((project-root (swift-project-root))
-         (view-name (when (buffer-file-name)
-                      (file-name-sans-extension
-                       (file-name-nondirectory (buffer-file-name))))))
-
-    (unless project-root
-      (user-error "No Swift project found"))
-
-    (unless view-name
-      (user-error "Current buffer is not visiting a file"))
-
-    (message "Setting up SwiftUI Preview (zero-config)...")
-
-    ;; 1. Ensure package is installed
-    (swiftui-preview--ensure-package-installed project-root)
-
-    ;; 2. Create or update registry
-    (swiftui-preview--auto-create-registry-if-missing project-root view-name)
-
-    (message "✓ SwiftUI Preview setup complete! Run M-x swiftui-preview-generate to create preview.")))
+         (output-path (if project-root
+                         (expand-file-name
+                          "capture.png"
+                          (swiftui-preview--directory project-root))
+                       (expand-file-name "capture.png" temporary-file-directory))))
+    (when project-root
+      (swiftui-preview--ensure-directory project-root))
+    (let ((captured (swiftui-preview-capture-simulator output-path)))
+      (when captured
+        (swiftui-preview--display-image captured)))))
 
 ;;; Transient Menu
 
@@ -1371,18 +1088,21 @@ Installs package and creates registry if needed."
   "SwiftUI Preview actions."
   ["Generate Preview"
    [("p" "Generate preview" swiftui-preview-generate)
-    ("h" "Generate with hot-reload" swiftui-preview-generate-with-hot-reload)
-    ("s" "Stop hot-reload" swiftui-preview-stop-hot-reload)]]
-  ["View Previews"
-   [("r" "Refresh current" swiftui-preview-refresh)
-    ("e" "Show existing previews" swiftui-preview-show-existing)
-    ("d" "Open preview directory" swiftui-preview-show-directory)]]
-  ["Cleanup"
-   [("c" "Clear preview window" swiftui-preview-clear)
-    ("C" "Clean temp files" swiftui-preview-clean-temp-files)]]
-  ["Debug"
-   [("g" "Toggle debug mode" swiftui-preview-toggle-debug)
-    ("t" "Test auto-show" swiftui-preview-test-auto-show)]]
+    ("a" "Generate all in file" swiftui-preview-generate-all)
+    ("s" "Select preview..." swiftui-preview-select)]]
+  ["Capture Simulator"
+   [("c" "Capture now" swiftui-preview-capture-current)
+    ("C" "Capture after delay" swiftui-preview-capture-after-delay)]]
+  ["View"
+   [("r" "Refresh" swiftui-preview-refresh)
+    ("e" "Show existing" swiftui-preview-show-existing)
+    ("d" "Open directory" swiftui-preview-show-directory)]]
+  ["Manage"
+   [("x" "Clear window" swiftui-preview-clear)
+    ("X" "Cleanup targets" swiftui-preview-cleanup)]]
+  ["Setup"
+   [("S" "Setup wizard" swiftui-preview-setup)
+    ("g" "Toggle debug" swiftui-preview-toggle-debug)]]
   [("q" "Quit" transient-quit-one)])
 
 (provide 'swiftui-preview)

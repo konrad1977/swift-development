@@ -174,8 +174,9 @@ Set to nil to disable automatic simulator launching."
 nil = unknown/never built, t = success, \\='failed = failed.")
 (defvar swift-development--current-build-command nil
   "Current build command being used.")
-(defvar swift-development--device-choice nil
-  "Whether to run on physical device (t) or simulator (nil).")
+(defvar swift-development--device-choice 'unset
+  "Whether to run on physical device (t) or simulator (nil).
+Value is \\='unset if no choice has been made yet.")
 
 (defvar swift-development--force-next-build nil
   "When non-nil, force build regardless of file watcher status.
@@ -284,7 +285,11 @@ This also invalidates the build status to force a rebuild on next compile."
 (defun swift-development-toggle-device-choice ()
   "Toggle between running on simulator and physical device."
   (interactive)
-  (setq swift-development--device-choice (not swift-development--device-choice))
+  ;; If unset, default to simulator (nil), then toggle will set to device (t)
+  (setq swift-development--device-choice
+        (if (eq swift-development--device-choice 'unset)
+            t  ; First toggle: unset -> device
+          (not swift-development--device-choice)))
   ;; Clear cached build folder since it's device-type dependent
   (setq xcode-project--current-build-folder nil
         xcode-project--last-device-type nil)
@@ -296,7 +301,7 @@ This also invalidates the build status to force a rebuild on next compile."
         (swift-project-settings-capture-from-variables root))))
   (swift-notification-send
    :message (format "Now running on %s"
-                    (if swift-development--device-choice "physical device" "simulator"))
+                    (if (eq swift-development--device-choice t) "physical device" "simulator"))
    :seconds 3))
 
 ;; Legacy alias for backwards compatibility
@@ -325,9 +330,15 @@ This also invalidates the build status to force a rebuild on next compile."
   ;; Save last-modified file to settings
   (let* ((ctx swift-development--build-context)
          (project-root (or (plist-get ctx :root) (xcode-project-project-root)))
+         (scheme (plist-get ctx :scheme))
          (last-modified (swift-development-get-last-modified-file)))
     (when (and project-root last-modified (fboundp 'swift-project-settings-update))
-      (swift-project-settings-update project-root :last-modified-file last-modified)))
+      (swift-project-settings-update project-root :last-modified-file last-modified))
+
+    ;; Refresh build settings from xcodebuild (async, updates deployment-target etc.)
+    (when (and project-root scheme
+               (fboundp 'swift-project-settings-fetch-build-info))
+      (swift-project-settings-fetch-build-info project-root scheme "iphoneos" nil)))
 
   ;; Use captured context for installation
   (let* ((ctx swift-development--build-context)
@@ -383,9 +394,16 @@ This also invalidates the build status to force a rebuild on next compile."
   ;; Save last-modified file to settings
   (let* ((ctx swift-development--build-context)
          (project-root (or (plist-get ctx :root) (xcode-project-project-root)))
+         (scheme (plist-get ctx :scheme))
          (last-modified (swift-development-get-last-modified-file)))
     (when (and project-root last-modified (fboundp 'swift-project-settings-update))
-      (swift-project-settings-update project-root :last-modified-file last-modified)))
+      (swift-project-settings-update project-root :last-modified-file last-modified))
+
+    ;; Refresh build settings from xcodebuild (async, updates deployment-target etc.)
+    (when (and project-root scheme
+               (fboundp 'swift-project-settings-fetch-build-info))
+      (let ((sdk (if (eq swift-development--device-choice t) "iphoneos" "iphonesimulator")))
+        (swift-project-settings-fetch-build-info project-root scheme sdk nil))))
 
   (swift-development-cleanup)
 
@@ -604,13 +622,26 @@ Keeps the end of the output where errors typically appear, and any lines with 'e
 
   ;; Save last-modified file to settings (fast, synchronous)
   (let* ((project-root (xcode-project-project-root))
+         (scheme xcode-project--current-xcode-scheme)
          (last-modified (swift-development-get-last-modified-file)))
     (when (and project-root last-modified
                (fboundp 'swift-project-settings-update))
       (swift-project-settings-update project-root :last-modified-file last-modified)
       (when swift-development-debug
         (message "[Build Success] Saved last-modified: %s at %s"
-                 (cdr last-modified) (car last-modified))))))
+                 (cdr last-modified) (car last-modified))))
+
+    ;; Refresh build settings from xcodebuild (async, updates deployment-target etc.)
+    (when (and project-root scheme
+               (fboundp 'swift-project-settings-fetch-build-info))
+      (let ((sdk (if (eq swift-development--device-choice t) "iphoneos" "iphonesimulator")))
+        (swift-project-settings-fetch-build-info
+         project-root scheme sdk
+         (lambda (settings)
+           (when (and settings swift-development-debug)
+             (message "[Build Success] Settings refreshed: target=%s module=%s"
+                      (plist-get settings :deployment-target)
+                      (plist-get settings :swift-module-name)))))))))
 
 (cl-defun swift-development-compile-with-progress (&key command callback update-callback)
   "Run compilation COMMAND with progress indicator and CALLBACK/UPDATE-CALLBACK in background.
@@ -863,7 +894,7 @@ Uses async rebuild check if swift-development-use-async-rebuild-check is t."
 
         ;; Start simulator early (async, non-blocking) so it's ready when build completes
         ;; Only for simulator builds, not physical device
-        (when (and run (not swift-development--device-choice))
+        (when (and run (not (eq swift-development--device-choice t)))
           (require 'ios-simulator)
           (let ((sim-id (ios-simulator-simulator-identifier)))
             (when sim-id
@@ -879,7 +910,7 @@ Uses async rebuild check if swift-development-use-async-rebuild-check is t."
                                                     :percent 5
                                                     :message "Checking build cache..."))
               ;; IMPORTANT: Capture ALL project info NOW before going async
-              (let* ((device-type (if swift-development--device-choice :device :simulator))
+              (let* ((device-type (if (eq swift-development--device-choice t) :device :simulator))
                      (captured-root (xcode-project-project-root))
                      (captured-build-folder (xcode-project-build-folder :device-type device-type))
                      (captured-app-id (xcode-project-fetch-or-load-app-identifier))
@@ -1016,7 +1047,7 @@ RUN specifies whether to run after building."
     (periphery-kill-buffer))
   (ios-simulator-kill-buffer)
   ;; Only ask for device/simulator if not already set
-  (unless swift-development--device-choice
+  (when (eq swift-development--device-choice 'unset)
     (xcode-addition-ask-for-device-or-simulator))
   (if (not (xcode-project-run-in-simulator))
       (swift-development-compile-for-device :run run)
@@ -1355,7 +1386,7 @@ Checks in order:
 4. Last build status
 5. File watcher / last-modified timestamps"
   (let* ((build-folder (xcode-project-build-folder 
-                        :device-type (if swift-development--device-choice :device :simulator)))
+                        :device-type (if (eq swift-development--device-choice t) :device :simulator)))
          (app-path (swift-development-get-built-app-path))
          (project-root (xcode-project-project-root))
          (needs-rebuild nil))
@@ -2312,7 +2343,7 @@ This is the fastest way to rebuild after small changes."
       (princ "\nFile System Checks:\n")
       (princ "-----------------\n")
       (let ((build-dir (xcode-project-build-folder
-                        :device-type (if swift-development--device-choice :device :simulator))))
+                        :device-type (if (eq swift-development--device-choice t) :device :simulator))))
         (princ (format "Build Directory Exists: %s\n"
                       (if (and build-dir (file-exists-p build-dir)) "Yes" "No")))
         (when build-dir
@@ -2333,7 +2364,7 @@ This is the fastest way to rebuild after small changes."
       ;(princ "\nSystem Information:\n")
       (princ "------------------\n")
       (princ (format "Build command: %s\n"
-                     (if swift-development--device-choice
+                     (if (eq swift-development--device-choice t)
                          (xcode-build-config-build-app-command
                           :device-id (when (fboundp 'ios-device-udid) (ios-device-udid))
                           :derived-path (xcode-project-derived-data-path))

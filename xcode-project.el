@@ -1275,6 +1275,16 @@ Returns nil if neither workspace nor project is found (e.g., pure Swift Package)
               ;; auto-detected based on device type (simulator vs physical device)
               ;; Restoring a cached build-folder causes wrong SDK builds to be installed
 
+              ;; Restore device choice (physical device vs simulator)
+              ;; This prevents asking the user every time they open a file
+              (when (boundp 'swift-development--device-choice)
+                (when-let* ((platform (plist-get settings :platform)))
+                  (setq swift-development--device-choice
+                        (string= platform "Physical Device"))
+                  (when xcode-project-debug
+                    (message "[Settings] Restored device-choice: %s (platform=%s)"
+                             swift-development--device-choice platform))))
+
               ;; Restore simulator selection
               (when (boundp 'ios-simulator--current-simulator-name)
                 (when-let* ((device-name (plist-get settings :device-name)))
@@ -1372,7 +1382,7 @@ Shows that multi-project support is enabled via buffer-local variables."
            (or xcode-project--current-build-configuration "nil")
            (or xcode-project--current-app-identifier "nil")
            (or xcode-project--current-build-folder "nil")
-           (or (and swift-development--device-choice "Physical Device") "Simulator")))
+           (or (and (eq swift-development--device-choice t) "Physical Device") "Simulator")))
 
 (defun xcode-project-project-root ()
   "Get the project root as a path string."
@@ -1390,13 +1400,14 @@ Shows that multi-project support is enabled via buffer-local variables."
 (defun xcode-addition-ask-for-device-or-simulator ()
   "Show menu for running on simulator or device."
   (interactive)
-  (when (and (ios-device-connected-device-id) (not swift-development--device-choice))
+  (when (and (ios-device-connected-device-id) (eq swift-development--device-choice 'unset))
     (setq swift-development--device-choice
           (xcode-project-device-or-simulator-menu :title "Run on simulator or device?"))))
 
 (defun xcode-project-run-in-simulator ()
   "Return t if app should run in simulator, nil for physical device."
-  (if (null swift-development--device-choice)
+  (if (or (null swift-development--device-choice)
+          (eq swift-development--device-choice 'unset))
       t  ; Default to simulator if not set
     (not swift-development--device-choice)))
 
@@ -1429,7 +1440,7 @@ Uses filtered scheme list (excludes test schemes) for build/run operations."
         xcode-project--current-errors-or-warnings nil
         xcode-project--current-is-xcode-project nil
         xcode-project--last-device-type nil
-        swift-development--device-choice nil)
+        swift-development--device-choice 'unset)
 
   ;; 4. Clear swift-cache for build-settings, scheme-files, and xcodebuild-schemes
   (when (fboundp 'swift-cache-invalidate-pattern)
@@ -1463,7 +1474,7 @@ Uses filtered scheme list (excludes test schemes) for build/run operations."
       (setq swift-development--last-build-succeeded nil))
     
     ;; 6e. If simulator, prompt for which one and boot it
-    (unless swift-development--device-choice
+    (unless (eq swift-development--device-choice t)
       (when (fboundp 'ios-simulator-choose-simulator)
         (ios-simulator-choose-simulator))
       (when (and (fboundp 'ios-simulator-simulator-identifier)
@@ -1474,8 +1485,8 @@ Uses filtered scheme list (excludes test schemes) for build/run operations."
     ;; This is the ONLY source of truth for build paths
     (let* ((project-root (xcode-project-project-root))
            (scheme xcode-project--current-xcode-scheme)
-           (sdk (if swift-development--device-choice "iphoneos" "iphonesimulator"))
-           (device-type (if swift-development--device-choice :device :simulator)))
+           (sdk (if (eq swift-development--device-choice t) "iphoneos" "iphonesimulator"))
+           (device-type (if (eq swift-development--device-choice t) :device :simulator)))
       (swift-notification-send :message "Fetching build settings..." :seconds 2)
       (if (fboundp 'swift-project-settings-fetch-build-info)
           (swift-project-settings-fetch-build-info
@@ -1602,7 +1613,7 @@ based on `swift-development--device-choice'."
   (xcode-project-scheme)
   (xcode-project-project-root)
 
-  (let* ((is-device swift-development--device-choice)
+  (let* ((is-device (eq swift-development--device-choice t))
          (app-bundle-id (or (xcode-project-fetch-or-load-app-identifier)
                             (error "Failed to get app bundle identifier")))
          (project-cwd (or (project-root (project-current))
@@ -2165,7 +2176,7 @@ Debug Mode: %s"
                  xcode-project--current-build-configuration
                  xcode-project--current-app-identifier
                  xcode-project--current-build-folder
-                 (if swift-development--device-choice "Physical Device" "Simulator")
+                 (if (eq swift-development--device-choice t) "Physical Device" "Simulator")
                  (ios-simulator-simulator-identifier)
                  (if xcode-project-debug "Enabled" "Disabled"))))
     (with-current-buffer (get-buffer-create "*Xcode Configuration*")
