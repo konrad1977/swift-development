@@ -661,9 +661,14 @@ This is the ONLY source of truth for build paths. No guessing."
                             (existing (swift-project-settings-load project-root scheme))
                             (updated (copy-sequence (or existing (list)))))
                        
-                       ;; Update with new build info
-                       (setq updated (plist-put updated :scheme scheme))
-                       (setq updated (plist-put updated :sdk sdk))
+                        ;; Update with new build info
+                        (setq updated (plist-put updated :scheme scheme))
+                        (setq updated (plist-put updated :sdk sdk))
+                        ;; Derive platform from SDK
+                        (setq updated (plist-put updated :platform
+                                                 (if (string= sdk "iphoneos")
+                                                     "Physical Device"
+                                                   "iOS Simulator")))
                        (when target-build-dir
                          (setq updated (plist-put updated :target-build-dir 
                                                   (file-name-as-directory target-build-dir))))

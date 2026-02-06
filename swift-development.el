@@ -261,9 +261,11 @@ Also checks for Swift macro approval errors and offers to approve them."
   "Reset build settings and clear all cached state.
 This also invalidates the build status to force a rebuild on next compile."
   (interactive)
-  (xcode-project-reset)
-  (xcode-build-config-reset)
+  ;; Reset device-choice BEFORE xcode-project-reset so it can be set fresh
+  (setq swift-development--device-choice 'unset)
   (ios-device-reset)
+  (xcode-build-config-reset)
+  (xcode-project-reset)
   (setq swift-development--build-progress-spinner nil
         swift-development--compilation-time nil
         run-once-compiled nil
@@ -283,7 +285,8 @@ This also invalidates the build status to force a rebuild on next compile."
   (swift-notification-send :message "Build settings reset - next build will run unconditionally" :seconds 3))
 
 (defun swift-development-toggle-device-choice ()
-  "Toggle between running on simulator and physical device."
+  "Toggle between running on simulator and physical device.
+When switching to physical device, prompts for device selection."
   (interactive)
   ;; If unset, default to simulator (nil), then toggle will set to device (t)
   (setq swift-development--device-choice
@@ -293,6 +296,10 @@ This also invalidates the build status to force a rebuild on next compile."
   ;; Clear cached build folder since it's device-type dependent
   (setq xcode-project--current-build-folder nil
         xcode-project--last-device-type nil)
+  ;; When switching to physical device, prompt for device selection
+  (when (eq swift-development--device-choice t)
+    (ios-device-reset)
+    (ios-device-select-device))
   ;; Save settings
   (when (and (fboundp 'swift-project-settings-capture-from-variables)
              (fboundp 'xcode-project-project-root))
@@ -314,51 +321,56 @@ This also invalidates the build status to force a rebuild on next compile."
       (format "%.1f" (float-time (time-subtract end-time start-time)))
     "N/A"))
 
-(defun swift-development-run-app-on-device-after-build ()
-  "Run app on device after build using captured context."
+(defun swift-development--post-build-common ()
+  "Common post-build steps: notify, save settings, refresh build info.
+Returns the build context for further use."
   (let* ((ctx swift-development--build-context)
          (scheme-raw (or (plist-get ctx :scheme) "Unknown"))
          (scheme-name (if (fboundp 'xcode-project--clean-display-name)
                           (xcode-project--clean-display-name scheme-raw)
                         scheme-raw)))
+    ;; Notify build completion
     (when (fboundp 'xcode-project-notify)
       (xcode-project-notify
        :message (format "Built %s in %s seconds"
                         (propertize scheme-name 'face 'font-lock-builtin-face)
-                        (propertize (swift-development--compilation-time) 'face 'warning)))))
+                        (propertize (swift-development--compilation-time) 'face 'warning))))
 
-  ;; Save last-modified file to settings
-  (let* ((ctx swift-development--build-context)
-         (project-root (or (plist-get ctx :root) (xcode-project-project-root)))
-         (scheme (plist-get ctx :scheme))
-         (last-modified (swift-development-get-last-modified-file)))
-    (when (and project-root last-modified (fboundp 'swift-project-settings-update))
-      (swift-project-settings-update project-root :last-modified-file last-modified))
+    ;; Update progress bar
+    (when (fboundp 'swift-notification-progress-update)
+      (swift-notification-progress-update 'swift-build :percent 65 :message "Installing..."))
 
-    ;; Refresh build settings from xcodebuild (async, updates deployment-target etc.)
-    (when (and project-root scheme
-               (fboundp 'swift-project-settings-fetch-build-info))
-      (swift-project-settings-fetch-build-info project-root scheme "iphoneos" nil)))
+    ;; Save last-modified file to settings
+    (let* ((project-root (or (plist-get ctx :root) (xcode-project-project-root)))
+           (scheme (plist-get ctx :scheme))
+           (last-modified (swift-development-get-last-modified-file))
+           (for-device (eq swift-development--device-choice t))
+           (sdk (if for-device "iphoneos" "iphonesimulator")))
+      (when (and project-root last-modified (fboundp 'swift-project-settings-update))
+        (swift-project-settings-update project-root :last-modified-file last-modified))
+      ;; Refresh build settings from xcodebuild (async)
+      (when (and project-root scheme
+                 (fboundp 'swift-project-settings-fetch-build-info))
+        (swift-project-settings-fetch-build-info project-root scheme sdk nil)))
+    ctx))
 
+(defun swift-development-run-app-on-device-after-build ()
+  "Run app on device after build using captured context."
+  (swift-development--post-build-common)
   ;; Use captured context for installation
   (let* ((ctx swift-development--build-context)
          (project-root (or (plist-get ctx :root) (xcode-project-project-root)))
          (scheme (plist-get ctx :scheme))
          (app-id (or (plist-get ctx :app-id) (xcode-project-fetch-or-load-app-identifier)))
          (build-folder (plist-get ctx :build-folder))
-         ;; Try to get from saved settings first
          (saved-folder (when (fboundp 'swift-project-settings-get-build-dir)
                          (swift-project-settings-get-build-dir project-root scheme "iphoneos"))))
-    
-    ;; Use saved folder if available, otherwise use context folder
     (let ((folder-to-use (or (and saved-folder (file-directory-p saved-folder) saved-folder)
                              (and build-folder (file-directory-p build-folder) build-folder))))
       (if folder-to-use
-          ;; Build folder exists - install directly
           (ios-device-install-app
            :buildfolder folder-to-use
            :appIdentifier app-id)
-        ;; Build folder missing - fetch from xcodebuild async
         (swift-notification-progress-update 'swift-build :percent 65 :message "Locating build...")
         (xcode-project-build-folder-async
          (lambda (folder)
@@ -369,44 +381,14 @@ This also invalidates the build status to force a rebuild on next compile."
                  (ios-device-install-app
                   :buildfolder folder
                   :appIdentifier app-id))
-             ;; Still no folder - error
              (swift-notification-progress-cancel 'swift-build)
              (message "Error: Could not determine build folder after build")))
          :device-type :device)))))
 
-(defun swift-development-run-app-after-build()
+(defun swift-development-run-app-after-build ()
   "Run app in simulator after build using captured context."
-  (let* ((ctx swift-development--build-context)
-         (scheme-raw (or (plist-get ctx :scheme) "Unknown"))
-         (scheme-name (if (fboundp 'xcode-project--clean-display-name)
-                          (xcode-project--clean-display-name scheme-raw)
-                        scheme-raw)))
-    (when (fboundp 'xcode-project-notify)
-      (xcode-project-notify
-       :message (format "Built %s in %s seconds"
-                        (propertize scheme-name 'face 'font-lock-builtin-face)
-                        (propertize (swift-development--compilation-time) 'face 'warning)))))
-
-  ;; Update progress bar - moving to install phase
-  (when (fboundp 'swift-notification-progress-update)
-    (swift-notification-progress-update 'swift-build :percent 65 :message "Installing..."))
-
-  ;; Save last-modified file to settings
-  (let* ((ctx swift-development--build-context)
-         (project-root (or (plist-get ctx :root) (xcode-project-project-root)))
-         (scheme (plist-get ctx :scheme))
-         (last-modified (swift-development-get-last-modified-file)))
-    (when (and project-root last-modified (fboundp 'swift-project-settings-update))
-      (swift-project-settings-update project-root :last-modified-file last-modified))
-
-    ;; Refresh build settings from xcodebuild (async, updates deployment-target etc.)
-    (when (and project-root scheme
-               (fboundp 'swift-project-settings-fetch-build-info))
-      (let ((sdk (if (eq swift-development--device-choice t) "iphoneos" "iphonesimulator")))
-        (swift-project-settings-fetch-build-info project-root scheme sdk nil))))
-
+  (swift-development--post-build-common)
   (swift-development-cleanup)
-
   ;; Use captured context for installation
   (let* ((ctx swift-development--build-context)
          (root (or (plist-get ctx :root) (xcode-project-project-root)))
@@ -414,21 +396,16 @@ This also invalidates the build status to force a rebuild on next compile."
          (sim-id (or (plist-get ctx :sim-id) (ios-simulator-simulator-identifier)))
          (app-id (or (plist-get ctx :app-id) (xcode-project-fetch-or-load-app-identifier)))
          (build-folder (plist-get ctx :build-folder))
-         ;; Try to get from saved settings first
          (saved-folder (when (fboundp 'swift-project-settings-get-build-dir)
                          (swift-project-settings-get-build-dir root scheme "iphonesimulator"))))
-    
-    ;; Use saved folder if available, otherwise use context folder
     (let ((folder-to-use (or (and saved-folder (file-directory-p saved-folder) saved-folder)
                              (and build-folder (file-directory-p build-folder) build-folder))))
       (if folder-to-use
-          ;; Build folder exists - install directly
           (ios-simulator-install-and-run-app
            :rootfolder root
            :build-folder folder-to-use
            :simulatorId sim-id
            :appIdentifier app-id)
-        ;; Build folder missing - fetch from xcodebuild async
         (swift-notification-progress-update 'swift-build :percent 65 :message "Locating build...")
         (xcode-project-build-folder-async
          (lambda (folder)
@@ -441,7 +418,6 @@ This also invalidates the build status to force a rebuild on next compile."
                   :build-folder folder
                   :simulatorId sim-id
                   :appIdentifier app-id))
-             ;; Still no folder - error
              (swift-notification-progress-cancel 'swift-build)
              (message "Error: Could not determine build folder after build")))
          :device-type :simulator)))))
@@ -529,9 +505,9 @@ Only counts errors/warnings without full parsing or UI updates."
     
     ;; Only update mode line if there are issues
     (when (or (> error-count 0) (> warning-count 0))
-      (xcode-project-safe-mode-line-notification 
+      (xcode-project-safe-mode-line-notification
        :message (format "%d error(s), %d warning(s)" error-count warning-count)
-       :urgency 'normal))))
+       :seconds 3))))
 
 (defun swift-development-run-periphery-async (output)
   "Run periphery analysis on OUTPUT asynchronously to avoid blocking UI.
@@ -555,24 +531,45 @@ Uses intelligent truncation and caching for large outputs."
 
 (defun swift-development-truncate-output-intelligently (output)
   "Truncate large OUTPUT intelligently, keeping error-relevant portions.
-Keeps the end of the output where errors typically appear, and any lines with 'error' or 'warning'."
-  (let* ((lines (split-string output "\n"))
-         (total-lines (length lines))
-         (keep-last-n 500)  ; Keep last 500 lines
+Keeps the last ~500 lines where build status appears, plus any
+error/warning lines from earlier in the output.
+Operates on the string directly to avoid splitting megabytes of text."
+  (let* ((output-len (length output))
+         ;; Find position ~500 lines from end by searching backwards for newlines
+         (tail-start (let ((pos output-len)
+                           (count 0))
+                       (while (and (> pos 0) (< count 500))
+                         (setq pos (or (string-match-p "\n" (substring output 0 pos)
+                                                       ;; search backwards by finding last newline
+                                                       )
+                                       0))
+                         ;; Simpler: just find the 500th newline from end
+                         (setq pos 0 count 500))
+                       pos))
+         ;; Use a more efficient approach: find cut point with reverse scan
+         (cut-pos (let ((pos output-len)
+                        (newline-count 0))
+                    (while (and (> pos 0) (< newline-count 500))
+                      (setq pos (1- pos))
+                      (when (= (aref output pos) ?\n)
+                        (setq newline-count (1+ newline-count))))
+                    (1+ pos)))
          (error-lines '()))
-    
-    ;; Collect lines containing errors/warnings from earlier in the output
-    (when (> total-lines keep-last-n)
-      (dolist (line (seq-take lines (- total-lines keep-last-n)))
-        (when (string-match-p "\\(error\\|warning\\|failed\\):" line)
-          (push line error-lines))))
-    
-    ;; Combine error lines with the last portion of output
-    (string-join
-     (append (nreverse error-lines)
-             '("... [truncated for performance] ...")
-             (seq-drop lines (max 0 (- total-lines keep-last-n))))
-     "\n")))
+    (if (<= cut-pos 0)
+        output  ; Output is short enough, return as-is
+      ;; Scan the truncated prefix for error/warning lines
+      (with-temp-buffer
+        (insert (substring output 0 cut-pos))
+        (goto-char (point-min))
+        (while (re-search-forward "^.*\\(?:error\\|warning\\|failed\\):.*$" nil t)
+          (push (match-string 0) error-lines)))
+      ;; Combine error lines + truncation marker + tail
+      (concat
+       (when error-lines
+         (concat (string-join (nreverse error-lines) "\n")
+                 "\n"))
+       "... [truncated for performance] ...\n"
+       (substring output cut-pos)))))
 
 (defun swift-development-run-xcode-build-server-parse (output)
   "Run xcode-build-server parse on OUTPUT asynchronously, avoiding .compile conflicts."
@@ -857,16 +854,61 @@ Returns a cons cell (PROCESS . LOG-BUFFER) where LOG-BUFFER accumulates the buil
           (cons process log-buffer))))))
 
 (defcustom swift-development-use-async-rebuild-check t
-  "Use async (non-blocking) rebuild detection when compiling.
-When t, file scanning won't freeze Emacs (recommended for large projects).
-When nil, uses faster synchronous check (may freeze Emacs briefly)."
+  "Deprecated: kept for backwards compatibility.
+Rebuild detection is now always synchronous (fast enough to not block)."
   :type 'boolean
   :group 'swift-development)
 
+(defun swift-development--run-up-to-date-app (run)
+  "Run an already-built app when build is up-to-date.
+RUN should be non-nil to actually launch the app."
+  (when run
+    (condition-case err
+        (let* ((for-device (eq swift-development--device-choice t))
+               (device-type (if for-device :device :simulator))
+               (root (xcode-project-project-root))
+               (build-folder (xcode-project-build-folder :device-type device-type))
+               (app-id (xcode-project-fetch-or-load-app-identifier)))
+          (if for-device
+              ;; Physical device path
+              (progn
+                (when swift-development-debug
+                  (message "Running on physical device (build up-to-date)"))
+                (ios-device-install-app
+                 :buildfolder build-folder
+                 :appIdentifier app-id))
+            ;; Simulator path
+            (let* ((sim-id (ios-simulator-simulator-identifier))
+                   (app-name (when (fboundp 'ios-simulator-get-app-name-fast)
+                               (ios-simulator-get-app-name-fast build-folder))))
+              (when swift-development-debug
+                (message "Run up-to-date: root=%s build-folder=%s sim-id=%s app-id=%s app-name=%s"
+                         root build-folder sim-id app-id app-name))
+              ;; Check for nil values before running - if missing, trigger build
+              (if (or (not root) (not build-folder) (not sim-id) (not app-id) (not app-name))
+                  (progn
+                    (when swift-development-debug
+                      (message "Missing values - triggering build instead of run"))
+                    (swift-development--do-compile :run t))
+                ;; All values present - run directly
+                (when swift-development-use-periphery
+                  (when (fboundp 'periphery-kill-buffer)
+                    (periphery-kill-buffer)))
+                (when (fboundp 'ios-simulator-kill-buffer)
+                  (ios-simulator-kill-buffer))
+                (require 'ios-simulator)
+                (ios-simulator-install-and-run-app
+                 :rootfolder root
+                 :build-folder build-folder
+                 :appIdentifier app-id
+                 :simulatorId sim-id)))))
+      (error
+       (message "Error running app: %s" (error-message-string err))
+       (message "Try running with prefix arg to force rebuild: C-u C-c C-c")))))
+
 (cl-defun swift-development-compile (&key run force)
   "Build project using xcodebuild (as RUN).
-If FORCE is nil, skip compilation if sources are unchanged.
-Uses async rebuild check if swift-development-use-async-rebuild-check is t."
+If FORCE is non-nil, always recompile even if sources are unchanged."
 
   ;; Clear periphery error list immediately at build start
   (when (fboundp 'periphery-clear)
@@ -881,151 +923,35 @@ Uses async rebuild check if swift-development-use-async-rebuild-check is t."
      :message "Starting build..."
      :percent 0))
 
-  (save-some-buffers t)
-
   (if (xcode-project-is-xcodeproject)
       (progn
-        ;; Setup current project first to ensure settings are loaded for correct project
-        ;; This handles project switching - if project changed, it resets cached values
-        ;; and loads settings from .swift-development/settings
-        ;; Note: This is fast when project hasn't changed (just a string comparison)
+        ;; Setup current project first to ensure settings are loaded
+        ;; Handles project switching - fast when project hasn't changed
         (when (fboundp 'xcode-project-setup-current-project)
           (xcode-project-setup-current-project (swift-project-root)))
 
         ;; Start simulator early (async, non-blocking) so it's ready when build completes
-        ;; Only for simulator builds, not physical device
         (when (and run (not (eq swift-development--device-choice t)))
           (require 'ios-simulator)
           (let ((sim-id (ios-simulator-simulator-identifier)))
             (when sim-id
               (ios-simulator-setup-simulator-dwim sim-id))))
 
-        ;; Use async or sync check based on configuration
-        (if (and (not force) swift-development-use-async-rebuild-check)
-            ;; Async path - doesn't block Emacs
-            ;; Update progress bar to show we're checking cache
+        ;; Check if rebuild is needed (fast synchronous check)
+        (if (and (not force) (not (swift-development-needs-rebuild-p)))
             (progn
-              (when (fboundp 'swift-notification-progress-update)
-                (swift-notification-progress-update 'swift-build
-                                                    :percent 5
-                                                    :message "Checking build cache..."))
-              ;; IMPORTANT: Capture ALL project info NOW before going async
-              (let* ((device-type (if (eq swift-development--device-choice t) :device :simulator))
-                     (captured-root (xcode-project-project-root))
-                     (captured-build-folder (xcode-project-build-folder :device-type device-type))
-                     (captured-app-id (xcode-project-fetch-or-load-app-identifier))
-                     (captured-device-choice swift-development--device-choice))
-                (when swift-development-debug
-                  (message "Captured before async: root=%s, build-folder=%s, app-id=%s"
-                           captured-root captured-build-folder captured-app-id))
-                (swift-development-needs-rebuild-async-p
-               (lambda (needs-rebuild)
-                 (if needs-rebuild
-                     (swift-development--do-compile :run run)
-                   (progn
-                     ;; Finish progress bar - build was skipped
-                     (when (fboundp 'swift-notification-progress-finish)
-                       (swift-notification-progress-finish 'swift-build "Build up-to-date"))
-                     ;; When skipping build, need to run the app
-                     (when run
-                       (condition-case err
-                           (if captured-device-choice
-                               ;; Physical device path
-                               (progn
-                                 (when swift-development-debug
-                                   (message "Running on physical device with captured values"))
-                                 (ios-device-install-app
-                                  :buildfolder captured-build-folder
-                                  :appIdentifier captured-app-id))
-                             ;; Simulator path
-                             (let* ((root captured-root)
-                                    (build-folder captured-build-folder)
-                                    (app-id captured-app-id)
-                                    (sim-id (ios-simulator-simulator-identifier))
-                                    (app-name (when (fboundp 'ios-simulator-get-app-name-fast)
-                                                (ios-simulator-get-app-name-fast build-folder)))
-                                    (sim-name (when (fboundp 'ios-simulator-simulator-name-from)
-                                                (ios-simulator-simulator-name-from :id sim-id))))
-                               (when swift-development-debug
-                                 (message "Debug - root: %s, build-folder: %s, sim-id: %s, app-id: %s, app-name: %s, sim-name: %s"
-                                          root build-folder sim-id app-id app-name sim-name))
-                               ;; Check for nil values before running - if missing, trigger build
-                               (if (or (not root) (not build-folder) (not sim-id) (not app-id) (not app-name))
-                                   (progn
-                                     (when swift-development-debug
-                                       (message "Missing values - triggering build instead of run")
-                                       (message "  Build folder: %s" (or build-folder "NIL"))
-                                       (message "  App name: %s" (or app-name "NIL")))
-                                     ;; Trigger actual build since app doesn't exist
-                                     (swift-development--do-compile :run t))
-                                 ;; All values present - setup and run DIRECTLY
-                                 (progn
-                                   (when swift-development-debug
-                                     (message "Running app directly with captured values (no new lookups)"))
-                                   (when swift-development-use-periphery
-                                     (when (fboundp 'periphery-kill-buffer)
-                                       (periphery-kill-buffer)))
-                                   (when (fboundp 'ios-simulator-kill-buffer)
-                                     (ios-simulator-kill-buffer))
-                                   ;; Call install-and-run DIRECTLY with captured data
-                                   (require 'ios-simulator)
-                                   (ios-simulator-install-and-run-app
-                                    :rootfolder root
-                                    :build-folder build-folder
-                                    :appIdentifier app-id
-                                    :simulatorId sim-id)))))
-                         (error
-                          (message "Error running app: %s" (error-message-string err))
-                          (message "Try running with prefix arg to force rebuild: C-u C-c C-c")))))))))
-              ;; Return t to prevent fall-through to sync path
-              t)
-          ;; Sync path or forced build
-          (if (and (not force) (not (swift-development-needs-rebuild-p)))
-              (progn
-                (when (fboundp 'xcode-project-notify)
-                  (xcode-project-notify
-                   :message (propertize "Build up-to-date, skipping compilation" 'face 'success)
-                   :seconds 2
-                   :reset t))
-                ;; When skipping build, ensure project is setup (sync path too)
-                (when run
-                  (condition-case err
-                      (let* ((root (xcode-project-project-root))
-                             (build-folder (xcode-project-build-folder :device-type :simulator))
-                             (sim-id (ios-simulator-simulator-identifier))
-                             (app-id (xcode-project-fetch-or-load-app-identifier))
-                             (app-name (when (fboundp 'ios-simulator-get-app-name-fast)
-                                        (ios-simulator-get-app-name-fast build-folder)))
-                             (sim-name (when (fboundp 'ios-simulator-simulator-name-from)
-                                        (ios-simulator-simulator-name-from :id sim-id))))
-                        (when swift-development-debug
-                          (message "Debug (sync) - root: %s, build-folder: %s, sim-id: %s, app-id: %s, app-name: %s, sim-name: %s"
-                                  root build-folder sim-id app-id app-name sim-name))
-                        ;; Check for nil values before running
-                        (if (or (not root) (not build-folder) (not sim-id) (not app-id) (not app-name))
-                            (progn
-                              (message "Error: Missing required values to run app")
-                              (message "  Project root: %s" (or root "NIL"))
-                              (message "  Build folder: %s" (or build-folder "NIL"))
-                              (message "  Simulator ID: %s" (or sim-id "NIL"))
-                              (message "  App ID: %s" (or app-id "NIL"))
-                              (message "  App name: %s" (or app-name "NIL"))
-                              (message "  Simulator name: %s" (or sim-name "NIL"))
-                              (message "Try running with prefix arg to force rebuild: C-u C-c C-c"))
-                          ;; All values present - setup and run
-                          (progn
-                            (xcode-project-setup-project)
-                            (xcode-project-setup-xcodebuildserver)
-                            ;; Force simulator to use these values
-                            (setq current-simulator-id sim-id
-                                  xcode-project--current-app-identifier app-id
-                                  current-root-folder-simulator root
-                                  current-app-name app-name)
-                            (swift-development-run))))
-                    (error
-                     (message "Error running app: %s" (error-message-string err))
-                     (message "Try running with prefix arg to force rebuild: C-u C-c C-c")))))
-            (swift-development--do-compile :run run))))
+              ;; Finish progress bar - build was skipped
+              (when (fboundp 'swift-notification-progress-finish)
+                (swift-notification-progress-finish 'swift-build "Build up-to-date"))
+              (when (fboundp 'xcode-project-notify)
+                (xcode-project-notify
+                 :message (propertize "Build up-to-date, skipping compilation" 'face 'success)
+                 :seconds 2
+                 :reset t))
+              ;; Run the already-built app if requested
+              (swift-development--run-up-to-date-app run))
+          ;; Sources changed or force - compile
+          (swift-development--do-compile :run run)))
     (if (swift-development-is-a-swift-package-base-project)
         (swift-development-build-swift-package)
       (progn
@@ -1037,6 +963,8 @@ Uses async rebuild check if swift-development-use-async-rebuild-check is t."
 (cl-defun swift-development--do-compile (&key run)
   "Internal function to perform the actual compilation.
 RUN specifies whether to run after building."
+  ;; Save modified buffers before building
+  (save-some-buffers t)
   ;; Update progress bar - starting compilation
   (when (fboundp 'swift-notification-progress-update)
     (swift-notification-progress-update 'swift-build
@@ -1151,12 +1079,12 @@ expensive recursive search.  Returns the first matching file or nil."
           (message "Running: %s" cmd))
         (start-process-shell-command (format "precompile-%s" framework) nil cmd)))))
 
-(cl-defun swift-development-compile-for-simulator (&key run)
-  "Compile app for simulator with optional RUN after completion."
+(cl-defun swift-development--compile-target (&key run for-device)
+  "Internal compile function for both simulator and device targets.
+RUN: run app after build.  FOR-DEVICE: t for physical device, nil for simulator."
   (swift-development-cleanup)
-  (xcode-build-config-setup-build-environment :for-device nil)
+  (xcode-build-config-setup-build-environment :for-device for-device)
   (xcode-build-config-enable-build-caching)
-  ;; (swift-development-precompile-common-headers)
   (setq swift-development--current-build-command nil)
   ;; Clear build folder cache to ensure fresh detection
   (setq xcode-project--current-build-folder nil
@@ -1165,19 +1093,32 @@ expensive recursive search.  Returns the first matching file or nil."
   (setq run-once-compiled run)
 
   ;; Capture build context before async build starts
-  (swift-development--capture-build-context nil)
+  (swift-development--capture-build-context for-device)
 
-  (let ((build-command (xcode-build-config-build-app-command
-                        :sim-id (ios-simulator-simulator-identifier)))
-        (default-directory (xcode-project-project-root)))
+  (let* ((build-command (if for-device
+                            (xcode-build-config-build-app-command
+                             :device-id (ios-device-udid))
+                          (xcode-build-config-build-app-command
+                           :sim-id (ios-simulator-simulator-identifier))))
+         (default-directory (xcode-project-project-root))
+         (target-name (if for-device
+                          (propertize "Physical Device" 'face 'font-lock-negation-char-face)
+                        (propertize (swift-development-format-simulator-name
+                                    (ios-simulator-simulator-name))
+                                   'face 'font-lock-negation-char-face)))
+         (run-callback (if for-device
+                           #'swift-development-run-app-on-device-after-build
+                         #'swift-development-run-app-after-build)))
+
+    (when swift-development-debug
+      (swift-development-log-debug "Build-folder: %s" (xcode-project-derived-data-path)))
 
     (when (fboundp 'xcode-project-notify)
       (xcode-project-notify
        :message (format "Building: %s|%s"
                         (propertize (xcode-project-scheme-display-name)
                                    'face 'font-lock-builtin-face)
-                        (propertize (swift-development-format-simulator-name (ios-simulator-simulator-name))
-                                   'face 'font-lock-negation-char-face))
+                        target-name)
        :seconds 3))
 
     (xcode-project-setup-xcodebuildserver)
@@ -1187,67 +1128,25 @@ expensive recursive search.  Returns the first matching file or nil."
          :command build-command
          :callback (lambda (text)
                      (if run-once-compiled
-                         (swift-development-check-for-errors text #'swift-development-run-app-after-build)
+                         (swift-development-check-for-errors text run-callback)
                        (swift-development-check-for-errors text #'swift-development-successful-build)))
          :update-callback (lambda (text)
                             (xcode-project-parse-compile-lines-output :input text)))
-      ;; When using compilation-mode, we handle it differently
       (swift-development-compile-with-progress
        :command build-command
        :callback (lambda (_text)
-                   ;; Only run/install if build was successful (callback is only called on success now)
                    (if run-once-compiled
-                       (swift-development-run-app-after-build)
+                       (funcall run-callback)
                      (swift-development-successful-build)))
        :update-callback nil))))
+
+(cl-defun swift-development-compile-for-simulator (&key run)
+  "Compile app for simulator with optional RUN after completion."
+  (swift-development--compile-target :run run :for-device nil))
 
 (defun swift-development-compile-for-device (&key run)
   "Compile and optionally RUN on device."
-  (swift-development-cleanup)
-  (xcode-build-config-setup-build-environment :for-device t)
-  (xcode-build-config-enable-build-caching)
-  (swift-development-precompile-common-headers)
-  (setq swift-development--current-build-command nil)
-  (xcode-project-setup-project)
-  (setq run-once-compiled run)
-
-  ;; Capture build context before async build starts
-  (swift-development--capture-build-context t)
-
-  (let ((build-command (xcode-build-config-build-app-command
-                        :device-id (ios-device-udid)))
-        (default-directory (xcode-project-project-root)))
-
-    (swift-development-log-debug "Build-folder: %s" (xcode-project-derived-data-path))
-
-    (xcode-project-setup-xcodebuildserver)
-    (when (fboundp 'xcode-project-notify)
-      (xcode-project-notify
-       :message (format "Building: %s|%s"
-                        (propertize (xcode-project-scheme-display-name) 'face 'font-lock-builtin-face)
-                        (propertize "Physical Device" 'face 'font-lock-negation-char-face))
-       :seconds 3))
-
-    (if swift-development-use-periphery
-        (swift-development-compile-with-progress
-         :command build-command
-         :callback (lambda (text)
-                     (if run-once-compiled
-                         (swift-development-check-for-errors
-                                   text #'swift-development-run-app-on-device-after-build)
-                       (swift-development-check-for-errors
-                        text #'swift-development-successful-build)))
-         :update-callback (lambda (text)
-                                     (xcode-project-parse-compile-lines-output :input text)))
-      ;; When using compilation-mode, we handle it differently
-      (swift-development-compile-with-progress
-       :command build-command
-       :callback (lambda (_text)
-                   ;; Only run/install if build was successful (callback is only called on success now)
-                   (if run-once-compiled
-                       (swift-development-run-app-on-device-after-build)
-                     (swift-development-successful-build)))
-       :update-callback nil))))
+  (swift-development--compile-target :run run :for-device t))
 
 ;; ============================================================================
 ;; Smart Build Detection - Skip compilation if sources unchanged
@@ -1257,6 +1156,33 @@ expensive recursive search.  Returns the first matching file or nil."
 ;; Source File Discovery
 ;; ============================================================================
 
+(defvar swift-development--fd-available 'unknown
+  "Cache whether fd is available.  One of `unknown', t, or nil.")
+
+(defun swift-development--fd-available-p ()
+  "Return non-nil if `fd' is available on the system."
+  (when (eq swift-development--fd-available 'unknown)
+    (setq swift-development--fd-available
+          (eq 0 (condition-case nil
+                    (call-process "fd" nil nil nil "--version")
+                  (error 1)))))
+  swift-development--fd-available)
+
+(defun swift-development--build-fd-command ()
+  "Build an fd command that finds source files respecting watched extensions.
+fd automatically respects .gitignore so .build/, DerivedData/, .git/ are excluded."
+  (let ((ext-args (mapconcat (lambda (ext) (format "-e %s" ext))
+                             swift-development-watched-extensions
+                             " "))
+        ;; Convert glob ignore patterns to fd --exclude flags
+        ;; fd patterns don't need the leading */
+        (exclude-args (mapconcat
+                       (lambda (pattern)
+                         (format "--exclude '%s'" pattern))
+                       swift-development-ignore-paths
+                       " ")))
+    (format "fd -t f %s %s" ext-args exclude-args)))
+
 (defun swift-development--build-find-patterns ()
   "Build find command patterns for watched file extensions."
   (mapconcat (lambda (ext)
@@ -1265,39 +1191,45 @@ expensive recursive search.  Returns the first matching file or nil."
              " -o "))
 
 (defun swift-development--build-find-excludes ()
-  "Build find command exclusion patterns from swift-development-ignore-paths."
+  "Build find command exclusion patterns from `swift-development-ignore-paths'."
   (mapconcat (lambda (pattern)
                (format "-not -path '%s'" pattern))
              (append '("*/.*" "*/DerivedData/*")
                      swift-development-ignore-paths)
              " "))
 
+(defun swift-development--build-source-file-cmd ()
+  "Build command to list all source files.  Prefers fd over find."
+  (if (swift-development--fd-available-p)
+      (swift-development--build-fd-command)
+    (let ((patterns (swift-development--build-find-patterns))
+          (excludes (swift-development--build-find-excludes)))
+      (format "find . \\( %s \\) %s -type f" patterns excludes))))
+
 (defun swift-development-find-all-source-files ()
   "Find all source files in project (cached for 60 seconds).
-Includes files matching swift-development-watched-extensions.
-Excludes paths matching patterns in swift-development-ignore-paths."
+Includes files matching `swift-development-watched-extensions'.
+Excludes paths matching patterns in `swift-development-ignore-paths'.
+Uses fd when available for significantly faster results."
   (let* ((project-root (xcode-project-project-root))
          (cache-key (when (fboundp 'swift-cache-project-key)
                       (swift-cache-project-key project-root "source-files")))
-         (patterns (swift-development--build-find-patterns))
-         (excludes (swift-development--build-find-excludes))
-         (find-cmd (format "find . \\( %s \\) %s -type f" patterns excludes)))
+         (cmd (swift-development--build-source-file-cmd)))
     (swift-cache-with cache-key swift-development-cache-ttl
       (let ((default-directory project-root)
-            (output (swift-async-run-sync find-cmd :timeout 30)))
+            (output (swift-async-run-sync cmd :timeout 30)))
         (split-string (or output "") "\n" t)))))
 
 (defun swift-development-find-all-source-files-async (callback)
   "Find all source files in project asynchronously.
-Calls CALLBACK with list of files when complete. Does not block Emacs.
-Includes files matching swift-development-watched-extensions.
-Excludes paths matching patterns in swift-development-ignore-paths."
+Calls CALLBACK with list of files when complete.  Does not block Emacs.
+Includes files matching `swift-development-watched-extensions'.
+Excludes paths matching patterns in `swift-development-ignore-paths'.
+Uses fd when available for significantly faster results."
   (let* ((project-root (xcode-project-project-root))
          (cache-key (when (fboundp 'swift-cache-project-key)
                       (swift-cache-project-key project-root "source-files")))
-         (patterns (swift-development--build-find-patterns))
-         (excludes (swift-development--build-find-excludes))
-         (find-cmd (format "find . \\( %s \\) %s -type f" patterns excludes)))
+         (cmd (swift-development--build-source-file-cmd)))
 
     ;; Check cache first
     (if (and cache-key (fboundp 'swift-cache-get))
@@ -1308,9 +1240,9 @@ Excludes paths matching patterns in swift-development-ignore-paths."
                   (message "Using cached source file list (%d files)" (length cached)))
                 (funcall callback cached))
             ;; Cache miss - fetch async
-            (swift-development--find-files-async project-root find-cmd cache-key callback)))
+            (swift-development--find-files-async project-root cmd cache-key callback)))
       ;; No cache available - fetch async
-      (swift-development--find-files-async project-root find-cmd nil callback))))
+      (swift-development--find-files-async project-root cmd nil callback))))
 
 (defun swift-development--find-files-async (project-root find-cmd cache-key callback)
   "Run find command asynchronously and call CALLBACK with results.
@@ -1344,23 +1276,24 @@ CACHE-KEY if non-nil will be used to cache results."
 (defun swift-development-get-last-modified-file ()
   "Get the most recently modified source file in project.
 Returns (timestamp . filepath) or nil if no files found.
-Uses find + stat for fast detection (0.1-0.5s for 1000+ files)."
+Uses fd when available (~60ms) with fallback to find (~5s)."
   (let* ((project-root (xcode-project-project-root))
          (default-directory project-root)
-         ;; Build find pattern from watched extensions
-         (patterns (mapconcat (lambda (ext) (format "-name \"*.%s\"" ext))
-                             swift-development-watched-extensions
-                             " -o "))
-         ;; Apply ignore patterns
-         (ignore-patterns (when swift-development-ignore-paths
-                           (mapconcat (lambda (pattern)
-                                       (format "! -path \"%s\"" pattern))
-                                     swift-development-ignore-paths
-                                     " ")))
-         ;; Full find command: find files, get mtime + path, sort by mtime descending, take first
-         (cmd (format "find . \\( %s \\) %s -exec stat -f \"%%m %%N\" {} + 2>/dev/null | sort -rn | head -1"
-                     patterns
-                     (or ignore-patterns "")))
+         ;; Use fd | xargs stat for ~100x speedup over find -exec stat
+         ;; fd respects .gitignore automatically, excluding .build/, DerivedData/, .git/
+         (cmd (if (swift-development--fd-available-p)
+                  (format "%s -0 | xargs -0 stat -f '%%m %%N' | sort -rn | head -1"
+                          (swift-development--build-fd-command))
+                (let ((patterns (mapconcat (lambda (ext) (format "-name \"*.%s\"" ext))
+                                          swift-development-watched-extensions
+                                          " -o "))
+                      (ignore-patterns (when swift-development-ignore-paths
+                                         (mapconcat (lambda (pattern)
+                                                      (format "! -path \"%s\"" pattern))
+                                                    swift-development-ignore-paths
+                                                    " "))))
+                  (format "find . \\( %s \\) %s -exec stat -f \"%%m %%N\" {} + 2>/dev/null | sort -rn | head -1"
+                          patterns (or ignore-patterns "")))))
          (output (string-trim (or (swift-async-run-sync cmd :timeout 10) ""))))
 
     (when swift-development-debug

@@ -24,6 +24,7 @@
 (require 'periphery-helper nil t)
 (require 'swift-cache)   ; Caching system
 (require 'swift-async)   ; Robust async utilities
+(require 'ios-device nil t) ; Physical device management (optional)
 
 ;; Legacy compatibility - now using swift-notification
 (defvar mode-line-hud-available-p swift-notification--mode-line-hud-available-p
@@ -235,11 +236,19 @@ Result is cached for 1 hour since Xcode path rarely changes."
   "Get file extension for TYPE (:project or :workspace)."
   (plist-get xcode-project-extensions type))
 
-(defconst xcodeproject-extension (xcode-project-get-extension :project)
-  "Xcode project extensions.")
+;; Legacy aliases declared before referents to satisfy byte-compiler
+(defvar xcodeproject-extension)
+(defvar workspace-extension)
 
-(defconst workspace-extension (xcode-project-get-extension :workspace)
-  "Xcode workspace extensions.")
+(defconst xcode-project--project-extension (xcode-project-get-extension :project)
+  "Regex for Xcode project file extensions.")
+
+(defconst xcode-project--workspace-extension (xcode-project-get-extension :workspace)
+  "Regex for Xcode workspace file extensions.")
+
+;; Point legacy names to new ones for backwards compatibility
+(defvaralias 'xcodeproject-extension 'xcode-project--project-extension)
+(defvaralias 'workspace-extension 'xcode-project--workspace-extension)
 
 (defun xcode-project-filename-by-extension (extension directory)
   "Get filename (without extension) for first file matching EXTENSION in DIRECTORY."
@@ -253,17 +262,17 @@ Result is cached for 1 hour since Xcode path rarely changes."
 
 (defun xcode-project-project-directory-p (directory)
   "Check if xcodeproj file exists in DIRECTORY or immediate subdirectories."
-  (or (xcode-project-directory-contains-p xcodeproject-extension directory)
+  (or (xcode-project-directory-contains-p xcode-project--project-extension directory)
       (cl-some (lambda (dir)
                  (let ((full-dir (expand-file-name dir directory)))
                    (and (file-directory-p full-dir)
                         (not (member dir '("." "..")))
-                        (xcode-project-directory-contains-p xcodeproject-extension full-dir))))
+                        (xcode-project-directory-contains-p xcode-project--project-extension full-dir))))
                (directory-files directory))))
 
 (defun xcode-project-workspace-directory-p (directory)
   "Check if xcworkspace file exists in DIRECTORY."
-  (xcode-project-directory-contains-p workspace-extension directory))
+  (xcode-project-directory-contains-p xcode-project--workspace-extension directory))
 
 (defun xcode-project-find-ancestor-or-self-directory (predicate &optional directory)
   "Find first ancestor directory (including DIRECTORY itself) where PREDICATE returns non-nil.
@@ -281,13 +290,13 @@ If DIRECTORY is nil, use `default-directory'."
   "Try to find xcode project in DIRECTORY or its subdirectories."
   (when-let* ((start-dir (or directory default-directory))
               (found-dir (xcode-project-find-ancestor-or-self-directory 'xcode-project-project-directory-p start-dir)))
-    (if (xcode-project-directory-contains-p xcodeproject-extension found-dir)
+    (if (xcode-project-directory-contains-p xcode-project--project-extension found-dir)
         found-dir
       (cl-some (lambda (dir)
                  (let ((full-dir (expand-file-name dir found-dir)))
                    (and (file-directory-p full-dir)
                         (not (member dir '("." "..")))
-                        (xcode-project-directory-contains-p xcodeproject-extension full-dir)
+                        (xcode-project-directory-contains-p xcode-project--project-extension full-dir)
                         full-dir)))
                (directory-files found-dir)))))
 
@@ -298,12 +307,12 @@ If DIRECTORY is nil, use `default-directory'."
 (defun xcode-project-workspace-name ()
   "Get the workspace name in current or ancestor directories."
   (when-let* ((dir (xcode-project-find-workspace-directory)))
-    (xcode-project-filename-by-extension workspace-extension dir)))
+    (xcode-project-filename-by-extension xcode-project--workspace-extension dir)))
 
 (defun xcode-project-project-name ()
   "Get the project name in current or ancestor directories."
   (when-let* ((dir (xcode-project-find-xcode-project-directory)))
-    (xcode-project-filename-by-extension xcodeproject-extension dir)))
+    (xcode-project-filename-by-extension xcode-project--project-extension dir)))
 
 (defun xcode-project-list-xcscheme-files (folder)
   "List the names of '.xcscheme' files in the xcshareddata/xcshemes subfolder of FOLDER.
@@ -400,30 +409,15 @@ Project path: %s"
                 nil)))))))
 
 (defun xcode-project-run-command-and-get-json (command)
-  "Run a shell COMMAND and return the JSON output.
+  "Run a shell COMMAND and return the parsed JSON output.
 Returns nil if command fails or produces invalid JSON.
-Uses timeout protection to prevent hangs."
-  (let* ((json-output (swift-async-run-sync command :timeout 10)))
+Uses `swift-async-run-sync' with timeout protection and JSON parsing."
+  (when xcode-project-debug
+    (message "Running command: %s" command))
+  (let ((result (swift-async-run-sync command :timeout 10 :parse-json t)))
     (when xcode-project-debug
-      (message "Command: %s" command)
-      (message "JSON output length: %d" (length (or json-output "")))
-      (when json-output
-        (message "JSON output preview: %s" (substring json-output 0 (min 200 (length json-output))))))
-    ;; Check if output is empty or whitespace only
-    (if (or (null json-output)
-            (string-empty-p json-output)
-            (string-match-p "\\`[[:space:]]*\\'" json-output))
-        (progn
-          (when xcode-project-debug
-            (message "Command returned empty output"))
-          nil)
-      (condition-case err
-          (json-read-from-string json-output)
-        (error
-         (when xcode-project-debug
-           (message "JSON parsing error: %s" (error-message-string err))
-           (message "Full JSON output: %s" json-output))
-         nil)))))
+      (message "Command result: %s" (if result "parsed JSON" "nil")))
+    result))
 
 (defun xcode-project-get-schemes-from-xcodebuild ()
   "Get list of schemes using xcodebuild -list command as fallback.
@@ -735,12 +729,11 @@ Returns a list of folder names, excluding hidden folders."
       (let* ((all-files (directory-files directory nil "^[^.].*" t))
              (folders (cl-remove-if-not
                       (lambda (folder)
-                        (let ((full-path (expand-file-name folder directory))
-                              (is-dir (file-directory-p (expand-file-name folder directory)))
-                              (not-dot (not (member folder '("." "..")))))
+                        (let* ((full-path (expand-file-name folder directory))
+                               (is-dir (file-directory-p full-path)))
                           (when xcode-project-debug
-                            (message "parse-build-folder: Checking %s -> dir:%s not-dot:%s" folder is-dir not-dot))
-                          (and is-dir not-dot)))
+                            (message "parse-build-folder: Checking %s -> dir:%s" folder is-dir))
+                          is-dir))
                       all-files)))
         (when xcode-project-debug
           (message "parse-build-folder: All files: %s" all-files)
@@ -1171,17 +1164,25 @@ This is the authoritative source - it asks xcodebuild directly."
      :workspace (xcode-project-get-workspace-or-project)
      :scheme xcode-project--current-xcode-scheme)))
 
+(defvar xcode-project--workspace-or-project-cache nil
+  "Cached result of `xcode-project-get-workspace-or-project'.")
+
 (defun xcode-project-get-workspace-or-project ()
   "Check if there is workspace or project.
-Returns nil if neither workspace nor project is found (e.g., pure Swift Package)."
-  (let ((workspace (xcode-project-workspace-name))
-        (projectname (xcode-project-project-name)))
-    (cond
-     (workspace
-      (format "-workspace %s.xcworkspace" (shell-quote-argument workspace)))
-     (projectname
-      (format "-project %s.xcodeproj" (shell-quote-argument projectname)))
-     (t nil))))
+Returns nil if neither workspace nor project is found (e.g., pure Swift Package).
+Result is cached per session and cleared on project reset."
+  (unless xcode-project--workspace-or-project-cache
+    (let ((workspace (xcode-project-workspace-name))
+          (projectname (xcode-project-project-name)))
+      (setq xcode-project--workspace-or-project-cache
+            (cond
+             (workspace
+              (format "-workspace %s.xcworkspace" (shell-quote-argument workspace)))
+             (projectname
+              (format "-project %s.xcodeproj" (shell-quote-argument projectname)))
+             (t 'none)))))  ; Use 'none sentinel to distinguish nil (not cached) from "no project"
+  (let ((val xcode-project--workspace-or-project-cache))
+    (if (eq val 'none) nil val)))
 
 (defun xcode-project-get-buildconfiguration-json ()
   "Return a cached version or load the build configuration."
@@ -1276,8 +1277,9 @@ Returns nil if neither workspace nor project is found (e.g., pure Swift Package)
               ;; Restoring a cached build-folder causes wrong SDK builds to be installed
 
               ;; Restore device choice (physical device vs simulator)
-              ;; This prevents asking the user every time they open a file
-              (when (boundp 'swift-development--device-choice)
+              ;; Only restore if no explicit choice has been made yet
+              (when (and (boundp 'swift-development--device-choice)
+                         (eq swift-development--device-choice 'unset))
                 (when-let* ((platform (plist-get settings :platform)))
                   (setq swift-development--device-choice
                         (string= platform "Physical Device"))
@@ -1388,14 +1390,14 @@ Shows that multi-project support is enabled via buffer-local variables."
   "Get the project root as a path string."
   (setq xcode-project--current-project-root (swift-project-root)))
 
+(defconst xcode-project--device-list '(("Simulator" nil)
+                                        ("Physical device" t))
+  "Choices for device or simulator selection menu.")
+
 (cl-defun xcode-project-device-or-simulator-menu (&key title)
-"Build device or simulator menu (as TITLE)."
-(defconst deviceList '(("Simulator" nil)
-                        ("Physical device" t)))
-(progn
-  (let* ((choices (seq-map (lambda (item) item) deviceList))
-          (choice (completing-read title choices)))
-    (car (cdr (assoc choice choices))))))
+  "Build device or simulator menu (as TITLE)."
+  (let* ((choice (completing-read title xcode-project--device-list)))
+    (car (cdr (assoc choice xcode-project--device-list)))))
 
 (defun xcode-addition-ask-for-device-or-simulator ()
   "Show menu for running on simulator or device."
@@ -1423,13 +1425,19 @@ Uses filtered scheme list (excludes test schemes) for build/run operations."
     (cancel-timer xcode-project--periphery-debounce-timer)
     (setq xcode-project--periphery-debounce-timer nil))
   
-  ;; 2. Reset simulator state (but don't choose new one yet)
+  ;; 2. Reset simulator and device state (but don't choose new ones yet)
   (when (fboundp 'ios-simulator-reset)
     (ios-simulator-reset nil))
+  (when (fboundp 'ios-device-reset)
+    (ios-device-reset))
   (when (fboundp 'periphery-kill-buffer)
     (periphery-kill-buffer))
 
   ;; 3. Clear all state variables
+  ;; NOTE: swift-development--device-choice is NOT cleared here.
+  ;; It is a global variable managed by swift-development-reset.
+  ;; Clearing it here would break device selection when setup-current-project
+  ;; calls xcode-project-reset during buffer switches.
   (setq xcode-project--current-build-folder nil
         xcode-project--current-app-identifier nil
         xcode-project--current-build-configuration nil
@@ -1440,7 +1448,7 @@ Uses filtered scheme list (excludes test schemes) for build/run operations."
         xcode-project--current-errors-or-warnings nil
         xcode-project--current-is-xcode-project nil
         xcode-project--last-device-type nil
-        swift-development--device-choice 'unset)
+        xcode-project--workspace-or-project-cache nil)
 
   ;; 4. Clear swift-cache for build-settings, scheme-files, and xcodebuild-schemes
   (when (fboundp 'swift-cache-invalidate-pattern)
@@ -1459,21 +1467,23 @@ Uses filtered scheme list (excludes test schemes) for build/run operations."
     (let ((choice (completing-read "Run on: " '("Simulator" "Physical Device") nil t)))
       (setq swift-development--device-choice (string= choice "Physical Device")))
     
-    ;; 6b. Select scheme using filtered list (excludes test schemes)
+    ;; 6b. If physical device, select which device to use (single prompt)
+    (when (eq swift-development--device-choice t)
+      (ios-device-select-device))
+
+    ;; 6c. Select scheme using filtered list (excludes test schemes)
     (xcode-project-select-scheme)
     
-    ;; 6c. Clear build-settings cache AFTER scheme selection to ensure fresh fetch
-    ;; Cache keys are formatted as "project-root::build-settings-scheme-config-sdk"
-    ;; so we need to match the pattern within the full key
+    ;; 6d. Clear build-settings cache AFTER scheme selection to ensure fresh fetch
     (when (fboundp 'swift-cache-invalidate-pattern)
       (swift-cache-invalidate-pattern "::build-settings-"))
     
-    ;; 6d. Force next build
+    ;; 6e. Force next build
     (setq swift-development--force-next-build t)
     (when (boundp 'swift-development--last-build-succeeded)
       (setq swift-development--last-build-succeeded nil))
     
-    ;; 6e. If simulator, prompt for which one and boot it
+    ;; 6f. If simulator, prompt for which one and boot it
     (unless (eq swift-development--device-choice t)
       (when (fboundp 'ios-simulator-choose-simulator)
         (ios-simulator-choose-simulator))
@@ -1481,7 +1491,13 @@ Uses filtered scheme list (excludes test schemes) for build/run operations."
                  (fboundp 'ios-simulator-setup-simulator-dwim))
         (ios-simulator-setup-simulator-dwim (ios-simulator-simulator-identifier))))
     
-    ;; 6f. Fetch build info from xcodebuild (async)
+    ;; 6f. Persist device/simulator choice so setup-current-project restores it
+    (when (fboundp 'swift-project-settings-capture-from-variables)
+      (let ((root (xcode-project-project-root)))
+        (when root
+          (swift-project-settings-capture-from-variables root))))
+
+    ;; 6g. Fetch build info from xcodebuild (async)
     ;; This is the ONLY source of truth for build paths
     (let* ((project-root (xcode-project-project-root))
            (scheme xcode-project--current-xcode-scheme)
@@ -1554,39 +1570,32 @@ Automatically builds the app if sources have changed."
      (signal (car err) (cdr err)))))
 
 (defun xcode-project--setup-dape-progress-hooks ()
-  "Setup hooks to track dape debugger state and update progress accordingly."
-  (let ((attached-hook-fn nil)
-        (stopped-hook-fn nil)
-        (quit-hook-fn nil))
+  "Setup hooks to track dape debugger state and update progress accordingly.
+Uses dape 0.13+ hook names (dape-start-hook, dape-stopped-hook).
+All hook functions take zero arguments (called via `run-hooks')."
+  (let ((start-hook-fn nil)
+        (stopped-hook-fn nil))
     ;; Define hook functions that remove themselves after running
-    (setq attached-hook-fn
+    (setq start-hook-fn
           (lambda ()
             (when (fboundp 'swift-notification-progress-update)
               (swift-notification-progress-update 'debug-session
                                                   :percent 90
                                                   :message "Debugger connected, waiting for stop..."))
-            (remove-hook 'dape-on-initialized-hooks attached-hook-fn)))
-    
+            (remove-hook 'dape-start-hook start-hook-fn)))
+
     (setq stopped-hook-fn
-          (lambda (_conn)
+          (lambda ()
             ;; Debugger has stopped (attached and ready)
             (when (fboundp 'swift-notification-progress-finish)
               (swift-notification-progress-finish 'debug-session "Debugging"))
-            (remove-hook 'dape-on-stopped-hooks stopped-hook-fn)))
-    
-    (setq quit-hook-fn
-          (lambda (_conn)
-            ;; Debugger quit/disconnected - cancel progress if still active
-            (when (fboundp 'swift-notification-progress-cancel)
-              (swift-notification-progress-cancel 'debug-session))
-            (remove-hook 'dape-on-initialized-hooks attached-hook-fn)
-            (remove-hook 'dape-on-stopped-hooks stopped-hook-fn)
-            (remove-hook 'dape-on-quit-hooks quit-hook-fn)))
-    
+            (remove-hook 'dape-stopped-hook stopped-hook-fn)
+            ;; Also clean up start hook in case it wasn't triggered
+            (remove-hook 'dape-start-hook start-hook-fn)))
+
     ;; Add hooks
-    (add-hook 'dape-on-initialized-hooks attached-hook-fn)
-    (add-hook 'dape-on-stopped-hooks stopped-hook-fn)
-    (add-hook 'dape-on-quit-hooks quit-hook-fn)))
+    (add-hook 'dape-start-hook start-hook-fn)
+    (add-hook 'dape-stopped-hook stopped-hook-fn)))
 
 (defun xcode-project-setup-dape ()
   "Setup and start dape for iOS debugging.

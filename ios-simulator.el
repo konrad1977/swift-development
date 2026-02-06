@@ -29,9 +29,6 @@
 (require 'swift-project-settings nil t)
 (require 'swift-notification nil t)
 
-(with-eval-after-load 'json
-  (require 'json))
-
 (defcustom ios-simulator-debug nil
   "Enable debug mode for iOS simulator."
   :type 'boolean
@@ -217,7 +214,7 @@ When non-nil, apply syntax highlighting to log messages."
   "xcrun simctl list devices | grep -m 1 \"(Booted)\" | grep -E -o -i \"([0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12})\""
   "Get booted simulator id if any.")
 
-(defvar-local ios-simulator-mode-map
+(defvar ios-simulator-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c i t") #'ios-simulator-terminate-current-app)
     (define-key map (kbd "C-c i l") #'ios-simulator-change-language)
@@ -280,6 +277,49 @@ When non-nil, apply syntax highlighting to log messages."
 (defvar-local current-language-selection ios-simulator-default-language
   "Current language selection for the simulator.")
 
+
+;; ============================================================================
+;; Device JSON Parsing Utilities
+;; ============================================================================
+
+(defun ios-simulator--parse-device-list (json)
+  "Parse device list JSON into a flat list of available device alists.
+Each device alist has an additional `iosVersion' key with the runtime version.
+JSON should be the parsed output of `xcrun simctl list devices available -j'."
+  (let ((devices-dict (when json (cdr (assoc 'devices json))))
+        (result '()))
+    (dolist (runtime-entry devices-dict)
+      (let* ((runtime-key (car runtime-entry))
+             (runtime-devices (cdr runtime-entry))
+             (runtime-string (if (symbolp runtime-key)
+                                 (symbol-name runtime-key)
+                               runtime-key))
+             (ios-version (when (and runtime-string
+                                     (string-match "iOS-\\([0-9]+\\)-\\([0-9]+\\)"
+                                                   runtime-string))
+                            (format "%s.%s"
+                                    (match-string 1 runtime-string)
+                                    (match-string 2 runtime-string)))))
+        (dolist (device (append runtime-devices nil))
+          (when (and device (listp device)
+                     (cdr (assoc 'isAvailable device)))
+            (let ((device-with-version (copy-alist device)))
+              (when ios-version
+                (setcdr device-with-version
+                        (cons (cons 'iosVersion ios-version)
+                              (cdr device-with-version))))
+              (push device-with-version result))))))
+    (nreverse result)))
+
+(defun ios-simulator--extract-ios-versions (device-list)
+  "Extract sorted unique iOS version strings from DEVICE-LIST.
+DEVICE-LIST should be the output of `ios-simulator--parse-device-list'."
+  (let ((versions '()))
+    (dolist (device device-list)
+      (let ((v (cdr (assoc 'iosVersion device))))
+        (when (and v (not (member v versions)))
+          (push v versions))))
+    (sort versions 'version<)))
 
 (defun ios-simulator-mode-setup ()
   "Setup the iOS simulator mode."
@@ -594,14 +634,16 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
 
 
 (defun ios-simulator-get-app-name-fast (build-folder)
-  "Get app name quickly by looking for .app files in BUILD-FOLDER."
-  (when build-folder
+  "Get app name quickly by looking for .app files in BUILD-FOLDER.
+Returns nil if BUILD-FOLDER is nil or does not exist."
+  (when (and build-folder (not (string-empty-p build-folder)))
     (let* ((folder (if (string-match "^['\"]\\(.*\\)['\"]$" build-folder)
                       (match-string 1 build-folder)
-                    build-folder))
-           (app-files (directory-files folder nil "\\.app$")))
-      (when app-files
-        (file-name-sans-extension (car app-files))))))
+                    build-folder)))
+      (when (file-directory-p folder)
+        (let ((app-files (directory-files folder nil "\\.app$")))
+          (when app-files
+            (file-name-sans-extension (car app-files))))))))
 
 (defun ios-simulator-kill-buffer ()
   "Kill the ios-simulator buffer."
@@ -785,29 +827,11 @@ If CALLBACK provided, run asynchronously."
 (defun ios-simulator-available-ios-versions ()
   "Get list of available iOS versions."
   (let* ((json (ios-simulator-run-command-and-get-json-simple list-simulators-command))
-         (devices (when json (cdr (assoc 'devices json))))
-         (versions '()))
+         (devices (ios-simulator--parse-device-list json)))
     (unless devices
       (when ios-simulator-debug
         (message "No devices found in simulator list")))
-    (dolist (runtime-entry devices)
-      (let* ((runtime-key (car runtime-entry))
-             (runtime-devices (cdr runtime-entry))
-             (runtime-string (if (symbolp runtime-key)
-                                 (symbol-name runtime-key)
-                               runtime-key))
-             (ios-version (when (and runtime-string
-                                     (string-match "iOS-\\([0-9]+\\)-\\([0-9]+\\)" runtime-string))
-                           (format "%s.%s"
-                                   (match-string 1 runtime-string)
-                                   (match-string 2 runtime-string)))))
-        ;; Only add version if there are available devices
-        (when (and ios-version
-                   (seq-some (lambda (device) (cdr (assoc 'isAvailable device)))
-                            runtime-devices))
-          (unless (member ios-version versions)
-            (push ios-version versions)))))
-    (sort versions 'version<)))
+    (ios-simulator--extract-ios-versions devices)))
 
 (defun ios-simulator-available-ios-versions-async (callback)
   "Get list of available iOS versions asynchronously.
@@ -816,26 +840,8 @@ Calls CALLBACK with version list."
    list-simulators-command
    (lambda (json)
      (when json
-       (let* ((devices (cdr (assoc 'devices json)))
-              (versions '()))
-         (dolist (runtime-entry devices)
-           (let* ((runtime-key (car runtime-entry))
-                  (runtime-devices (cdr runtime-entry))
-                  (runtime-string (if (symbolp runtime-key)
-                                      (symbol-name runtime-key)
-                                    runtime-key))
-                  (ios-version (when (and runtime-string
-                                          (string-match "iOS-\\([0-9]+\\)-\\([0-9]+\\)" runtime-string))
-                                (format "%s.%s"
-                                        (match-string 1 runtime-string)
-                                        (match-string 2 runtime-string)))))
-             ;; Only add version if there are available devices
-             (when (and ios-version
-                        (seq-some (lambda (device) (cdr (assoc 'isAvailable device)))
-                                 runtime-devices))
-               (unless (member ios-version versions)
-                 (push ios-version versions)))))
-         (funcall callback (sort versions 'version<)))))))
+       (let ((devices (ios-simulator--parse-device-list json)))
+         (funcall callback (ios-simulator--extract-ios-versions devices)))))))
 
 (defun ios-simulator-devices-for-ios-version (ios-version)
   "Get available devices for a specific IOS-VERSION."
@@ -865,38 +871,37 @@ Calls CALLBACK with version list."
                          (cdr (assoc 'udid device))) matching-devices))))))
     (nreverse matching-devices)))
 
+(defconst ios-simulator--language-list
+  '(("🇦🇪 Arabic (United Arab Emirates)" "ar-AE")
+    ("🇦🇷 Arabic (Saudi Arabia)" "ar-SA")
+    ("🇦🇺 English (Australia)" "en-AU")
+    ("🇧🇪 Dutch (Belgium)" "nl-BE")
+    ("🇧🇭 Indonesian (Indonesia)" "id-ID")
+    ("🇧🇷 Portuguese (Brazil)" "pt-BR")
+    ("🇨🇳 Chinese (Simplified)" "zh-CN")
+    ("🇩🇪 German (Germany)" "de-DE")
+    ("🇩🇰 Danish (Denmark)" "da-DK")
+    ("🇪🇸 Spanish (Spain)" "es-ES")
+    ("🇫🇷 French (France)" "fr-FR")
+    ("🇬🇧 English (UK)" "en-UK")
+    ("🇮🇳 Hindi (India)" "hi-IN")
+    ("🇮🇹 Italian (Italy)" "it-IT")
+    ("🇯🇵 Japanese (Japan)" "ja-JP")
+    ("🇰🇷 Korean (Korea)" "ko-KR")
+    ("🇳🇱 Dutch (Netherlands)" "nl-NL")
+    ("🇳🇴 Norwegian (Bokmål)" "nb-NO")
+    ("🇵🇱 Polish (Poland)" "pl-PL")
+    ("🇷🇺 Russian (Russia)" "ru-RU")
+    ("🇸🇦 Arabic (Saudi Arabia)" "ar-EG")
+    ("🇸🇪 Swedish (Sweden)" "sv-SE")
+    ("🇹🇷 Turkish (Turkey)" "tr-TR")
+    ("🇹🇼 Chinese (Traditional)" "zh-TW"))
+  "Available languages for simulator locale selection.")
+
 (cl-defun ios-simulator-build-language-menu (&key title)
   "Build language menu (as TITLE)."
-  (defconst languageList '(
-                           ("🇦🇪 Arabic (United Arab Emirates)" "ar-AE")
-                           ("🇦🇷 Arabic (Saudi Arabia)" "ar-SA")
-                           ("🇦🇺 English (Australia)" "en-AU")
-                           ("🇧🇪 Dutch (Belgium)" "nl-BE")
-                           ("🇧🇭 Indonesian (Indonesia)" "id-ID")
-                           ("🇧🇷 Portuguese (Brazil)" "pt-BR")
-                           ("🇨🇳 Chinese (Simplified)" "zh-CN")
-                           ("🇩🇪 German (Germany)" "de-DE")
-                           ("🇪🇸 Spanish (Spain)" "es-ES")
-                           ("🇫🇷 French (France)" "fr-FR")
-                           ("🇬🇧 English (UK)" "en-UK")
-                           ("🇮🇳 Hindi (India)" "hi-IN")
-                           ("🇮🇹 Italian (Italy)" "it-IT")
-                           ("🇯🇵 Japanese (Japan)" "ja-JP")
-                           ("🇰🇷 Korean (Korea)" "ko-KR")
-                           ("🇳🇱 Dutch (Netherlands)" "nl-NL")
-                           ("🇳🇴 Norwegian (Bokmål)" "nb-NO")
-                           ("🇵🇱 Polish (Poland)" "pl-PL")
-                           ("🇷🇺 Russian (Russia)" "ru-RU")
-                           ("🇸🇦 Arabic (Saudi Arabia)" "ar-EG")
-                           ("🇸🇪 Swedish (Sweden)" "sv-SE")
-                           ("🇹🇷 Turkish (Turkey)" "tr-TR")
-                           ("🇹🇼 Chinese (Traditional)" "zh-TW")
- ("🇩🇰 Danish (Denmark)" "da-DK")
-                           ))
-    (progn
-    (let* ((choices (seq-map (lambda (item) item) languageList))
-           (choice (completing-read title choices)))
-      (car (cdr (assoc choice choices))))))
+  (let* ((choice (completing-read title ios-simulator--language-list)))
+    (car (cdr (assoc choice ios-simulator--language-list)))))
 
 (cl-defun ios-simulator-simulator-identifier (&key callback)
   "Get the booted simulator id or fetch a suitable one. If CALLBACK provided, run asynchronously."
@@ -1089,47 +1094,40 @@ Uses cached simulator data when available to improve performance."
 
 (defun ios-simulator-device-exists-p (device-id)
   "Check if DEVICE-ID exists in available simulators.
-Returns t if the device exists, nil otherwise."
+Returns t if the device exists, nil otherwise.
+Uses cached device list when available to avoid blocking."
   (when device-id
-    (let* ((json-data (ios-simulator-run-command-and-get-json-simple
-                       "xcrun simctl list devices available -j"))
-           (devices-dict (when json-data (cdr (assoc 'devices json-data))))
-           (found nil))
-      (when devices-dict
-        (dolist (runtime-entry devices-dict)
-          (let ((devices-list (cdr runtime-entry)))
-            (when (vectorp devices-list)
-              (mapc (lambda (device)
-                      (let ((udid (cdr (assoc 'udid device))))
-                        (when (string= udid device-id)
-                          (setq found t))))
-                    (append devices-list nil))))))
-      found)))
+    ;; Try cached device list first to avoid blocking simctl call
+    (let ((devices (or (ios-simulator-fetch-available-simulators)
+                       ;; Fallback: fetch fresh if cache empty
+                       (let ((json (ios-simulator-run-command-and-get-json-simple
+                                    list-simulators-command)))
+                         (ios-simulator--parse-device-list json)))))
+      (cl-some (lambda (device)
+                 (string= (cdr (assoc 'udid device)) device-id))
+               devices))))
 
 (defun ios-simulator-get-all-booted-simulators ()
   "Get list of all currently booted simulators.
-Returns list of (name . id) pairs."
+Returns list of (name . id) pairs.
+Note: This always fetches fresh data (not cached) since boot state changes."
   (when ios-simulator-debug
     (message "Checking for booted simulators..."))
   (let* ((json-data (ios-simulator-run-command-and-get-json-simple
-                     "xcrun simctl list devices available -j"))
+                     "xcrun simctl list devices -j"))
          (devices-dict (when json-data (cdr (assoc 'devices json-data))))
          (simulators '()))
-    (when devices-dict
-      ;; Iterate through all runtimes
-      (dolist (runtime-entry devices-dict)
-        (let ((devices-list (cdr runtime-entry)))
-          (when (vectorp devices-list)
-            ;; Convert vector to list and check each device
-            (mapc (lambda (device)
-                    (let ((state (cdr (assoc 'state device)))
-                          (name (cdr (assoc 'name device)))
-                          (udid (cdr (assoc 'udid device))))
-                      (when (and state (string= state "Booted"))
-                        (when ios-simulator-debug
-                          (message "Found booted simulator: %s (%s)" name udid))
-                        (push (cons name udid) simulators))))
-                  (append devices-list nil))))))
+    (dolist (runtime-entry devices-dict)
+      (let ((devices-list (cdr runtime-entry)))
+        (dolist (device (append devices-list nil))
+          (when (and device (listp device))
+            (let ((state (cdr (assoc 'state device)))
+                  (name (cdr (assoc 'name device)))
+                  (udid (cdr (assoc 'udid device))))
+              (when (and state (string= state "Booted"))
+                (when ios-simulator-debug
+                  (message "Found booted simulator: %s (%s)" name udid))
+                (push (cons name udid) simulators)))))))
     (when ios-simulator-debug
       (message "Total booted simulators found: %d" (length simulators)))
     (nreverse simulators)))
@@ -1303,38 +1301,10 @@ Uses timeout and proper cleanup handling."
                        (funcall callback nil)))))
 
 (defun ios-simulator-run-command-and-get-json-simple (command)
-  "Run a shell COMMAND and return JSON. Simple synchronous version with timeout.
+  "Run a shell COMMAND synchronously and return parsed JSON.
+Uses `swift-async-run-sync' with timeout protection and JSON parsing.
 The command should be fast (<0.3s) but we add a 5s timeout as safety measure."
-  (let* ((timeout-secs 5)
-         (start-time (current-time))
-         (json-output nil)
-         (timed-out nil))
-    (with-temp-buffer
-      (let ((proc (start-process-shell-command
-                   "simctl-json-sync" (current-buffer) command)))
-        ;; Wait for process to finish or timeout
-        (while (and (process-live-p proc)
-                    (< (float-time (time-subtract (current-time) start-time)) timeout-secs))
-          (accept-process-output proc 0.1))
-
-        (if (process-live-p proc)
-            (progn
-              ;; Timeout - kill the process
-              (delete-process proc)
-              (setq timed-out t)
-              (when ios-simulator-debug
-                (message "Command timed out after %ds: %s" timeout-secs command)))
-          ;; Process finished - get output
-          (setq json-output (buffer-string)))))
-
-    (if (and json-output (not timed-out) (> (length json-output) 0))
-        (condition-case err
-            (json-read-from-string json-output)
-          (error
-           (when ios-simulator-debug
-             (message "Failed to parse JSON: %s" err))
-           nil))
-      nil)))
+  (swift-async-run-sync command :timeout 5 :parse-json t))
 
 (cl-defun ios-simulator-terminate-app-with (&key appIdentifier)
   "Terminate runnings apps (as APPIDENTIFIER)."
@@ -1448,43 +1418,14 @@ The command should be fast (<0.3s) but we add a 5s timeout as safety measure."
         (message "[Device Cache] Fetching fresh device list..."))
 
       (let* ((json (ios-simulator-run-command-and-get-json-simple list-simulators-command))
-             (devices (when json (cdr (assoc 'devices json))))
-             (flattened-devices '()))
+             (flattened-devices (ios-simulator--parse-device-list json)))
 
-        (unless devices
+        (unless flattened-devices
           (when ios-simulator-debug
             (message "[Device Cache] Failed to fetch device list - empty response")))
 
-        ;; Process each runtime and its devices
-        (dolist (runtime-entry devices)
-          (let* ((runtime-key (car runtime-entry))
-                 (runtime-devices (cdr runtime-entry))
-                 ;; Extract iOS version from runtime key
-                 (runtime-string (if (symbolp runtime-key)
-                                     (symbol-name runtime-key)
-                                   runtime-key))
-                 (ios-version (when (and runtime-string
-                                         (string-match "iOS-\\([0-9]+\\)-\\([0-9]+\\)" runtime-string))
-                               (format "%s.%s"
-                                       (match-string 1 runtime-string)
-                                       (match-string 2 runtime-string)))))
-            ;; Process each device in this runtime
-            (dolist (device (append runtime-devices nil))
-              (when (and device
-                         (listp device)
-                         (cdr (assoc 'isAvailable device)))
-                ;; Create a new device entry with iOS version
-                (let ((device-with-version (copy-alist device)))
-                  (when ios-version
-                    (setcdr device-with-version
-                            (cons (cons 'iosVersion ios-version)
-                                  (cdr device-with-version))))
-                  (push device-with-version flattened-devices))))))
-
-        (setq flattened-devices (nreverse flattened-devices))
-
         ;; Cache the devices if we have project context
-        (when (and project-root scheme project-file
+        (when (and project-root scheme project-file flattened-devices
                    (fboundp 'swift-project-settings-cache-devices))
           (swift-project-settings-cache-devices
            project-root flattened-devices scheme project-file)
@@ -1525,13 +1466,13 @@ This is called automatically when needed but can also be called manually."
     (cancel-timer ios-simulator--preload-timer)
     (setq ios-simulator--preload-timer nil))
 
-  ;; Check if cache is already valid
-  (let ((cache-valid (or (and ios-simulator--cached-devices
+  ;; Check if cache is already valid (prefer swift-cache, fallback to legacy)
+  (let ((cache-valid (or (and (fboundp 'swift-cache-get)
+                              (swift-cache-get "ios-simulator-available-devices"))
+                         (and ios-simulator--cached-devices
                               ios-simulator--cache-timestamp
                               (< (- (float-time) ios-simulator--cache-timestamp)
-                                 ios-simulator--cache-ttl))
-                         (and (fboundp 'swift-cache-get)
-                              (swift-cache-get "ios-simulator-available-devices")))))
+                                 ios-simulator--cache-ttl)))))
     (if cache-valid
         (when ios-simulator-debug
           (message "[Auto-warming] Cache already valid, skipping preload"))
@@ -1541,38 +1482,16 @@ This is called automatically when needed but can also be called manually."
        list-simulators-command
        (lambda (json)
          (when json
-           (let* ((devices (cdr (assoc 'devices json)))
-                  (flattened-devices '()))
-             ;; Process devices
-             (dolist (runtime-entry devices)
-               (let* ((runtime-key (car runtime-entry))
-                      (runtime-devices (cdr runtime-entry))
-                      (runtime-string (if (symbolp runtime-key)
-                                          (symbol-name runtime-key)
-                                        runtime-key))
-                      (ios-version (when (and runtime-string
-                                              (string-match "iOS-\\([0-9]+\\)-\\([0-9]+\\)" runtime-string))
-                                    (format "%s.%s"
-                                            (match-string 1 runtime-string)
-                                            (match-string 2 runtime-string)))))
-                 (dolist (device (append runtime-devices nil))
-                   (when (and device
-                              (listp device)
-                              (cdr (assoc 'isAvailable device)))
-                     (let ((device-with-version (copy-alist device)))
-                       (when ios-version
-                         (setcdr device-with-version
-                                 (cons (cons 'iosVersion ios-version)
-                                       (cdr device-with-version))))
-                       (push device-with-version flattened-devices))))))
-             ;; Store in cache
+           (let ((flattened-devices (ios-simulator--parse-device-list json)))
+             ;; Store in swift-cache (preferred), with legacy fallback
              (if (fboundp 'swift-cache-set)
-                 (swift-cache-set "ios-simulator-available-devices" (nreverse flattened-devices) 300)
-               ;; Fallback to legacy cache
-               (setq ios-simulator--cached-devices (nreverse flattened-devices)
+                 (swift-cache-set "ios-simulator-available-devices" flattened-devices 300)
+               (setq ios-simulator--cached-devices flattened-devices
                      ios-simulator--cache-timestamp (float-time)))
              (when ios-simulator-debug
-               (message "[Auto-warming] ✅ Cache pre-loaded with %d devices in background" (length flattened-devices))))))))))
+               (message "[Auto-warming] Cache pre-loaded with %d devices in background"
+                        (length flattened-devices))))))))))
+
 
 (defun ios-simulator-maybe-preload-cache ()
   "Schedule cache preloading if in a Swift/iOS project.
@@ -2271,58 +2190,37 @@ CONTAINER-TYPE can be: app, data, groups, or a specific group identifier."
     map)
   "Keymap for iOS Simulator commands.")
 
+(defconst ios-simulator--menu-commands
+  '(("restart - Restart Simulator.app" . ios-simulator-restart)
+    ("shutdown - Shutdown current simulator" . ios-simulator-shutdown)
+    ("erase - Factory reset simulator" . ios-simulator-erase)
+    ("choose - Select a different simulator" . ios-simulator-choose-simulator)
+    ("screenshot - Take screenshot" . ios-simulator-screenshot)
+    ("screenshot-clipboard - Screenshot to clipboard" . ios-simulator-screenshot-to-clipboard)
+    ("record-toggle - Start/stop video recording" . ios-simulator-toggle-recording)
+    ("location - Set GPS location" . ios-simulator-set-location-preset)
+    ("location-clear - Clear GPS simulation" . ios-simulator-clear-location)
+    ("statusbar-clean - Apple marketing style" . ios-simulator-status-bar-apple-style)
+    ("statusbar-clear - Restore normal status bar" . ios-simulator-status-bar-clear)
+    ("apps - List installed apps" . ios-simulator-list-apps)
+    ("uninstall - Uninstall current app" . ios-simulator-uninstall-current-app)
+    ("app-data - Open app data folder" . ios-simulator-open-app-data)
+    ("open-url - Open URL in simulator" . ios-simulator-open-url)
+    ("privacy-grant - Grant permission" . ios-simulator-privacy-grant)
+    ("privacy-revoke - Revoke permission" . ios-simulator-privacy-revoke)
+    ("privacy-grant-all - Grant all permissions" . ios-simulator-privacy-grant-all)
+    ("clipboard-paste - Paste to simulator" . ios-simulator-paste-from-kill-ring)
+    ("clipboard-copy - Copy from simulator" . ios-simulator-copy-from-simulator)
+    ("notification - Send push notification" . ios-simulator-send-notification))
+  "Alist of simulator menu command labels to functions.")
+
 (defun ios-simulator-menu ()
   "Show an interactive menu of simulator commands."
   (interactive)
-  (let ((choice (completing-read
-                 "Simulator command: "
-                 '(("restart - Restart Simulator.app" . ios-simulator-restart)
-                   ("shutdown - Shutdown current simulator" . ios-simulator-shutdown)
-                   ("erase - Factory reset simulator" . ios-simulator-erase)
-                   ("choose - Select a different simulator" . ios-simulator-choose-simulator)
-                   ("screenshot - Take screenshot" . ios-simulator-screenshot)
-                   ("screenshot-clipboard - Screenshot to clipboard" . ios-simulator-screenshot-to-clipboard)
-                   ("record-toggle - Start/stop video recording" . ios-simulator-toggle-recording)
-                   ("location - Set GPS location" . ios-simulator-set-location-preset)
-                   ("location-clear - Clear GPS simulation" . ios-simulator-clear-location)
-                   ("statusbar-clean - Apple marketing style" . ios-simulator-status-bar-apple-style)
-                   ("statusbar-clear - Restore normal status bar" . ios-simulator-status-bar-clear)
-                   ("apps - List installed apps" . ios-simulator-list-apps)
-                   ("uninstall - Uninstall current app" . ios-simulator-uninstall-current-app)
-                   ("app-data - Open app data folder" . ios-simulator-open-app-data)
-                   ("open-url - Open URL in simulator" . ios-simulator-open-url)
-                   ("privacy-grant - Grant permission" . ios-simulator-privacy-grant)
-                   ("privacy-revoke - Revoke permission" . ios-simulator-privacy-revoke)
-                   ("privacy-grant-all - Grant all permissions" . ios-simulator-privacy-grant-all)
-                   ("clipboard-paste - Paste to simulator" . ios-simulator-paste-from-kill-ring)
-                   ("clipboard-copy - Copy from simulator" . ios-simulator-copy-from-simulator)
-                   ("notification - Send push notification" . ios-simulator-send-notification))
-                 nil t)))
-    (when choice
-      (let ((cmd (cdr (assoc choice
-                             '(("restart - Restart Simulator.app" . ios-simulator-restart)
-                               ("shutdown - Shutdown current simulator" . ios-simulator-shutdown)
-                               ("erase - Factory reset simulator" . ios-simulator-erase)
-                               ("choose - Select a different simulator" . ios-simulator-choose-simulator)
-                               ("screenshot - Take screenshot" . ios-simulator-screenshot)
-                               ("screenshot-clipboard - Screenshot to clipboard" . ios-simulator-screenshot-to-clipboard)
-                               ("record-toggle - Start/stop video recording" . ios-simulator-toggle-recording)
-                               ("location - Set GPS location" . ios-simulator-set-location-preset)
-                               ("location-clear - Clear GPS simulation" . ios-simulator-clear-location)
-                               ("statusbar-clean - Apple marketing style" . ios-simulator-status-bar-apple-style)
-                               ("statusbar-clear - Restore normal status bar" . ios-simulator-status-bar-clear)
-                               ("apps - List installed apps" . ios-simulator-list-apps)
-                               ("uninstall - Uninstall current app" . ios-simulator-uninstall-current-app)
-                               ("app-data - Open app data folder" . ios-simulator-open-app-data)
-                               ("open-url - Open URL in simulator" . ios-simulator-open-url)
-                               ("privacy-grant - Grant permission" . ios-simulator-privacy-grant)
-                               ("privacy-revoke - Revoke permission" . ios-simulator-privacy-revoke)
-                               ("privacy-grant-all - Grant all permissions" . ios-simulator-privacy-grant-all)
-                               ("clipboard-paste - Paste to simulator" . ios-simulator-paste-from-kill-ring)
-                               ("clipboard-copy - Copy from simulator" . ios-simulator-copy-from-simulator)
-                               ("notification - Send push notification" . ios-simulator-send-notification))))))
-        (when cmd
-          (call-interactively cmd))))))
+  (let ((choice (completing-read "Simulator command: "
+                                 ios-simulator--menu-commands nil t)))
+    (when-let* ((cmd (cdr (assoc choice ios-simulator--menu-commands))))
+      (call-interactively cmd))))
 
 ;;; Transient Menu
 

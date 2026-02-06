@@ -324,14 +324,15 @@ Returns the process object."
                              ;; Success
                              ((and (eq (process-status process) 'exit)
                                    (= (process-exit-status process) 0))
-                              (let ((result nil))
-                                (when (buffer-live-p out-buf)
-                                  (with-current-buffer out-buf
-                                    (let ((txt (buffer-substring-no-properties
-                                                (point-min) (point-max))))
-                                      (setq result (if parse-json
-                                                       (swift-async--parse-json txt)
-                                                     txt)))))
+                               (let ((result nil))
+                                 (when (buffer-live-p out-buf)
+                                   (with-current-buffer out-buf
+                                     (let ((txt (string-trim
+                                                 (buffer-substring-no-properties
+                                                  (point-min) (point-max)))))
+                                       (setq result (if parse-json
+                                                        (swift-async--parse-json txt)
+                                                      txt)))))
                                 ;; Handle JSON parse failure
                                 (when (and parse-json (null result))
                                   (swift-async--state-put key :error "JSON parse error")
@@ -417,7 +418,8 @@ This is useful for commands that should be fast (<1s) but need timeout protectio
                    :command cmd-list
                    :coding 'utf-8-unix
                    :noquery t
-                   :connection-type 'pipe)))
+                   :connection-type 'pipe
+                   :sentinel #'ignore)))
         ;; Wait for process to finish or timeout (with redisplay)
         (while (and (process-live-p proc)
                     (< (float-time (time-subtract (current-time) start-time)) timeout))
@@ -431,9 +433,9 @@ This is useful for commands that should be fast (<1s) but need timeout protectio
               (swift-async--log "Sync command timed out after %ds: %s"
                                 timeout
                                 (if (stringp command) command (car command))))
-          ;; Process finished - get output
+          ;; Process finished - get output (trimmed)
           (when (= (process-exit-status proc) 0)
-            (setq result (buffer-string))))))
+            (setq result (string-trim (buffer-string)))))))
 
     ;; Parse JSON if requested
     (when (and result parse-json (not timed-out))

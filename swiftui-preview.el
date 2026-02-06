@@ -118,6 +118,15 @@ Disable this on slower machines to avoid frequent rebuilds."
   :type 'boolean
   :group 'swiftui-preview)
 
+(defcustom swiftui-preview-show-notifications t
+  "If non-nil, show progress notifications during preview generation.
+When nil, preview generation runs silently without progress updates.
+This avoids potential UI overhead from frequent `redisplay' calls
+during the preview pipeline.  Toggle interactively with
+`swiftui-preview-toggle-notifications'."
+  :type 'boolean
+  :group 'swiftui-preview)
+
 (defcustom swiftui-preview-detect-setup-modifier t
   "If non-nil, detect .setupSwiftDevelopmentPreview() modifier for auto-generation."
   :type 'boolean
@@ -203,7 +212,7 @@ Used to retry preview generation after fixing errors.")
   "Get the swiftuipreview directory path for PROJECT-ROOT."
   (expand-file-name
    swiftui-preview-directory-name
-   (swift-project-settings--directory project-root)))
+   (expand-file-name ".swift-development" project-root)))
 
 (defun swiftui-preview--ensure-directory (project-root)
   "Ensure swiftuipreview directory exists for PROJECT-ROOT.
@@ -740,12 +749,16 @@ Returns the count of detected previews."
   (length (swiftui-preview--detect-preview-definitions)))
 
 (defun swiftui-preview--get-first-preview-body ()
-  "Get the body of the first #Preview macro in current buffer.
+  "Get the body of the last #Preview macro in current buffer.
+When multiple #Preview blocks exist, the last one is typically the most
+complete (e.g., with NavigationView wrappers, color scheme modifiers).
 Returns nil if no #Preview found."
-  (let ((previews (swiftui-preview--detect-preview-definitions)))
-    (cl-loop for preview in previews
-             when (eq (plist-get preview :type) 'preview-macro)
-             return (plist-get preview :body))))
+  (let ((previews (swiftui-preview--detect-preview-definitions))
+        (last-body nil))
+    (dolist (preview previews)
+      (when (eq (plist-get preview :type) 'preview-macro)
+        (setq last-body (plist-get preview :body))))
+    last-body))
 
 (defun swiftui-preview--get-preview-by-name (name)
   "Get the preview definition with NAME from current buffer.
@@ -931,6 +944,17 @@ This is always enabled as it's fundamental preview behavior."
   (message "SwiftUI Preview auto-update on save disabled"))
 
 ;;;###autoload
+(defun swiftui-preview-toggle-notifications ()
+  "Toggle whether preview progress notifications are shown.
+When disabled, preview generation runs silently without calling
+`swift-notification-progress-start/update/finish/cancel'."
+  (interactive)
+  (setq swiftui-preview-show-notifications
+        (not swiftui-preview-show-notifications))
+  (message "SwiftUI Preview notifications: %s"
+           (if swiftui-preview-show-notifications "ON" "OFF")))
+
+;;;###autoload
 (defun swiftui-preview-enable-auto-generate ()
   "Enable automatic preview generation when opening Swift files without previews."
   (interactive)
@@ -970,39 +994,18 @@ Used when capturing via simctl to allow the app to render."
   :type 'number
   :group 'swiftui-preview)
 
-(defun swiftui-preview--find-simulator-udid (simulator-name)
-  "Find the UDID for SIMULATOR-NAME.
-Returns UDID string or nil if not found."
-  (let ((output (shell-command-to-string
-                 "xcrun simctl list devices available -j 2>/dev/null")))
-    (condition-case nil
-        (let* ((json (json-read-from-string output))
-               (devices (alist-get 'devices json)))
-          (catch 'found
-            (dolist (runtime-devices devices)
-              (when (string-match-p "iOS" (symbol-name (car runtime-devices)))
-                (dolist (device (cdr runtime-devices))
-                  (when (and (equal (alist-get 'name device) simulator-name)
-                             (eq (alist-get 'isAvailable device) t))
-                    (throw 'found (alist-get 'udid device))))))
-            nil))
-      (error nil))))
+(defun swiftui-preview--find-simulator-udid (_simulator-name)
+  "Find the UDID for a simulator.
+_SIMULATOR-NAME is accepted for compatibility but ignored.
+Delegates to `ios-simulator-simulator-identifier'."
+  (swiftui-preview-core-find-simulator))
 
 (defun swiftui-preview--get-booted-simulator ()
   "Get the UDID of the first booted simulator.
-Returns UDID string or nil if none booted."
-  (let ((output (shell-command-to-string
-                 "xcrun simctl list devices booted -j 2>/dev/null")))
-    (condition-case nil
-        (let* ((json (json-read-from-string output))
-               (devices (alist-get 'devices json)))
-          (catch 'found
-            (dolist (runtime-devices devices)
-              (dolist (device (cdr runtime-devices))
-                (when (equal (alist-get 'state device) "Booted")
-                  (throw 'found (alist-get 'udid device)))))
-            nil))
-      (error nil))))
+Delegates to `ios-simulator-booted-simulator'."
+  (if (fboundp 'ios-simulator-booted-simulator)
+      (ios-simulator-booted-simulator)
+    (swiftui-preview-core-find-simulator)))
 
 ;;;###autoload
 (defun swiftui-preview-capture-simulator (&optional output-path simulator-id)
@@ -1083,6 +1086,12 @@ Useful for debugging or checking the current UI state."
 
 (require 'transient)
 
+(defun swiftui-preview--live-mode-description ()
+  "Return description for live mode toggle showing current state."
+  (format "Toggle live mode (%s)"
+          (if (bound-and-true-p swiftui-preview-dynamic-live-mode)
+              "ON" "OFF")))
+
 ;;;###autoload
 (transient-define-prefix swiftui-preview-transient ()
   "SwiftUI Preview actions."
@@ -1097,12 +1106,18 @@ Useful for debugging or checking the current UI state."
    [("r" "Refresh" swiftui-preview-refresh)
     ("e" "Show existing" swiftui-preview-show-existing)
     ("d" "Open directory" swiftui-preview-show-directory)]]
+  ["Live Mode"
+   [("L" swiftui-preview-dynamic-toggle-live-mode
+     :description swiftui-preview--live-mode-description)
+    ("R" "Refresh live" swiftui-preview-dynamic-refresh-live)
+    ("K" "Stop live" swiftui-preview-dynamic-stop-live)]]
   ["Manage"
    [("x" "Clear window" swiftui-preview-clear)
     ("X" "Cleanup targets" swiftui-preview-cleanup)]]
-  ["Setup"
+  ["Settings"
    [("S" "Setup wizard" swiftui-preview-setup)
-    ("g" "Toggle debug" swiftui-preview-toggle-debug)]]
+    ("g" "Toggle debug" swiftui-preview-toggle-debug)
+    ("n" "Toggle notifications" swiftui-preview-toggle-notifications)]]
   [("q" "Quit" transient-quit-one)])
 
 (provide 'swiftui-preview)

@@ -125,11 +125,12 @@
         (pop-to-buffer buffer)))))
 
 (defun ios-device-identifier ()
-  "Get iOS device identifier."
-  (if ios-device--current-device-id
-      ios-device--current-device-id
-    (setq ios-device--current-device-id (ios-device-choose-device))
-    ios-device--current-device-id))
+  "Get iOS device CoreDevice identifier.
+If no device is selected yet, prompts via `ios-device-select-device'."
+  (or ios-device--current-device-id
+      (progn
+        (ios-device-select-device)
+        ios-device--current-device-id)))
 
 (defun ios-device-connected-device-id ()
   "Get the id of the connected device (cached for 30 seconds).
@@ -348,24 +349,53 @@ Results are cached for 30 seconds."
                                  devices)))
       (plist-get device :udid))))
 
+(defun ios-device-get-identifier-for-name (device-name)
+  "Get the CoreDevice identifier for DEVICE-NAME.
+Looks up the device in the devicectl list."
+  (let ((devices (ios-device-parse-devices)))
+    (when-let* ((device (seq-find (lambda (d)
+                                   (string= (plist-get d :name) device-name))
+                                 devices)))
+      (plist-get device :identifier))))
+
+(defun ios-device-select-device ()
+  "Select a physical device with a single prompt.
+Populates both the UDID (for xcodebuild) and CoreDevice identifier
+\(for devicectl install/run).  Returns the selected device name or nil."
+  (interactive)
+  (let* ((devices (ios-device-parse-xctrace-devices))
+         (selected-name nil))
+    (cond
+     ((null devices)
+      (message "No iOS devices found. Connect a device and try again.")
+      nil)
+     ((= (length devices) 1)
+      (setq selected-name (plist-get (car devices) :name))
+      (setq ios-device--current-device-udid (plist-get (car devices) :udid))
+      (setq ios-device--current-device-id
+            (ios-device-get-identifier-for-name selected-name))
+      (message "Selected device: %s" selected-name)
+      selected-name)
+     (t
+      (let* ((device-names (mapcar (lambda (d) (plist-get d :name)) devices))
+             (name (completing-read "Select device: " device-names nil t)))
+        (when name
+          (setq selected-name name)
+          (setq ios-device--current-device-udid
+                (ios-device-get-udid-for-name name))
+          (setq ios-device--current-device-id
+                (ios-device-get-identifier-for-name name))
+          (message "Selected device: %s" name)
+          selected-name))))))
+
 (defun ios-device-udid ()
   "Get the UDID for xcodebuild destination.
-This returns the UDID format that xcodebuild expects, not the CoreDevice UUID."
+This returns the UDID format that xcodebuild expects, not the CoreDevice UUID.
+If no device is selected yet, prompts via `ios-device-select-device'."
   (or ios-device--current-device-udid
-      (let* ((devices (ios-device-parse-xctrace-devices)))
-        (cond
-         ((null devices)
-          (message "No iOS devices found")
-          nil)
-         ((= (length devices) 1)
-          (setq ios-device--current-device-udid (plist-get (car devices) :udid)))
-         (t
-          ;; Multiple devices - let user choose
-          (let* ((device-names (mapcar (lambda (d) (plist-get d :name)) devices))
-                 (selected-name (completing-read "Select device for build: " device-names nil t)))
-            (when selected-name
-              (setq ios-device--current-device-udid
-                    (ios-device-get-udid-for-name selected-name)))))))))
+      (progn
+        (ios-device-select-device)
+        ios-device--current-device-udid)))
 
 (cl-defun ios-device-launch-for-debug (&key device-id app-identifier)
   "Launch app on device in stopped state for debugging.
