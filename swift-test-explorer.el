@@ -46,6 +46,8 @@
 (declare-function swift-notification-send "swift-notification")
 (declare-function periphery-run-test-parser "periphery")
 (declare-function periphery-run-parser "periphery")
+(declare-function swift-error-proxy-parse-output "swift-error-proxy")
+(declare-function swift-error-proxy-has-errors-p "swift-error-proxy")
 
 ;;; Customization
 
@@ -1128,22 +1130,23 @@ Prompts for scheme selection - choose your main app scheme or a test plan scheme
            (let* ((output (with-current-buffer (process-buffer proc)
                             (buffer-string)))
                   (has-build-errors (swift-test--has-build-errors-p output)))
-             ;; If there are build errors, send to periphery for display
-             (when (and has-build-errors (fboundp 'periphery-run-parser))
-               (periphery-run-parser output))
-             ;; Always try to parse test results
-             (swift-test--parse-results output)
-             (swift-test--render-buffer)
-             (kill-buffer (process-buffer proc))
-             ;; Notify based on results
-             (cond
-              (has-build-errors
-               (swift-test--notify "Build failed - check *Periphery* buffer for errors"))
-              ((> (length swift-test--failed-tests) 0)
-               (swift-test--notify (format "Tests completed: %d failed"
-                                           (length swift-test--failed-tests))))
-              (t
-               (swift-test--notify "All tests passed!"))))))))))
+              ;; If there are build errors, send to error proxy for display
+              (when has-build-errors
+                (when (fboundp 'swift-error-proxy-parse-output)
+                  (swift-error-proxy-parse-output output)))
+              ;; Always try to parse test results
+              (swift-test--parse-results output)
+              (swift-test--render-buffer)
+              (kill-buffer (process-buffer proc))
+              ;; Notify based on results
+              (cond
+               (has-build-errors
+                (swift-test--notify "Build failed - check error buffer for details"))
+               ((> (length swift-test--failed-tests) 0)
+                (swift-test--notify (format "Tests completed: %d failed"
+                                            (length swift-test--failed-tests))))
+               (t
+                (swift-test--notify "All tests passed!"))))))))))
 
 (defun swift-test-explorer-run-failed ()
   "Re-run failed tests."
@@ -1239,31 +1242,13 @@ Prompts for scheme selection - choose your main app scheme or a test plan scheme
 
 (defun swift-test--has-build-errors-p (output)
   "Check if OUTPUT contains build errors (not test failures).
-Returns non-nil if there are compilation or build configuration errors."
-  (and output
-       (or
-        ;; Standard compiler errors: /path/file.swift:42:10: error: ...
-        (string-match-p ":[0-9]+:[0-9]+: error:" output)
-        ;; xcodebuild errors
-        (string-match-p "^xcodebuild: error:" output)
-        ;; Build failed markers
-        (string-match-p "\\*\\* BUILD FAILED \\*\\*" output)
-        (string-match-p "The following build commands failed:" output)
-        ;; Package resolution errors
-        (string-match-p "Could not resolve package dependencies" output)
-        ;; Missing SDK/platform
-        (string-match-p "SDK .* cannot be located" output)
-        (string-match-p "error:.*platform.*not found" output)
-        ;; Provisioning/signing errors
-        (string-match-p "error:.*provisioning profile" output)
-        (string-match-p "error:.*[Cc]ode [Ss]ign" output)
-        ;; Deployment target mismatch
-        (string-match-p "Compiling for iOS [0-9.]+, but module" output)
-        ;; Linker errors
-        (string-match-p "^ld: " output)
-        (string-match-p "Undefined symbol" output)
-        ;; Module not found
-        (string-match-p "No such module" output))))
+Returns non-nil if there are compilation or build configuration errors.
+Delegates to `swift-error-proxy-has-errors-p' for consolidated pattern matching."
+  (if (fboundp 'swift-error-proxy-has-errors-p)
+      (swift-error-proxy-has-errors-p output)
+    ;; Fallback if proxy not loaded
+    (and output
+         (string-match-p "\\(?:error:\\|BUILD FAILED\\)" output))))
 
 (defun swift-test--mark-tests-running (test-ids)
   "Mark TEST-IDS as running and clear previous error messages."
@@ -1357,22 +1342,24 @@ Returns the package root directory or nil if not a local package."
            (let* ((output (with-current-buffer (process-buffer proc)
                             (buffer-string)))
                   (has-build-errors (swift-test--has-build-errors-p output)))
-             ;; If there are build errors, send to periphery for display
-             (when (and has-build-errors (fboundp 'periphery-run-parser))
-               (periphery-run-parser output))
-             ;; Always try to parse test results
-             (swift-test--parse-results output)
-             (swift-test--render-buffer)
-             (kill-buffer (process-buffer proc))
-             ;; Notify based on results
-             (cond
-              (has-build-errors
-               (swift-test--notify "Build failed - check *Periphery* buffer for errors"))
-              ((> (length swift-test--failed-tests) 0)
-               (swift-test--notify (format "Tests completed: %d failed"
-                                           (length swift-test--failed-tests))))
-              (t
-               (swift-test--notify "All tests passed!"))))))))))
+              ;; If there are build errors, send to error proxy for display
+              (when has-build-errors
+                (when (fboundp 'swift-error-proxy-parse-output)
+                  (swift-error-proxy-parse-output output)))
+              ;; Always try to parse test results
+              (swift-test--parse-results output)
+              (swift-test--render-buffer)
+              (kill-buffer (process-buffer proc))
+              ;; Notify based on results
+              (cond
+               (has-build-errors
+                (swift-test--notify "Build failed - check error buffer for details"))
+               ((> (length swift-test--failed-tests) 0)
+                (swift-test--notify (format "Tests completed: %d failed"
+                                            (length swift-test--failed-tests))))
+               (t
+                (swift-test--notify "All tests passed!"))))))))))
+
 
 (defun swift-test--build-spm-command (test-ids)
   "Build swift test command for TEST-IDS."

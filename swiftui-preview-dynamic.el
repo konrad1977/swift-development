@@ -58,14 +58,14 @@
 (declare-function swift-notification-progress-finish "swift-notification")
 (declare-function swift-notification-progress-cancel "swift-notification")
 (declare-function xcode-project-project-root "xcode-project")
-(declare-function periphery-run-parser "periphery")
+(declare-function swift-error-proxy-parse-output "swift-error-proxy")
 
 ;; External variables
 (defvar xcode-build-config-enable-testability)
 (defvar xcode-build-config-xcode-cache-dir)
 (defvar xcode-project--current-xcode-scheme)
 (defvar swiftui-preview-show-notifications)
-(defvar swift-development-use-periphery)
+(defvar swift-error-proxy-backend)
 
 ;;; Notification helpers (respects swiftui-preview-show-notifications)
 
@@ -97,13 +97,9 @@ MESSAGE is the completion message."
     (swift-notification-progress-cancel id)))
 
 (defun swiftui-preview-dynamic--parse-build-errors (output)
-  "Parse build OUTPUT through periphery if available and enabled.
-Falls back to displaying the raw output buffer."
-  (when (and (bound-and-true-p swift-development-use-periphery)
-             (fboundp 'periphery-run-parser)
-             (stringp output)
-             (> (length output) 0))
-    (periphery-run-parser output)))
+  "Parse build OUTPUT through the error proxy."
+  (when (fboundp 'swift-error-proxy-parse-output)
+    (swift-error-proxy-parse-output output)))
 
 (defgroup swiftui-preview-dynamic nil
   "Dynamic target injection preview settings."

@@ -438,7 +438,7 @@ With prefix argument CHOOSE-NEW-SIMULATOR, also select a new simulator."
 (defun ios-simulator-shut-down-all ()
   "Shut down all simulators."
   (interactive)
-  (call-process-shell-command "xcrun simctl shutdown all")
+  (swift-async-run-sync (list "xcrun" "simctl" "shutdown" "all") :timeout 10)
   (swift-notification-send :message "All simulators shut down" :seconds 2))
 
 (defun ios-simulator-target ()
@@ -1318,15 +1318,11 @@ The command should be fast (<0.3s) but we add a 5s timeout as safety measure."
   "Terminate app (as APPIDENTIFIER as SIMULATORID)."
   (when ios-simulator-debug
     (message "%s %s" simulatorID appIdentifier))
-  (inhibit-sentinel-messages #'call-process-shell-command
-                             (string-trim
-                              (concat
-                               (if simulatorID
-                                   (format "xcrun simctl terminate %s %s"
-                                           (shell-quote-argument simulatorID)
-                                           (shell-quote-argument appIdentifier))
-                                 (format "xcrun simctl terminate booted %s"
-                                         (shell-quote-argument appIdentifier)))))))
+  (swift-async-run-sync
+   (if simulatorID
+       (list "xcrun" "simctl" "terminate" simulatorID appIdentifier)
+     (list "xcrun" "simctl" "terminate" "booted" appIdentifier))
+   :timeout 5))
 
 (defun ios-simulator-send-notification ()
   "Send a notification to the current simulator and app."
@@ -1728,10 +1724,9 @@ TERMINATE-FIRST: Whether to terminate existing app instance"
                          nil t)))
   (when-let* ((info (gethash simulator-id ios-simulator--active-simulators))
               (app-id (plist-get info :app-identifier)))
-    (call-process-shell-command
-     (format "xcrun simctl terminate %s %s"
-             (shell-quote-argument simulator-id)
-             (shell-quote-argument app-id)))
+    (swift-async-run-sync
+     (list "xcrun" "simctl" "terminate" simulator-id app-id)
+     :timeout 5)
     (message "Terminated app on simulator: %s" (plist-get info :name))))
 
 ;;;###autoload
@@ -1746,7 +1741,9 @@ TERMINATE-FIRST: Whether to terminate existing app instance"
                            sims)
                          nil t)))
   (when-let* ((info (gethash simulator-id ios-simulator--active-simulators)))
-    (call-process-shell-command (format "xcrun simctl shutdown %s" (shell-quote-argument simulator-id)))
+    (swift-async-run-sync
+     (list "xcrun" "simctl" "shutdown" simulator-id)
+     :timeout 10)
     (remhash simulator-id ios-simulator--active-simulators)
     (remhash simulator-id ios-simulator--simulator-buffers)
     (message "Shutdown simulator: %s" (plist-get info :name))))
@@ -1795,7 +1792,9 @@ This kills the Simulator app and restarts it with the current simulator."
   (interactive)
   (let ((sim-id (or current-simulator-id "booted")))
     (message "Shutting down simulator...")
-    (call-process-shell-command (format "xcrun simctl shutdown %s" sim-id))
+    (swift-async-run-sync
+     (list "xcrun" "simctl" "shutdown" sim-id)
+     :timeout 10)
     (message "Simulator shut down")))
 
 (defun ios-simulator-erase ()
@@ -1807,9 +1806,13 @@ This is like a factory reset - removes all apps, data, and settings."
     (when (yes-or-no-p (format "Erase ALL content from %s? This cannot be undone. " sim-name))
       (message "Erasing simulator...")
       ;; Must shutdown first
-      (call-process-shell-command (format "xcrun simctl shutdown %s 2>/dev/null" sim-id))
+      (swift-async-run-sync
+       (list "xcrun" "simctl" "shutdown" sim-id)
+       :timeout 10)
       (sit-for 0.5)
-      (call-process-shell-command (format "xcrun simctl erase %s" sim-id))
+      (swift-async-run-sync
+       (list "xcrun" "simctl" "erase" sim-id)
+       :timeout 15)
       (message "Simulator erased. Rebooting...")
       (ios-simulator-boot-simulator-with-id sim-id))))
 
@@ -1817,16 +1820,18 @@ This is like a factory reset - removes all apps, data, and settings."
   "Open URL in the current simulator's default browser."
   (interactive "sURL to open: ")
   (let ((sim-id (or current-simulator-id "booted")))
-    (call-process-shell-command
-     (format "xcrun simctl openurl %s '%s'" sim-id url))
+    (swift-async-run-sync
+     (list "xcrun" "simctl" "openurl" sim-id url)
+     :timeout 5)
     (message "Opened %s in simulator" url)))
 
 (defun ios-simulator-open-url-in-app (url)
   "Open URL in the current app (for deep links/universal links)."
   (interactive "sDeep link URL: ")
   (let ((sim-id (or current-simulator-id "booted")))
-    (call-process-shell-command
-     (format "xcrun simctl openurl %s '%s'" sim-id url))
+    (swift-async-run-sync
+     (list "xcrun" "simctl" "openurl" sim-id url)
+     :timeout 5)
     (message "Opened deep link: %s" url)))
 
 ;;; ============================================================================
@@ -1855,8 +1860,9 @@ If FILENAME is nil, generates a timestamped filename on Desktop."
                                (format-time-string "%Y%m%d-%H%M%S")))
          (file (or filename
                    (expand-file-name default-name ios-simulator-screenshot-directory))))
-    (call-process-shell-command
-     (format "xcrun simctl io %s screenshot '%s'" sim-id file))
+    (swift-async-run-sync
+     (list "xcrun" "simctl" "io" sim-id "screenshot" file)
+     :timeout 10)
     (message "Screenshot saved to %s" file)
     file))
 
@@ -1865,8 +1871,9 @@ If FILENAME is nil, generates a timestamped filename on Desktop."
   (interactive)
   (let* ((temp-file (make-temp-file "sim-screenshot" nil ".png")))
     (ios-simulator-screenshot temp-file)
-    (call-process-shell-command
-     (format "osascript -e 'set the clipboard to (read (POSIX file \"%s\") as TIFF picture)'" temp-file))
+    (swift-async-run-sync
+     (format "osascript -e 'set the clipboard to (read (POSIX file \"%s\") as TIFF picture)'" temp-file)
+     :timeout 5)
     (delete-file temp-file)
     (message "Screenshot copied to clipboard")))
 
@@ -1925,8 +1932,10 @@ If FILENAME is nil, generates a timestamped filename."
   "Set simulator GPS location to LATITUDE and LONGITUDE."
   (interactive "nLatitude: \nnLongitude: ")
   (let ((sim-id (or current-simulator-id "booted")))
-    (call-process-shell-command
-     (format "xcrun simctl location %s set %f,%f" sim-id latitude longitude))
+    (swift-async-run-sync
+     (list "xcrun" "simctl" "location" sim-id "set"
+           (format "%f,%f" latitude longitude))
+     :timeout 5)
     (message "Location set to %f, %f" latitude longitude)))
 
 (defun ios-simulator-set-location-preset ()
@@ -1943,8 +1952,9 @@ If FILENAME is nil, generates a timestamped filename."
   "Clear/reset the simulated location."
   (interactive)
   (let ((sim-id (or current-simulator-id "booted")))
-    (call-process-shell-command
-     (format "xcrun simctl location %s clear" sim-id))
+    (swift-async-run-sync
+     (list "xcrun" "simctl" "location" sim-id "clear")
+     :timeout 5)
     (message "Location simulation cleared")))
 
 ;;; ============================================================================
@@ -1965,7 +1975,7 @@ CELLULAR: cellular bars 0-4"
          (cellular-bars (or cellular 4))
          (cmd (format "xcrun simctl status_bar %s override --time '%s' --batteryLevel %d --wifiBars %d --cellularBars %d"
                       sim-id time-str battery-level wifi-bars cellular-bars)))
-    (call-process-shell-command cmd)
+    (swift-async-run-sync cmd :timeout 5)
     (message "Status bar overridden")))
 
 (defun ios-simulator-status-bar-apple-style ()
@@ -1977,8 +1987,9 @@ CELLULAR: cellular bars 0-4"
   "Clear status bar overrides and restore normal behavior."
   (interactive)
   (let ((sim-id (or current-simulator-id "booted")))
-    (call-process-shell-command
-     (format "xcrun simctl status_bar %s clear" sim-id))
+    (swift-async-run-sync
+     (list "xcrun" "simctl" "status_bar" sim-id "clear")
+     :timeout 5)
     (message "Status bar restored to normal")))
 
 ;;; ============================================================================
@@ -2026,8 +2037,9 @@ CELLULAR: cellular bars 0-4"
                       xcode-project--current-app-identifier)))
   (let ((sim-id (or current-simulator-id "booted")))
     (when (yes-or-no-p (format "Uninstall %s? " bundle-id))
-      (call-process-shell-command
-       (format "xcrun simctl uninstall %s %s" sim-id bundle-id))
+      (swift-async-run-sync
+       (list "xcrun" "simctl" "uninstall" sim-id bundle-id)
+       :timeout 10)
       (message "Uninstalled %s" bundle-id))))
 
 (defun ios-simulator-uninstall-current-app ()
@@ -2090,8 +2102,9 @@ CONTAINER-TYPE can be: app, data, groups, or a specific group identifier."
          (read-string "Bundle ID: " xcode-project--current-app-identifier)))
   (let ((sim-id (or current-simulator-id "booted"))
         (app-id (or bundle-id xcode-project--current-app-identifier)))
-    (call-process-shell-command
-     (format "xcrun simctl privacy %s grant %s %s" sim-id service app-id))
+    (swift-async-run-sync
+     (list "xcrun" "simctl" "privacy" sim-id "grant" service app-id)
+     :timeout 5)
     (message "Granted %s permission to %s" service app-id)))
 
 (defun ios-simulator-privacy-revoke (service &optional bundle-id)
@@ -2101,8 +2114,9 @@ CONTAINER-TYPE can be: app, data, groups, or a specific group identifier."
          (read-string "Bundle ID: " xcode-project--current-app-identifier)))
   (let ((sim-id (or current-simulator-id "booted"))
         (app-id (or bundle-id xcode-project--current-app-identifier)))
-    (call-process-shell-command
-     (format "xcrun simctl privacy %s revoke %s %s" sim-id service app-id))
+    (swift-async-run-sync
+     (list "xcrun" "simctl" "privacy" sim-id "revoke" service app-id)
+     :timeout 5)
     (message "Revoked %s permission from %s" service app-id)))
 
 (defun ios-simulator-privacy-reset (service &optional bundle-id)
@@ -2111,11 +2125,11 @@ CONTAINER-TYPE can be: app, data, groups, or a specific group identifier."
    (list (completing-read "Service: " ios-simulator-privacy-services nil t)
          (read-string "Bundle ID (empty for all apps): " "")))
   (let ((sim-id (or current-simulator-id "booted")))
-    (if (and bundle-id (not (string-empty-p bundle-id)))
-        (call-process-shell-command
-         (format "xcrun simctl privacy %s reset %s %s" sim-id service bundle-id))
-      (call-process-shell-command
-       (format "xcrun simctl privacy %s reset %s" sim-id service)))
+    (swift-async-run-sync
+     (if (and bundle-id (not (string-empty-p bundle-id)))
+         (list "xcrun" "simctl" "privacy" sim-id "reset" service bundle-id)
+       (list "xcrun" "simctl" "privacy" sim-id "reset" service))
+     :timeout 5)
     (message "Reset %s permission" service)))
 
 (defun ios-simulator-privacy-grant-all ()

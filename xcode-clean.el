@@ -162,5 +162,51 @@ DISPLAY-NAME is used for user messages."
       (when callback
         (funcall callback "skipped - folder not found")))))
 
+;;; ============================================================================
+;;; xcodebuild clean integration
+;;; ============================================================================
+
+(declare-function xcode-project-project-root "xcode-project")
+(declare-function xcode-project-get-workspace-or-project "xcode-project")
+(declare-function xcode-project-scheme-display-name "xcode-project")
+(declare-function swift-async-run "swift-async")
+
+(defun xcode-clean-xcodebuild (&optional callback)
+  "Run `xcodebuild clean' for the current scheme and workspace/project.
+This is the proper Xcode-native clean that respects the build system state.
+Calls CALLBACK when done."
+  (interactive)
+  (let* ((default-directory (if (fboundp 'xcode-project-project-root)
+                                (or (xcode-project-project-root) default-directory)
+                              default-directory))
+         (workspace-or-project (when (fboundp 'xcode-project-get-workspace-or-project)
+                                 (xcode-project-get-workspace-or-project)))
+         (scheme (when (fboundp 'xcode-project-scheme-display-name)
+                   (xcode-project-scheme-display-name)))
+         (cmd (mapconcat 'identity
+                         (delq nil
+                               (list "xcrun" "xcodebuild" "clean"
+                                     (when workspace-or-project
+                                       (format "%s" workspace-or-project))
+                                     (when scheme
+                                       (format "-scheme '%s'" scheme))
+                                     "-derivedDataPath .build"))
+                         " ")))
+    (xcode-clean--notify "Running xcodebuild clean..." 3)
+    (if (fboundp 'swift-async-run)
+        (swift-async-run
+         cmd
+         (lambda (_output)
+           (xcode-clean--notify "xcodebuild clean completed" 2)
+           (when callback (funcall callback)))
+         :timeout 30
+         :error-callback (lambda (_key err)
+                           (xcode-clean--notify
+                            (format "xcodebuild clean failed: %s" err) 3)))
+      ;; Fallback: synchronous
+      (shell-command cmd)
+      (xcode-clean--notify "xcodebuild clean completed" 2)
+      (when callback (funcall callback)))))
+
 (provide 'xcode-clean)
 ;;; xcode-clean.el ends here

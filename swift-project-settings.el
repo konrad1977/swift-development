@@ -118,6 +118,17 @@ Returns data or nil if file doesn't exist."
 
 ;;; Settings Management
 
+(defun swift-project-settings-clear (project-root)
+  "Remove all settings files from .swift-development/ for PROJECT-ROOT.
+Preserves the directory and non-settings files (e.g. previews/)."
+  (let ((dir (swift-project-settings--directory project-root)))
+    (when (file-directory-p dir)
+      (dolist (file (directory-files dir t "^settings"))
+        (when (file-regular-p file)
+          (delete-file file)
+          (when swift-project-settings-debug
+            (message "[Settings] Deleted: %s" file)))))))
+
 (defun swift-project-settings-save (project-root settings &optional scheme)
   "Save SETTINGS to .swift-development/ for PROJECT-ROOT and SCHEME.
 SETTINGS should be a plist with keys like :scheme, :device-name, etc.

@@ -15,6 +15,10 @@
 (require 'swift-notification nil t)
 (require 'transient)
 
+;; Forward declarations
+(declare-function swift-error-proxy-parse-output "swift-error-proxy")
+(declare-function swift-error-proxy-has-errors-p "swift-error-proxy")
+
 (defgroup swift-refactor nil
   "Provides refactoring tools for Swift."
   :group 'tools
@@ -310,17 +314,16 @@
     (unless (executable-find swift-refactor-swiftlint-command)
       (user-error "swiftlint not installed. Install with: brew install swiftlint"))
     (save-buffer)
-    (require 'periphery-helper)
-    (require 'periphery)
+    (require 'periphery-helper nil t)
     (async-start-command-to-string
      :command (format "%s lint --path %s" swift-refactor-swiftlint-command (shell-quote-argument file))
      :callback (lambda (result)
-                 (periphery-run-parser result
-                                       (lambda ()
-                                         (message-with-color
-                                          :tag "[Success]"
-                                          :text "No lint warnings or errors."
-                                          :attributes 'success)))))
+                 (if (and result (not (string-empty-p (string-trim result))))
+                     (swift-error-proxy-parse-output result)
+                   (message-with-color
+                    :tag "[Success]"
+                    :text "No lint warnings or errors."
+                    :attributes 'success))))
     (swift-notification-send :message (format "Linting %s..." (file-name-nondirectory file)) :seconds 1)))
 
 ;;;###autoload

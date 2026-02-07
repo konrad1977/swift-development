@@ -97,6 +97,8 @@ This is a compatibility wrapper - prefer using `xcode-project-notify' directly."
   "Buffer-local flag indicating if current project is an Xcode project.")
 (defvar-local xcode-project--current-errors-or-warnings nil
   "Buffer-local errors or warnings from last build.")
+(defvar-local xcode-project--seen-diagnostics nil
+  "Hash table for deduplicating diagnostic lines during builds.")
 (defvar-local xcode-project--last-device-type nil
   "Buffer-local last device type used (:simulator or :device).")
 ;; Note: swift-development--device-choice is now defined in swift-development.el
@@ -1430,8 +1432,8 @@ Uses filtered scheme list (excludes test schemes) for build/run operations."
     (ios-simulator-reset nil))
   (when (fboundp 'ios-device-reset)
     (ios-device-reset))
-  (when (fboundp 'periphery-kill-buffer)
-    (periphery-kill-buffer))
+  (when (fboundp 'swift-error-proxy-kill-buffer)
+    (swift-error-proxy-kill-buffer))
 
   ;; 3. Clear all state variables
   ;; NOTE: swift-development--device-choice is NOT cleared here.
@@ -1446,15 +1448,21 @@ Uses filtered scheme list (excludes test schemes) for build/run operations."
         xcode-project--current-xcode-scheme nil
         xcode-project--current-buildconfiguration-json-data nil
         xcode-project--current-errors-or-warnings nil
+        xcode-project--seen-diagnostics nil
         xcode-project--current-is-xcode-project nil
         xcode-project--last-device-type nil
         xcode-project--workspace-or-project-cache nil)
 
-  ;; 4. Clear swift-cache for build-settings, scheme-files, and xcodebuild-schemes
+  ;; 4. Clear swift-cache and settings files on disk
   (when (fboundp 'swift-cache-invalidate-pattern)
     (swift-cache-invalidate-pattern "::build-settings-")
     (swift-cache-invalidate-pattern "::scheme-files")
     (swift-cache-invalidate-pattern "::xcodebuild-schemes"))
+  (when (fboundp 'swift-project-settings-clear)
+    (let ((root (or xcode-project--previous-project-root
+                    (swift-project-root nil t))))
+      (when root
+        (swift-project-settings-clear root))))
 
   ;; 5. Reset project root
   (swift-project-reset-root)
@@ -1938,9 +1946,11 @@ Handles escaped parentheses like \\( and \\), quotes, and other escaped characte
       ;; Remove any remaining standalone quotes
       (replace-regexp-in-string "\"" ""))))
 
-(cl-defun xcode-project-parse-compile-lines-output (&key input)
+(cl-defun xcode-project-parse-compile-lines-output (&key input error-context)
   "Parse compile output and print unique matched lines using separate message calls.
-   Also prints compiler messages for C++ errors, warnings, and notes."
+   Also prints compiler messages for C++ errors, warnings, and notes.
+   ERROR-CONTEXT is an optional keyword passed to `swift-error-proxy-parse-output'
+   to control how diagnostics are displayed (e.g. :analyze for static analysis)."
   (when xcode-project-debug
     (message "Parsing compile output: %s" input))
   (let ((seen-messages (make-hash-table :test 'equal))
@@ -2115,22 +2125,33 @@ Handles escaped parentheses like \\( and \\), quotes, and other escaped characte
             (xcode-project-safe-mode-line-update :message
                                                    (format "  %s" (propertize msg 'face 'font-lock-type-face)))
             (puthash msg t seen-messages))))
-       ;; Errors, warnings, notes
+       ;; Errors, warnings, notes -- only accumulate unique diagnostics
        ((string-match error-regex line)
-        (setq xcode-project--current-errors-or-warnings (concat line "\n" xcode-project--current-errors-or-warnings))
-        ;; Debounce periphery parsing to avoid blocking UI
-        (when xcode-project--periphery-debounce-timer
-          (cancel-timer xcode-project--periphery-debounce-timer))
-        (let ((errors-snapshot xcode-project--current-errors-or-warnings))
-          (setq xcode-project--periphery-debounce-timer
-                (run-with-idle-timer
-                 0.2 nil
-                 (lambda (errors)
-                   (when (fboundp 'periphery-run-parser)
-                     (condition-case nil
-                         (periphery-run-parser errors)
-                       (error nil))))
-                 errors-snapshot))))))))
+        ;; Lazy-init dedup table
+        (unless xcode-project--seen-diagnostics
+          (setq xcode-project--seen-diagnostics (make-hash-table :test 'equal)))
+        ;; Only accumulate if we haven't seen this exact line before
+        (unless (gethash line xcode-project--seen-diagnostics)
+          (puthash line t xcode-project--seen-diagnostics)
+          (setq xcode-project--current-errors-or-warnings
+                (concat line "\n" xcode-project--current-errors-or-warnings))
+          ;; Debounce error parsing to avoid blocking UI
+          (when xcode-project--periphery-debounce-timer
+            (cancel-timer xcode-project--periphery-debounce-timer))
+          (let ((errors-snapshot xcode-project--current-errors-or-warnings)
+                (ctx error-context)
+                (buf (current-buffer)))
+            (setq xcode-project--periphery-debounce-timer
+                  (run-with-idle-timer
+                   0.2 nil
+                   (lambda (errors context source-buf)
+                     (when (fboundp 'swift-error-proxy-parse-output)
+                       ;; Run in source buffer context so default-directory is correct
+                       (if (buffer-live-p source-buf)
+                           (with-current-buffer source-buf
+                             (swift-error-proxy-parse-output errors nil context))
+                         (swift-error-proxy-parse-output errors nil context))))
+                   errors-snapshot ctx buf)))))))))
 
 (defun xcode-project-derived-data-path ()
   "Get the actual DerivedData path by running xcodebuild -showBuildSettings.

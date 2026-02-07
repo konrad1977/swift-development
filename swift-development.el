@@ -19,7 +19,7 @@
 (require 'ios-device nil t)
 (require 'ios-simulator nil t)
 (require 'swift-cache nil t) ;; Unified caching system
-(require 'swift-error-handler nil t) ;; Enhanced error handling
+(require 'swift-error-proxy nil t) ;; Unified error parsing proxy
 (require 'swift-file-watcher nil t) ;; File change detection for instant rebuild checks
 (require 'swift-macro-manager nil t) ;; Swift macro approval management
 (require 'swift-package-manager nil t) ;; SPM dependency management
@@ -30,6 +30,7 @@
 (require 'xcode-project nil t) ;; For notification system
 (require 'swift-notification nil t) ;; Unified notification system with progress bars
 (require 'swift-refactor nil t) ;; Code refactoring tools
+(require 'xcode-archive nil t) ;; Archive, export, and TestFlight distribution
 
 ;; Forward declarations for optional dependencies
 ;; Spinner (visual progress indicators)
@@ -67,6 +68,7 @@
 (declare-function xcode-project-transient "xcode-project")
 (declare-function swift-refactor-transient "swift-refactor")
 (declare-function periphery-transient "periphery")
+(declare-function xcode-archive-transient "xcode-archive")
 
 ;; Provide fallbacks when periphery is not available
 (unless (fboundp 'message-with-color)
@@ -78,6 +80,16 @@
 ;; Declare periphery functions - they will be loaded on demand
 (declare-function periphery-toggle-buffer "periphery" nil)
 (declare-function periphery-transient "periphery" nil)
+
+;; Error proxy (unified error parsing)
+(declare-function swift-error-proxy-parse-output "swift-error-proxy")
+(declare-function swift-error-proxy-parse-test-output "swift-error-proxy")
+(declare-function swift-error-proxy-has-errors-p "swift-error-proxy")
+(declare-function swift-error-proxy-has-warnings-p "swift-error-proxy")
+(declare-function swift-error-proxy-clear "swift-error-proxy")
+(declare-function swift-error-proxy-kill-buffer "swift-error-proxy")
+(declare-function swift-error-proxy-effective-backend "swift-error-proxy")
+(defvar swift-error-proxy-backend)
 
 (defun swift-development--periphery-toggle-buffer ()
   "Toggle periphery buffer, or show message if not available."
@@ -105,10 +117,12 @@
 
 (defcustom swift-development-use-periphery t
   "Whether to use periphery for error parsing.
-When non-nil, use periphery's custom error display.
-When nil, use standard compilation-mode."
+Deprecated: use `swift-error-proxy-backend' instead.
+Kept for backward compatibility -- synced by `swift-development-toggle-periphery-mode'."
   :type 'boolean
   :group 'swift-development)
+(make-obsolete-variable 'swift-development-use-periphery
+                        'swift-error-proxy-backend "0.7.0")
 
 (defcustom swift-development-analysis-mode 'fast
   "Level of post-build analysis to perform.
@@ -241,21 +255,10 @@ Also checks for Swift macro approval errors and offers to approve them."
       (xcode-project-notify
        :message (format "Build failed: %s"
                         (propertize (truncate-string-to-width error-message 50) 'face 'error))))
-    (if swift-development-use-periphery
-        (periphery-run-parser error-message)
-      (swift-development-show-errors-in-compilation-mode error-message))))
+    (swift-error-proxy-parse-output error-message)))
 
-(defun swift-development-show-errors-in-compilation-mode (output)
-  "Display build OUTPUT in compilation-mode buffer."
-  (let ((buf (get-buffer-create "*Swift Build*")))
-    (when (buffer-live-p buf)
-      (with-current-buffer buf
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (insert output)
-          (compilation-mode)
-          (goto-char (point-min))))
-      (display-buffer buf))))
+(define-obsolete-function-alias 'swift-development-show-errors-in-compilation-mode
+  #'ignore "0.7.0" "Use `swift-error-proxy-parse-output' instead.")
 
 (defun swift-development-reset ()
   "Reset build settings and clear all cached state.
@@ -473,103 +476,29 @@ Analysis level controlled by `swift-development-analysis-mode`."
      (swift-development-handle-build-error (error-message-string err))))
   
   ;; Run analysis based on configured mode
-  (when swift-development-use-periphery
-    (pcase swift-development-analysis-mode
-      ('disabled 
-       ;; Skip all analysis
-       nil)
-      ('minimal 
-       ;; Only basic error detection, no UI updates
-       (swift-development-run-minimal-analysis output))
-      ('fast 
-       ;; Async analysis with truncation (default)
-       (swift-development-run-periphery-async output))
-      ('full 
-       ;; Full synchronous analysis (may be slow)
-       (periphery-run-parser output)))))
+  (pcase swift-development-analysis-mode
+    ('disabled
+     ;; Skip all analysis
+     nil)
+    ('minimal
+     ;; Only basic error detection, no UI updates
+     (let ((swift-error-proxy-backend 'minimal))
+       (swift-error-proxy-parse-output output)))
+    ('fast
+     ;; Async analysis with truncation (default)
+     (swift-error-proxy-parse-output output t))
+    ('full
+     ;; Full synchronous analysis (may be slow)
+     (swift-error-proxy-parse-output output))))
 
-(defun swift-development-run-minimal-analysis (output)
-  "Run minimal error analysis on OUTPUT for fastest performance.
-Only counts errors/warnings without full parsing or UI updates."
-  (let ((error-count 0)
-        (warning-count 0))
-    (with-temp-buffer
-      (insert output)
-      (goto-char (point-min))
-      ;; Quick count of errors and warnings
-      (while (re-search-forward xcode-build-config-error-keyword-pattern nil t)
-        (cl-incf error-count))
-      (goto-char (point-min))
-      (while (re-search-forward xcode-build-config-warning-keyword-pattern nil t)
-        (cl-incf warning-count)))
-    
-    ;; Only update mode line if there are issues
-    (when (or (> error-count 0) (> warning-count 0))
-      (xcode-project-safe-mode-line-notification
-       :message (format "%d error(s), %d warning(s)" error-count warning-count)
-       :seconds 3))))
+(define-obsolete-function-alias 'swift-development-run-minimal-analysis
+  #'ignore "0.7.0" "Use `swift-error-proxy-parse-output' with minimal backend instead.")
 
-(defun swift-development-run-periphery-async (output)
-  "Run periphery analysis on OUTPUT asynchronously to avoid blocking UI.
-Uses intelligent truncation and caching for large outputs."
-  (when (fboundp 'periphery-run-parser)
-    ;; For very large outputs (>100KB), only analyze the last portion with errors
-    (let* ((output-size (length output))
-           (truncated-output 
-            (if (> output-size 100000)
-                (swift-development-truncate-output-intelligently output)
-              output)))
-      
-      ;; Run periphery in a timer to avoid blocking
-      (run-with-idle-timer 0.1 nil 
-                          (lambda (text)
-                            (condition-case err
-                                (periphery-run-parser text)
-                              (error 
-                               (message "Periphery analysis failed: %s" (error-message-string err)))))
-                          truncated-output))))
+(define-obsolete-function-alias 'swift-development-run-periphery-async
+  #'ignore "0.7.0" "Use `swift-error-proxy-parse-output' with ASYNC parameter instead.")
 
-(defun swift-development-truncate-output-intelligently (output)
-  "Truncate large OUTPUT intelligently, keeping error-relevant portions.
-Keeps the last ~500 lines where build status appears, plus any
-error/warning lines from earlier in the output.
-Operates on the string directly to avoid splitting megabytes of text."
-  (let* ((output-len (length output))
-         ;; Find position ~500 lines from end by searching backwards for newlines
-         (tail-start (let ((pos output-len)
-                           (count 0))
-                       (while (and (> pos 0) (< count 500))
-                         (setq pos (or (string-match-p "\n" (substring output 0 pos)
-                                                       ;; search backwards by finding last newline
-                                                       )
-                                       0))
-                         ;; Simpler: just find the 500th newline from end
-                         (setq pos 0 count 500))
-                       pos))
-         ;; Use a more efficient approach: find cut point with reverse scan
-         (cut-pos (let ((pos output-len)
-                        (newline-count 0))
-                    (while (and (> pos 0) (< newline-count 500))
-                      (setq pos (1- pos))
-                      (when (= (aref output pos) ?\n)
-                        (setq newline-count (1+ newline-count))))
-                    (1+ pos)))
-         (error-lines '()))
-    (if (<= cut-pos 0)
-        output  ; Output is short enough, return as-is
-      ;; Scan the truncated prefix for error/warning lines
-      (with-temp-buffer
-        (insert (substring output 0 cut-pos))
-        (goto-char (point-min))
-        (while (re-search-forward "^.*\\(?:error\\|warning\\|failed\\):.*$" nil t)
-          (push (match-string 0) error-lines)))
-      ;; Combine error lines + truncation marker + tail
-      (concat
-       (when error-lines
-         (concat (string-join (nreverse error-lines) "\n")
-                 "\n"))
-       "... [truncated for performance] ...\n"
-       (substring output cut-pos)))))
+(define-obsolete-function-alias 'swift-development-truncate-output-intelligently
+  #'ignore "0.7.0" "Use `swift-error-proxy--truncate-output' instead.")
 
 (defun swift-development-run-xcode-build-server-parse (output)
   "Run xcode-build-server parse on OUTPUT asynchronously, avoiding .compile conflicts."
@@ -643,7 +572,7 @@ Operates on the string directly to avoid splitting megabytes of text."
 (cl-defun swift-development-compile-with-progress (&key command callback update-callback)
   "Run compilation COMMAND with progress indicator and CALLBACK/UPDATE-CALLBACK in background.
 Returns a cons cell (PROCESS . LOG-BUFFER) where LOG-BUFFER accumulates the build output."
-  (if (not swift-development-use-periphery)
+  (if (eq (swift-error-proxy-effective-backend) 'compilation)
       ;; Use compilation-mode directly
       (progn
         ;; Clean up any existing build process first
@@ -891,9 +820,7 @@ RUN should be non-nil to actually launch the app."
                       (message "Missing values - triggering build instead of run"))
                     (swift-development--do-compile :run t))
                 ;; All values present - run directly
-                (when swift-development-use-periphery
-                  (when (fboundp 'periphery-kill-buffer)
-                    (periphery-kill-buffer)))
+                (swift-error-proxy-kill-buffer)
                 (when (fboundp 'ios-simulator-kill-buffer)
                   (ios-simulator-kill-buffer))
                 (require 'ios-simulator)
@@ -910,9 +837,8 @@ RUN should be non-nil to actually launch the app."
   "Build project using xcodebuild (as RUN).
 If FORCE is non-nil, always recompile even if sources are unchanged."
 
-  ;; Clear periphery error list immediately at build start
-  (when (fboundp 'periphery-clear)
-    (periphery-clear))
+   ;; Clear error list immediately at build start
+  (swift-error-proxy-clear)
 
   ;; Show immediate feedback - start progress bar right away
   (setq swift-development--current-build-progress 0)
@@ -971,8 +897,7 @@ RUN specifies whether to run after building."
                                         :percent 10
                                         :title "Building"
                                         :message "Compiling..."))
-  (when swift-development-use-periphery
-    (periphery-kill-buffer))
+  (swift-error-proxy-kill-buffer)
   (ios-simulator-kill-buffer)
   ;; Only ask for device/simulator if not already set
   (when (eq swift-development--device-choice 'unset)
@@ -1123,7 +1048,7 @@ RUN: run app after build.  FOR-DEVICE: t for physical device, nil for simulator.
 
     (xcode-project-setup-xcodebuildserver)
 
-    (if swift-development-use-periphery
+    (if (not (eq (swift-error-proxy-effective-backend) 'compilation))
         (swift-development-compile-with-progress
          :command build-command
          :callback (lambda (text)
@@ -1147,6 +1072,107 @@ RUN: run app after build.  FOR-DEVICE: t for physical device, nil for simulator.
 (defun swift-development-compile-for-device (&key run)
   "Compile and optionally RUN on device."
   (swift-development--compile-target :run run :for-device t))
+
+(defcustom swift-development-analyze-max-diagnostics 200
+  "Maximum number of diagnostics to show from static analysis.
+Errors are always included; warnings are truncated after this limit."
+  :type 'integer
+  :group 'swift-development)
+
+(defun swift-development--extract-diagnostics (output)
+  "Extract unique actionable diagnostic lines from build OUTPUT.
+Keeps only file-level errors and warnings (file:line:col: severity:),
+plus build-level errors.  Skips notes (context-only, not actionable)
+and build-system noise.  Deduplicates to avoid repeating per-target.
+Limits total results to `swift-development-analyze-max-diagnostics'
+to prevent Emacs from freezing on large projects."
+  (let ((lines (split-string output "\n"))
+        ;; Only file-level errors/warnings + build-level errors (no notes)
+        (diagnostic-regex
+         "^\\(?:.+:[0-9]+:[0-9]+: \\(?:error\\|warning\\):\\|^xcodebuild: error:\\|^ld: \\|^Undefined symbol\\|The following build commands failed:\\|\\*\\* \\(?:BUILD\\|ANALYZE\\) FAILED \\*\\*\\)")
+        (seen (make-hash-table :test 'equal))
+        (result nil)
+        (count 0)
+        (total-unique 0)
+        (max-items swift-development-analyze-max-diagnostics))
+    (dolist (line lines)
+      (when (and line
+                 (not (string-empty-p line))
+                 (string-match-p diagnostic-regex line)
+                 (not (gethash line seen)))
+        (puthash line t seen)
+        (cl-incf total-unique)
+        ;; Always include errors, limit warnings
+        (when (or (< count max-items)
+                  (string-match-p "error:" line))
+          (push line result)
+          (cl-incf count))))
+    (when (> total-unique max-items)
+      (message "Analysis: showing %d of %d diagnostics (limit: %d)"
+               count total-unique max-items))
+    (string-join (nreverse result) "\n")))
+
+;;;###autoload
+(defun swift-development-analyze-app ()
+  "Run static analysis on the current project using xcodebuild analyze.
+Finds potential bugs, memory leaks, and logic errors.
+Results are displayed through the error proxy (same format as build errors/warnings)."
+  (interactive)
+  (unless (xcode-project-is-xcodeproject)
+    (user-error "Static analysis requires an Xcode project"))
+  (save-some-buffers t)
+  (swift-error-proxy-clear)
+  ;; Clear accumulated errors from previous builds
+  (setq xcode-project--current-errors-or-warnings nil)
+  (setq xcode-project--seen-diagnostics nil)
+  ;; Setup project if needed
+  (xcode-project-setup-project)
+  (let* ((sim-id (when (xcode-project-run-in-simulator)
+                   (ios-simulator-simulator-identifier)))
+         (device-id (unless sim-id
+                      (when (fboundp 'ios-device-udid) (ios-device-udid))))
+         (analyze-command (xcode-build-config-analyze-command
+                           :sim-id sim-id
+                           :device-id device-id))
+         (default-directory (xcode-project-project-root)))
+    ;; Start progress notification
+    (when (fboundp 'swift-notification-progress-start)
+      (swift-notification-progress-start
+       :id 'swift-analyze
+       :title "Analyzing"
+       :message "Running static analysis..."
+       :percent 0))
+    (swift-notification-send :message "Starting static analysis..." :seconds 2)
+    ;; Run analysis with progress
+    (swift-development-compile-with-progress
+     :command analyze-command
+     :callback (lambda (text)
+                 (when (fboundp 'swift-notification-progress-finish)
+                   (swift-notification-progress-finish 'swift-analyze "Analysis complete"))
+                 (swift-development-cleanup)
+                 ;; Clear live-parsed results, then re-parse with :analyze context
+                 ;; to show [ ANALYZER ] badges instead of [ WARNING ]
+                 (swift-error-proxy-clear)
+                 ;; Filter to only diagnostic lines before parsing
+                 ;; (full output can be 100KB+ of build log, freezes Emacs)
+                 (let ((diagnostics (swift-development--extract-diagnostics text)))
+                   (if (swift-error-proxy-has-errors-p diagnostics)
+                       (progn
+                         (swift-notification-send
+                          :message "Analysis found issues" :seconds 3)
+                         (swift-error-proxy-parse-output diagnostics nil :analyze))
+                     (if (swift-error-proxy-has-warnings-p diagnostics)
+                         (progn
+                           (swift-notification-send
+                            :message "Analysis complete with warnings" :seconds 3)
+                           (swift-error-proxy-parse-output diagnostics nil :analyze))
+                       (swift-notification-send
+                        :message "Analysis complete - no issues found" :seconds 3)))))
+     :update-callback (lambda (text)
+                         ;; Show progress with live error parsing (uses default compiler parsers
+                         ;; for real-time feedback; final callback re-parses with :analyze context)
+                         (xcode-project-parse-compile-lines-output
+                          :input text)))))
 
 ;; ============================================================================
 ;; Smart Build Detection - Skip compilation if sources unchanged
@@ -1681,9 +1707,8 @@ Returns the configuration name or 'Debug' as fallback."
 (defun swift-development-get-project-root ()
   "Get the project root directory."
   (cond
-   ;; If periphery is available and enabled, use it
-   ((and swift-development-use-periphery
-         (fboundp 'periphery-helper:project-root-dir))
+   ;; If periphery helper is available, use it for project root
+   ((fboundp 'periphery-helper:project-root-dir)
     (periphery-helper:project-root-dir))
    ;; Try xcode-additions if available
    ((fboundp 'xcode-project-project-root)
@@ -1700,19 +1725,17 @@ Returns the configuration name or 'Debug' as fallback."
   ;; Cancel progress notification
   (when (fboundp 'swift-notification-progress-cancel)
     (swift-notification-progress-cancel 'spm-build))
-  (let ((has-errors (string-match-p (regexp-quote "error:") text))
-        (has-warnings (string-match-p (regexp-quote "warning:") text)))
+  (let ((has-errors (swift-error-proxy-has-errors-p text))
+        (has-warnings (swift-error-proxy-has-warnings-p text)))
     (cond
      ;; Build failed with errors
      (has-errors
       (swift-notification-send :message "Build failed with errors" :seconds 3)
-      (when (and (fboundp 'periphery-run-parser) swift-development-use-periphery)
-        (periphery-run-parser text)))
+      (swift-error-proxy-parse-output text))
      ;; Build succeeded with warnings - run anyway
      (has-warnings
       (swift-notification-send :message "Build succeeded (with warnings)" :seconds 2)
-      (when (and (fboundp 'periphery-run-parser) swift-development-use-periphery)
-        (periphery-run-parser text))
+      (swift-error-proxy-parse-output text)
       (swift-development-run-async-swift-package))
      ;; Build succeeded
      (t
@@ -1733,15 +1756,15 @@ Returns the configuration name or 'Debug' as fallback."
   (interactive)
   (let* ((default-directory (swift-development-get-project-root))
          (package-name (file-name-nondirectory (directory-file-name default-directory))))
-    (if swift-development-use-periphery
+    ;; Start progress notification
+    (when (fboundp 'swift-notification-progress-start)
+      (swift-notification-progress-start
+       :id 'spm-build
+       :title (format "Building %s" package-name)
+       :message "Compiling Swift package..."
+       :percent 0))
+    (if (fboundp 'async-shell-command-to-string)
         (progn
-          ;; Start progress notification
-          (when (fboundp 'swift-notification-progress-start)
-            (swift-notification-progress-start
-             :id 'spm-build
-             :title (format "Building %s" package-name)
-             :message "Compiling Swift package..."
-             :percent 0))
           ;; Start async build
           (async-shell-command-to-string
            :process-name "swift-package-build"
@@ -1752,7 +1775,7 @@ Returns the configuration name or 'Debug' as fallback."
             (swift-notification-progress-update 'spm-build
                                                 :percent 25
                                                 :message "Building...")))
-      ;; Use compilation-mode for building (non-periphery path)
+      ;; Fallback: use compilation-mode for building
       (let ((compilation-buffer-name-function (lambda (_) "*Swift Package Build*"))
             (compilation-scroll-output t))
         (swift-notification-send :message (format "Building %s..." package-name) :seconds 2)
@@ -1772,34 +1795,34 @@ Returns the configuration name or 'Debug' as fallback."
   "Test package in ROOT."
   (let ((default-directory root)
         (package-name (file-name-nondirectory (directory-file-name root))))
-    (if swift-development-use-periphery
-        ;; Original async implementation for periphery
-        (progn
-          (spinner-start 'progress-bar-filled)
-          (setq swift-development--build-progress-spinner spinner-current)
+    (progn
+      (spinner-start 'progress-bar-filled)
+      (setq swift-development--build-progress-spinner spinner-current)
+      (if (fboundp 'async-start-command-to-string)
           (async-start-command-to-string
            :command "swift test"
            :callback (lambda (text)
-                      (spinner-stop swift-development--build-progress-spinner)
-                      (let ((filtered (periphery-helper:filter-keep-beginning-paths text)))
-                        (periphery-run-test-parser filtered (lambda ()
-                                                              (message-with-color
-                                                               :tag "[All tests passed]"
-                                                               :text ""
-                                                               :attributes 'success)))))
+                       (spinner-stop swift-development--build-progress-spinner)
+                       (let ((filtered (if (fboundp 'periphery-helper:filter-keep-beginning-paths)
+                                           (periphery-helper:filter-keep-beginning-paths text)
+                                         text)))
+                         (swift-error-proxy-parse-test-output
+                          filtered
+                          (lambda ()
+                            (message-with-color
+                             :tag "[All tests passed]"
+                             :text ""
+                             :attributes 'success)))))
            :debug swift-development-debug)
-          (message-with-color
-           :tag (format "[Testing '%s'-package]" package-name)
-           :text "Please wait. Patience is a virtue!"
-           :attributes 'warning))
-      ;; Use compilation-mode for testing
-      (let ((compilation-buffer-name-function (lambda (_) "*Swift Test*"))
-            (compilation-scroll-output t))
-        (compile "swift test")
-        (message-with-color
-         :tag (format "[Testing '%s'-package]" package-name)
-         :text "Running tests..."
-         :attributes 'warning)))))
+        ;; Fallback: use compilation-mode for testing
+        (spinner-stop swift-development--build-progress-spinner)
+        (let ((compilation-buffer-name-function (lambda (_) "*Swift Test*"))
+              (compilation-scroll-output t))
+          (compile "swift test")))
+      (message-with-color
+       :tag (format "[Testing '%s'-package]" package-name)
+       :text "Please wait. Patience is a virtue!"
+       :attributes 'warning))))
 
 (defun swift-development-detect-package-root ()
   "Detects the root directory of the Swift package based on the current buffer."
@@ -1808,24 +1831,26 @@ Returns the configuration name or 'Debug' as fallback."
 
 ;;;###autoload
 (defun swift-development-toggle-periphery-mode ()
-  "Toggle between periphery mode and compilation mode for error display."
+  "Toggle between periphery and compilation mode for error display.
+Cycles through `swift-error-proxy-backend' settings."
   (interactive)
-  (setq swift-development-use-periphery (not swift-development-use-periphery))
-  (message "Swift error display mode: %s" 
-           (if swift-development-use-periphery 
-               "Periphery (tabulated list)" 
-               "Compilation mode"))
-  ;; Kill existing buffers to ensure fresh start with new mode
-  (when swift-development-use-periphery
-    (when-let* ((buf (get-buffer "*Swift Build*")))
-      (kill-buffer buf))
-    (when-let* ((buf (get-buffer "*Swift Test*")))
-      (kill-buffer buf))
-    (when-let* ((buf (get-buffer "*Swift Package Build*")))
-      (kill-buffer buf)))
-  (when (not swift-development-use-periphery)
-    (when (fboundp 'periphery-kill-buffer)
-      (periphery-kill-buffer))))
+  (let ((new-backend (pcase swift-error-proxy-backend
+                       ('periphery 'compilation)
+                       ('compilation 'minimal)
+                       (_ 'periphery))))
+    (setq swift-error-proxy-backend new-backend)
+    ;; Keep legacy variable in sync
+    (setq swift-development-use-periphery (eq new-backend 'periphery))
+    (message "Swift error display mode: %s"
+             (pcase new-backend
+               ('periphery "Periphery (rich UI)")
+               ('compilation "Compilation mode")
+               ('minimal "Minimal (counts only)")))
+    ;; Kill existing buffers to ensure fresh start with new mode
+    (swift-error-proxy-kill-buffer)
+    (dolist (name '("*Swift Build*" "*Swift Test*" "*Swift Package Build*"))
+      (when-let* ((buf (get-buffer name)))
+        (kill-buffer buf)))))
 
 ;;;###autoload
 (defun swift-development-show-build-output ()
@@ -1972,9 +1997,8 @@ This is the fastest way to rebuild after small changes."
 (defun swift-development-run()
     "Rerun already compiled and installed app."
     (interactive)
-    (when swift-development-use-periphery
-      (periphery-kill-buffer))
-    (ios-simulator-kill-buffer)
+  (swift-error-proxy-kill-buffer)
+  (ios-simulator-kill-buffer)
 
     (if (xcode-project-run-in-simulator)
         (ios-simulator-install-and-run-app
@@ -1991,8 +2015,7 @@ This is the fastest way to rebuild after small changes."
   "Test module."
   (interactive)
   (save-some-buffers t)
-  (when swift-development-use-periphery
-    (periphery-kill-buffer))
+  (swift-error-proxy-kill-buffer)
   (ios-simulator-kill-buffer)
   (swift-development-test-swift-package))
 
@@ -2537,7 +2560,7 @@ swift-project-debug, swift-cache-debug, and ios-device-debug."
   (interactive)
   (if (fboundp 'periphery-filter-menu)
       (periphery-filter-menu)
-    (message "Periphery not loaded. Enable swift-development-use-periphery.")))
+    (message "Periphery not loaded.")))
 
 (defun swift-development-toggle-build-output-buffer ()
   "Toggle visibility of the build output buffer."
@@ -2619,7 +2642,8 @@ even when some files have errors, showing all errors at once."
    [("c" "Compile" swift-development-compile-app)
     ("r" "Compile & Run" swift-development-compile-and-run)
     ("q" "Quick rebuild" swift-development-quick-rebuild)]
-   [("b" "Build SPM package" swift-development-build-swift-package)]]
+   [("b" "Build SPM package" swift-development-build-swift-package)
+    ("a" "Static Analysis" swift-development-analyze-app)]]
   ["Build Modes"
    [("1" "Turbo mode" swift-development-enable-turbo-mode)
     ("2" "Balanced mode" swift-development-enable-balanced-mode)
@@ -2627,6 +2651,7 @@ even when some files have errors, showing all errors at once."
     ("4" "Minimal analysis" swift-development-set-minimal-mode)]]
   ["Cache & Status"
    [("w" "Warm build cache" swift-development-warm-build-cache)
+    ("h" "Enable cache sharing" swift-development-enable-build-cache-sharing)
     ("B" "Build status" swift-development-build-status)
     ("e" "Show last errors" swift-development-show-last-build-errors)]
    [("C" "Clear hash cache" swift-development-clear-hash-cache)
@@ -2648,6 +2673,7 @@ even when some files have errors, showing all errors at once."
    [("v" "Preview..." swiftui-preview-transient)
     ("x" "Xcode Project..." xcode-project-transient)
     ("f" "Refactor..." swift-refactor-transient)
+    ("F" "Distribute..." xcode-archive-transient)
     ("E" "Errors (Periphery)..." swift-development--periphery-transient)
     ("S" "Settings..." swift-development-settings-transient)]]
   ["Quick Settings"

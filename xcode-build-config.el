@@ -150,8 +150,8 @@ Higher values allow compilation of larger files but require more RAM."
   :group 'xcode-build-config)
 
 ;;; Build Output Patterns
-(defcustom xcode-build-config-build-succeeded-pattern "\\*\\* BUILD SUCCEEDED \\*\\*"
-  "Regex pattern to detect successful builds."
+(defcustom xcode-build-config-build-succeeded-pattern "\\*\\* \\(?:BUILD\\|ANALYZE\\|TEST\\) SUCCEEDED \\*\\*"
+  "Regex pattern to detect successful builds, analysis, and test runs."
   :type 'string
   :group 'xcode-build-config)
 
@@ -668,6 +668,48 @@ DERIVED-PATH is the derived data path."
         ;; Cache the command and return it
         (puthash cache-key new-command xcode-build-config--build-command-cache)
         new-command))))
+
+;;; ============================================================================
+;;; Static Analysis Command
+;;; ============================================================================
+
+(cl-defun xcode-build-config-analyze-command (&key sim-id device-id)
+  "Generate xcodebuild analyze command for static analysis.
+SIM-ID is the simulator identifier, DEVICE-ID is the physical device identifier.
+Uses the same project/scheme/destination as build but runs Clang static analyzer."
+  (let* ((workspace-or-project (xcode-project-get-workspace-or-project))
+         (scheme (xcode-project-scheme-display-name)))
+    (mapconcat 'identity
+               (delq nil
+                     (list
+                      "xcrun xcodebuild clean analyze"
+                      (format "%s" workspace-or-project)
+                      (format "-scheme '%s'" scheme)
+                      "-parallelizeTargets"
+                      (format "-jobs %d" (* (num-processors) xcode-build-config-parallel-jobs-multiplier))
+                      ;; Destination
+                      (cond
+                       (sim-id
+                        (format "-destination 'platform=iOS Simulator,id=%s'" sim-id))
+                       (device-id
+                        (format "-destination 'platform=iOS,id=%s'" device-id)))
+                      ;; Configuration
+                      (when xcode-build-config-default-configuration
+                        (format "-configuration %s" xcode-build-config-default-configuration))
+                      ;; Code signing for simulator
+                      (when sim-id "CODE_SIGNING_REQUIRED=NO")
+                      (when sim-id "CODE_SIGN_IDENTITY=\"\"")
+                      (when sim-id "CODE_SIGNING_ALLOWED=NO")
+                       ;; Enable static analyzer (text output for stdout parsing)
+                       "RUN_CLANG_STATIC_ANALYZER=YES"
+                       "CLANG_ANALYZER_OUTPUT=text"
+                      ;; Continue to find all issues
+                      "-IDEBuildingContinueBuildingAfterErrors=YES"
+                      "-skipMacroValidation"
+                      "ONLY_ACTIVE_ARCH=YES"
+                      ;; Derived data path
+                      "-derivedDataPath .build"))
+               " ")))
 
 ;;; ============================================================================
 ;;; Optimization Flags
