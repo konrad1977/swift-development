@@ -95,11 +95,13 @@ Returns path to copied file."
 
 ;;; Preview Host Generation
 
-(defun swiftui-preview-spm--generate-preview-host (preview-body imports temp-dir source-file)
+(defun swiftui-preview-spm--generate-preview-host
+    (preview-body imports temp-dir source-file &optional output-path)
   "Generate PreviewHostApp.swift in TEMP-DIR.
 PREVIEW-BODY is the extracted #Preview content.
 IMPORTS is list of imports from the source file.
-SOURCE-FILE is the original Swift file being previewed."
+SOURCE-FILE is the original Swift file being previewed.
+OUTPUT-PATH is the absolute path for the snapshot PNG (embedded in Swift)."
   ;; Copy source file to preview dir (removes #Preview blocks)
   (when source-file
     (swiftui-preview-spm--copy-source-file source-file temp-dir))
@@ -110,10 +112,13 @@ SOURCE-FILE is the original Swift file being previewed."
                               (seq-remove (lambda (imp) (string= imp module-name)) imports)
                             imports))
          (all-imports (delete-dups (cons "SwiftUI" filtered-imports)))
-         (filename (file-name-nondirectory (or source-file (buffer-file-name)))))
+         (filename (file-name-nondirectory (or source-file (buffer-file-name))))
+         (color-scheme (swiftui-preview-core-detect-color-scheme preview-body)))
 
-    ;; Use core to write the host app
-    (swiftui-preview-core-write-host-app preview-body all-imports temp-dir filename)))
+    ;; Use core to write the host app with embedded output-path
+    (swiftui-preview-core-write-host-app
+     preview-body all-imports temp-dir filename color-scheme
+     nil nil nil output-path)))
 
 ;;; Ruby Script Interaction
 
@@ -234,7 +239,8 @@ Creates a temporary Xcode project, builds the preview, and captures screenshot."
                 ;; Generate preview host (also copies source file)
                 (message "Generating preview host...")
                 (swiftui-preview-spm--generate-preview-host
-                 preview-body imports preview-dir (buffer-file-name))
+                 preview-body imports preview-dir (buffer-file-name)
+                 output-path)
 
                 ;; Create temp Xcode project
                 (message "Creating temporary Xcode project...")

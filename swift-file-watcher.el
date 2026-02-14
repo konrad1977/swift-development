@@ -69,7 +69,8 @@ Lower values are more responsive but may cause more CPU usage."
 
 (defcustom swift-file-watcher-ignored-directories
   '("Pods" "Carthage" ".build" "DerivedData" ".git" "node_modules"
-    "vendor" "Build" "build" ".swiftpm" "SourcePackages")
+    "vendor" "Build" "build" ".swiftpm" "SourcePackages"
+    "xcuserdata" "xcshareddata")
   "Directories to ignore when setting up file watchers.
 These directories are typically large and contain generated content."
   :type '(repeat string)
@@ -84,6 +85,14 @@ These directories are typically large and contain generated content."
   "Maximum directory depth to watch for file changes.
 Higher values catch deeper nested source files but use more watchers.
 Default is 10, which handles most iOS project structures."
+  :type 'integer
+  :group 'swift-file-watcher)
+
+(defcustom swift-file-watcher-max-watchers 350
+  "Maximum number of file watchers to create.
+This is a safety limit to prevent file descriptor exhaustion.
+When exceeded, a warning is logged and no further watchers are added.
+Increase this value if you have very large projects."
   :type 'integer
   :group 'swift-file-watcher)
 
@@ -172,20 +181,52 @@ Checks file extension and ignore patterns."
                                        relative-path))
                      swift-file-watcher-ignored-directories))))))
 
+(defvar swift-file-watcher--asset-catalog-extensions
+  '("xcassets" "xcstickers" "xcodeproj" "xcworkspace"
+    "xcframework" "framework")
+  "Directory extensions that are treated as opaque bundles.
+Only the top-level directory is watched, not its children.
+This prevents watching hundreds of .imageset/.appiconset subdirectories
+and compiled framework binaries.")
+
+(defvar swift-file-watcher--asset-subdirectory-extensions
+  '("imageset" "appiconset" "brandassets" "colorset" "complicationset"
+    "dataset" "iconset" "launchimage" "stickerpack" "sticker"
+    "stickersequence" "symbolset" "textureset")
+  "Asset catalog subdirectory extensions that should never be watched.
+These directories contain only binary assets and Contents.json.")
+
 (defun swift-file-watcher--should-watch-dir-p (dirpath)
   "Return non-nil if DIRPATH should be watched.
-Excludes directories in `swift-file-watcher-ignored-directories'."
-  (let ((dirname (file-name-nondirectory (directory-file-name dirpath))))
-    (not (member dirname swift-file-watcher-ignored-directories))))
+Excludes directories in `swift-file-watcher-ignored-directories',
+Xcode project/workspace bundles, and asset catalog subdirectories."
+  (let* ((dirname (file-name-nondirectory (directory-file-name dirpath)))
+         (ext (file-name-extension dirname)))
+    (and
+     ;; Not in ignored directories list
+     (not (member dirname swift-file-watcher-ignored-directories))
+     ;; Not an asset catalog subdirectory (.imageset, .colorset, etc.)
+     (not (and ext (member ext swift-file-watcher--asset-subdirectory-extensions)))
+     ;; Not inside a .xcodeproj or .xcworkspace bundle
+     (not (and ext (member ext '("xcodeproj" "xcworkspace")))))))
 
 ;;; ============================================================================
 ;;; Directory Discovery
 ;;; ============================================================================
 
+(defun swift-file-watcher--opaque-bundle-p (dirpath)
+  "Return non-nil if DIRPATH is an opaque bundle that should not be recursed into.
+Asset catalogs (.xcassets) are watched at the top level but their
+subdirectories (.imageset, .colorset, etc.) are not traversed."
+  (let ((ext (file-name-extension (directory-file-name dirpath))))
+    (and ext (member ext swift-file-watcher--asset-catalog-extensions))))
+
 (defun swift-file-watcher--find-watch-dirs (project-root)
   "Find directories to watch in PROJECT-ROOT.
 Returns a list of directories that likely contain source files.
-Recursively searches up to `swift-file-watcher-max-depth' levels deep."
+Recursively searches up to `swift-file-watcher-max-depth' levels deep.
+Opaque bundles (.xcassets, .xcodeproj, .xcworkspace) are watched at
+the top level but not recursed into, saving hundreds of file descriptors."
   (let ((dirs '())
         (max-depth (or swift-file-watcher-max-depth 6)))
     
@@ -193,9 +234,11 @@ Recursively searches up to `swift-file-watcher-max-depth' levels deep."
                   (when (and (< depth max-depth)
                              (swift-file-watcher--should-watch-dir-p dir))
                     (push dir dirs)
-                    (dolist (entry (ignore-errors (directory-files dir t "^[^.]" t)))
-                      (when (file-directory-p entry)
-                        (collect-dirs entry (1+ depth)))))))
+                    ;; Don't recurse into opaque bundles (.xcassets, etc.)
+                    (unless (swift-file-watcher--opaque-bundle-p dir)
+                      (dolist (entry (ignore-errors (directory-files dir t "^[^.]" t)))
+                        (when (file-directory-p entry)
+                          (collect-dirs entry (1+ depth))))))))
       (collect-dirs project-root 0))
     
     (when swift-file-watcher-debug
@@ -263,7 +306,16 @@ Sets up file-notify watchers for relevant directories."
         swift-file-watcher--change-count 0)
   
   ;; Find directories to watch
-  (let ((dirs (swift-file-watcher--find-watch-dirs swift-file-watcher--project-root)))
+  (let* ((dirs (swift-file-watcher--find-watch-dirs swift-file-watcher--project-root))
+         (max-w (or swift-file-watcher-max-watchers 200))
+         (truncated (> (length dirs) max-w)))
+
+    ;; Enforce safety limit
+    (when truncated
+      (message "[FileWatcher] WARNING: Found %d directories but limit is %d. Watching only the first %d."
+               (length dirs) max-w max-w)
+      (setq dirs (seq-take dirs max-w)))
+
     (setq swift-file-watcher--watched-dirs dirs)
     
     ;; Create watchers for each directory
@@ -277,13 +329,11 @@ Sets up file-notify watchers for relevant directories."
             (when swift-file-watcher-debug
               (message "[FileWatcher] Watching: %s" dir)))
         (error
-         (when swift-file-watcher-debug
-           (message "[FileWatcher] Failed to watch %s: %s" dir (error-message-string err))))))
+         (message "[FileWatcher] Failed to watch %s: %s" dir (error-message-string err)))))
     
-    (when swift-file-watcher-debug
-      (message "[FileWatcher] Started with %d watchers for %s"
-               (length swift-file-watcher--watchers)
-               (file-name-nondirectory (directory-file-name project-root))))
+    (message "[FileWatcher] Started with %d watchers for %s"
+             (length swift-file-watcher--watchers)
+             (file-name-nondirectory (directory-file-name project-root)))
     
     ;; Return number of active watchers
     (length swift-file-watcher--watchers)))

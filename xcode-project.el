@@ -766,6 +766,9 @@ Sets `xcode-project--current-xcode-scheme' and loads settings."
         (setq xcode-project--current-xcode-scheme scheme)
         (when (fboundp 'swift-project-settings-load-for-scheme)
           (swift-project-settings-load-for-scheme (xcode-project-project-root) scheme))
+        ;; Persist to disk so the scheme is remembered across buffers/sessions
+        (when (fboundp 'swift-project-settings-capture-from-variables)
+          (swift-project-settings-capture-from-variables (xcode-project-project-root)))
         (xcode-project-notify
          :message (format "Selected scheme: %s"
                           (propertize (xcode-project--clean-display-name scheme) 'face 'success))
@@ -781,6 +784,9 @@ Sets `xcode-project--current-xcode-scheme' and loads settings."
         (setq xcode-project--current-xcode-scheme selected)
         (when (fboundp 'swift-project-settings-load-for-scheme)
           (swift-project-settings-load-for-scheme (xcode-project-project-root) selected))
+        ;; Persist to disk so the scheme is remembered across buffers/sessions
+        (when (fboundp 'swift-project-settings-capture-from-variables)
+          (swift-project-settings-capture-from-variables (xcode-project-project-root)))
         (xcode-project-notify
          :message (format "Selected scheme: %s"
                           (propertize (xcode-project--clean-display-name selected) 'face 'success))
@@ -1231,8 +1237,9 @@ Result is cached per session and cleared on project reset."
       (when xcode-project-debug
         (message "[DEBUG] Project changed from '%s' to '%s'" current-root normalized-project))
 
-      ;; Reset all cached values when project changes
-      (xcode-project-reset)
+      ;; Reset in-memory cached values when project changes
+      ;; Use soft-reset to preserve disk settings so they can be restored below
+      (xcode-project--soft-reset)
       (setq default-directory project)
       (setq xcode-project--current-project-root normalized-project))
 
@@ -1390,7 +1397,7 @@ Shows that multi-project support is enabled via buffer-local variables."
 
 (defun xcode-project-project-root ()
   "Get the project root as a path string."
-  (setq xcode-project--current-project-root (swift-project-root)))
+  (setq xcode-project--current-project-root (swift-project-root nil t)))
 
 (defconst xcode-project--device-list '(("Simulator" nil)
                                         ("Physical device" t))
@@ -1415,18 +1422,16 @@ Shows that multi-project support is enabled via buffer-local variables."
       t  ; Default to simulator if not set
     (not swift-development--device-choice)))
 
-;;;###autoload
-(defun xcode-project-reset ()
-  "Reset project configuration.
-Prompts for device/simulator choice, then scheme, then fetches build info.
-Build folder is determined by xcodebuild, not by guessing.
-Uses filtered scheme list (excludes test schemes) for build/run operations."
-  (interactive)
+(defun xcode-project--soft-reset ()
+  "Reset in-memory project state without clearing disk settings.
+This is used internally when switching between projects so that
+settings can be restored from disk for the new project.
+Does NOT prompt the user or clear persisted settings."
   ;; 1. Cancel pending timers
   (when xcode-project--periphery-debounce-timer
     (cancel-timer xcode-project--periphery-debounce-timer)
     (setq xcode-project--periphery-debounce-timer nil))
-  
+
   ;; 2. Reset simulator and device state (but don't choose new ones yet)
   (when (fboundp 'ios-simulator-reset)
     (ios-simulator-reset nil))
@@ -1435,11 +1440,9 @@ Uses filtered scheme list (excludes test schemes) for build/run operations."
   (when (fboundp 'swift-error-proxy-kill-buffer)
     (swift-error-proxy-kill-buffer))
 
-  ;; 3. Clear all state variables
+  ;; 3. Clear all in-memory state variables
   ;; NOTE: swift-development--device-choice is NOT cleared here.
   ;; It is a global variable managed by swift-development-reset.
-  ;; Clearing it here would break device selection when setup-current-project
-  ;; calls xcode-project-reset during buffer switches.
   (setq xcode-project--current-build-folder nil
         xcode-project--current-app-identifier nil
         xcode-project--current-build-configuration nil
@@ -1453,23 +1456,36 @@ Uses filtered scheme list (excludes test schemes) for build/run operations."
         xcode-project--last-device-type nil
         xcode-project--workspace-or-project-cache nil)
 
-  ;; 4. Clear swift-cache and settings files on disk
+  ;; 4. Clear in-memory caches only (NOT disk settings)
   (when (fboundp 'swift-cache-invalidate-pattern)
     (swift-cache-invalidate-pattern "::build-settings-")
     (swift-cache-invalidate-pattern "::scheme-files")
     (swift-cache-invalidate-pattern "::xcodebuild-schemes"))
+
+  ;; 5. Reset project root
+  (swift-project-reset-root))
+
+(defun xcode-project-reset ()
+  "Reset project configuration.
+Prompts for device/simulator choice, then scheme, then fetches build info.
+Build folder is determined by xcodebuild, not by guessing.
+Uses filtered scheme list (excludes test schemes) for build/run operations.
+This clears ALL state including persisted disk settings."
+  (interactive)
+  ;; 1. Soft-reset all in-memory state
+  (xcode-project--soft-reset)
+
+  ;; 2. Clear persisted settings on disk
   (when (fboundp 'swift-project-settings-clear)
     (let ((root (or xcode-project--previous-project-root
                     (swift-project-root nil t))))
       (when root
         (swift-project-settings-clear root))))
 
-  ;; 5. Reset project root
-  (swift-project-reset-root)
   (xcode-project-safe-mode-line-update :message "Resetting configuration")
   (swift-notification-send :message "Configuration reset" :seconds 2)
 
-  ;; 6. Prompt for new configuration
+  ;; 3. Prompt for new configuration
   (when (y-or-n-p "Choose a new scheme? ")
     ;; 6a. Ask device or simulator FIRST
     (let ((choice (completing-read "Run on: " '("Simulator" "Physical Device") nil t)))

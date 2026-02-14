@@ -106,18 +106,6 @@ MESSAGE is the completion message."
   :group 'swiftui-preview
   :prefix "swiftui-preview-dynamic-")
 
-(defcustom swiftui-preview-dynamic-simulator "iPhone 16 Pro"
-  "Default simulator name for previews."
-  :type 'string
-  :group 'swiftui-preview-dynamic)
-
-(defcustom swiftui-preview-dynamic-capture-delay 1.0
-  "Delay in seconds after app launch before capturing screenshot.
-Lower values are faster but may capture before the view fully renders.
-Default 1.0 works well for most views; increase for complex views."
-  :type 'number
-  :group 'swiftui-preview-dynamic)
-
 (defcustom swiftui-preview-dynamic-keep-target nil
   "If non-nil, keep the injected PreviewHost target after capture.
 Useful for debugging build issues."
@@ -178,6 +166,12 @@ Used when `swiftui-preview-save-location' is \\=`custom\\='."
 
 (defvar swiftui-preview-dynamic--pending-preview-buffer nil
   "Buffer to generate preview for after testability rebuild.")
+
+(defvar swiftui-preview-dynamic--recompile-cache nil
+  "Cache for recompiled object files during generate-all.
+When non-nil, a plist with :source-file, :fresh-o, :object-files.
+Subsequent previews from the same source file skip recompilation
+and reuse the cached .o file.  Cleared when generate-all finishes.")
 
 ;;; Live mode state
 
@@ -332,12 +326,13 @@ First tries Ruby script, falls back to swift-project-settings (sync but fast)."
 
 (defun swiftui-preview-dynamic--generate-preview-host
     (preview-body imports temp-dir
-     &optional testable-module color-scheme)
+     &optional testable-module color-scheme output-path)
   "Generate PreviewHostApp.swift in TEMP-DIR.
 PREVIEW-BODY is the extracted #Preview content.
 IMPORTS is list of modules to import.
 TESTABLE-MODULE is the module to import with @testable.
 COLOR-SCHEME is \"dark\", \"light\", or nil.
+OUTPUT-PATH is the absolute path where the snapshot PNG will be saved.
 Delegates Swift code generation to `swiftui-preview-core-write-host-app'."
   (let* ((filename (file-name-nondirectory (buffer-file-name)))
          (color-scheme (or color-scheme
@@ -349,6 +344,7 @@ Delegates Swift code generation to `swiftui-preview-core-write-host-app'."
 
     (when swiftui-preview-dynamic-verbose
       (message "[Preview] Color scheme: %s" (or color-scheme "none"))
+      (message "[Preview] Output path embedded: %s" (or output-path "default"))
       (message "[Preview] Preview body (first 200 chars): %s"
                (substring preview-body 0
                           (min 200 (length preview-body)))))
@@ -356,7 +352,7 @@ Delegates Swift code generation to `swiftui-preview-core-write-host-app'."
     (swiftui-preview-core-write-host-app
      preview-body imports temp-dir filename
      color-scheme testable-module use-testable
-     swiftui-preview-dynamic-live-mode)))
+     swiftui-preview-dynamic-live-mode output-path)))
 
 ;;; Ruby Script Interaction
 
@@ -441,11 +437,16 @@ SOURCE-FILE is the original Swift file being previewed."
 
 ;;; Build and Capture
 
-(defun swiftui-preview-dynamic--get-output-path (project-root filename)
+(defun swiftui-preview-dynamic--get-output-path (project-root filename &optional preview-id)
   "Get output path for preview image.
 PROJECT-ROOT is the project directory.
-FILENAME is the base name for the preview."
-  (let ((preview-name (file-name-sans-extension filename)))
+FILENAME is the base name for the preview (e.g., \"HomeView.swift\").
+PREVIEW-ID, when non-nil, is appended to create a unique filename
+\(e.g., \"Light\" produces \"HomeView-Light.png\")."
+  (let ((preview-name (concat (file-name-sans-extension filename)
+                               (when preview-id
+                                 (concat "-" (replace-regexp-in-string
+                                              "[[:space:]]+" "-" preview-id))))))
     (pcase swiftui-preview-save-location
       ('project
        (let ((preview-dir (expand-file-name ".swift-development/previews" project-root)))
@@ -605,6 +606,17 @@ Returns the directory path or nil."
           (setq dir parent)))
       nil)))
 
+(defun swiftui-preview-dynamic--find-objc-include-dirs (derived-data)
+  "Find ObjC include directories from SourcePackages in DERIVED-DATA.
+Returns a list of directory paths for mixed-language module dependencies."
+  (let ((checkouts (expand-file-name "SourcePackages/checkouts" derived-data))
+        (dirs '()))
+    (when (file-directory-p checkouts)
+      (dolist (inc-dir (directory-files-recursively checkouts "^include$" t))
+        (when (file-directory-p inc-dir)
+          (push inc-dir dirs))))
+    (nreverse dirs)))
+
 (defun swiftui-preview-dynamic--recompile-stale-sources (object-files source-file products-dir derived-data ios-version)
   "Recompile the module containing SOURCE-FILE with whole-module optimization.
 Always recompiles to ensure the preview reflects the latest saved code.
@@ -684,13 +696,7 @@ IOS-VERSION is the deployment target (e.g., \"17.0\")."
                                 toolchain-path))
          ;; ObjC include dirs from SourcePackages (needed for mixed modules)
          (objc-include-dirs
-          (let ((checkouts (expand-file-name "SourcePackages/checkouts" derived-data))
-                (dirs '()))
-            (when (file-directory-p checkouts)
-              (dolist (inc-dir (directory-files-recursively checkouts "^include$" t))
-                (when (file-directory-p inc-dir)
-                  (push inc-dir dirs))))
-            (nreverse dirs)))
+          (swiftui-preview-dynamic--find-objc-include-dirs derived-data))
          ;; Fresh .o output path - for module-level, replace the whole module
          (fresh-o (expand-file-name
                    (if module-o (concat module-name ".o") (concat source-base ".o"))
@@ -750,56 +756,83 @@ IOS-VERSION is the deployment target (e.g., \"17.0\")."
       (message "[Preview] Recompile: module-sources-dir=%s (WMO=%s)"
                module-sources-dir (if (and module-o filelist-path) "yes" "no")))
 
-    ;; Always recompile
+    ;; Always recompile -- use async process to avoid blocking Emacs
     (swiftui-preview-dynamic--notify-update 'swiftui-preview
      :percent 15 :message (format "Recompiling %s..." module-name))
 
-    (let* ((recompile-buf (get-buffer-create "*SwiftUI Preview Recompile*"))
-           (exit-code (progn
-                        (with-current-buffer recompile-buf
-                          (let ((inhibit-read-only t)) (erase-buffer)))
-                        (apply #'call-process
-                               (car compile-args) nil
-                               recompile-buf nil (cdr compile-args)))))
-      (cond
-       ;; Recompilation failed - parse errors and fall back to original object files
-       ((/= exit-code 0)
-        (let ((err-output (with-current-buffer recompile-buf
-                            (buffer-substring-no-properties
-                             (point-min) (point-max)))))
-          (when swiftui-preview-dynamic-verbose
-            (message "[Preview] Recompile FAILED (exit %d) for %s - using original .o files"
-                     exit-code source-base)
-            (message "[Preview] Recompile errors:\n%s"
-                     (substring err-output 0 (min (length err-output) 2000))))
-          ;; Parse errors through periphery for clickable diagnostics
-          (swiftui-preview-dynamic--parse-build-errors err-output))
-        object-files)
+    ;; Return the compile-args, fresh-o path, and context so the caller
+    ;; can run the compilation asynchronously
+    (list :compile-args compile-args
+          :fresh-o fresh-o
+          :module-o module-o
+          :per-file-match per-file-match
+          :object-files object-files
+          :source-base source-base
+          :module-name module-name)))
 
-       ;; Module-level .o: replace with fresh whole-module .o
-       (module-o
-        (when swiftui-preview-dynamic-verbose
-          (message "[Preview] Recompiled module %s -> %s (replacing %s)"
-                   module-name (file-name-nondirectory fresh-o)
-                   (file-name-nondirectory module-o)))
-        (mapcar (lambda (f)
-                  (if (string= f module-o) fresh-o f))
-                object-files))
+(defun swiftui-preview-dynamic--recompile-async (recompile-spec callback)
+  "Run the recompilation described by RECOMPILE-SPEC asynchronously.
+RECOMPILE-SPEC is a plist from `--recompile-stale-sources'.
+CALLBACK is called with the updated object-files list."
+  (let* ((compile-args (plist-get recompile-spec :compile-args))
+         (fresh-o (plist-get recompile-spec :fresh-o))
+         (module-o (plist-get recompile-spec :module-o))
+         (per-file-match (plist-get recompile-spec :per-file-match))
+         (object-files (plist-get recompile-spec :object-files))
+         (source-base (plist-get recompile-spec :source-base))
+         (module-name (plist-get recompile-spec :module-name))
+         (recompile-buf (get-buffer-create "*SwiftUI Preview Recompile*")))
+    (with-current-buffer recompile-buf
+      (let ((inhibit-read-only t)) (erase-buffer)))
+    (when swiftui-preview-dynamic-verbose
+      (message "[Preview] Recompile async: %s" (string-join compile-args " ")))
+    (make-process
+     :name "swiftui-preview-recompile"
+     :buffer recompile-buf
+     :command compile-args
+     :sentinel
+     (lambda (process _event)
+       (when (memq (process-status process) '(exit signal))
+         (let ((exit-code (process-exit-status process)))
+           (if (/= exit-code 0)
+               ;; Recompilation failed -- abort the pipeline.
+               ;; Do NOT continue with stale .o files as that would
+               ;; replace a working live preview app with a broken one.
+               (let ((err-output (with-current-buffer recompile-buf
+                                   (buffer-substring-no-properties
+                                    (point-min) (point-max)))))
+                 (when swiftui-preview-dynamic-verbose
+                   (message "[Preview] Recompile FAILED (exit %d) for %s - aborting"
+                            exit-code source-base))
+                 (swiftui-preview-dynamic--parse-build-errors err-output)
+                 (swiftui-preview-dynamic--notify-cancel 'swiftui-preview)
+                 (message "Preview recompile failed — keeping current preview"))
+              (funcall
+               callback
+               (cond
+                ;; Module-level .o: replace with fresh whole-module .o
+                (module-o
+                 (when swiftui-preview-dynamic-verbose
+                   (message "[Preview] Recompiled module %s -> %s (replacing %s)"
+                            module-name (file-name-nondirectory fresh-o)
+                            (file-name-nondirectory module-o)))
+                 (mapcar (lambda (f)
+                           (if (string= f module-o) fresh-o f))
+                         object-files))
+                ;; Per-file match: replace the matching .o
+                (per-file-match
+                 (when swiftui-preview-dynamic-verbose
+                   (message "[Preview] Recompiled %s.o - replacing per-file match" source-base))
+                 (mapcar (lambda (f)
+                           (if (string= f per-file-match) fresh-o f))
+                         object-files))
+                ;; No match: add fresh .o
+                (t
+                 (when swiftui-preview-dynamic-verbose
+                   (message "[Preview] Recompiled %s.o - no matching .o found, adding to list"
+                            source-base))
+                 (cons fresh-o object-files)))))))))))
 
-       ;; Per-file match: replace the matching .o with fresh one
-       (per-file-match
-        (when swiftui-preview-dynamic-verbose
-          (message "[Preview] Recompiled %s.o - replacing per-file match" source-base))
-        (mapcar (lambda (f)
-                  (if (string= f per-file-match) fresh-o f))
-                object-files))
-
-       ;; No match at all - just add the fresh .o to the list
-       (t
-        (when swiftui-preview-dynamic-verbose
-          (message "[Preview] Recompiled %s.o - no matching .o found, adding to list"
-                   source-base))
-        (cons fresh-o object-files))))))
 
 (defun swiftui-preview-dynamic--ensure-testability-build (callback)
   "Ensure project is built with testability, then call CALLBACK.
@@ -1076,119 +1109,179 @@ receives (app-path nil) or (nil error-msg)."
       (let* ((raw-object-files (swiftui-preview-dynamic--collect-object-files products-dir derived-data))
              ;; Detect iOS version from built modules (needed for recompilation)
              (ios-version (swiftui-preview-dynamic--detect-ios-version products-dir))
-             ;; Recompile stale source files to fresh .o files
-             (object-files (if swiftui-preview-dynamic--current-source-file
-                               (swiftui-preview-dynamic--recompile-stale-sources
-                                raw-object-files
-                                swiftui-preview-dynamic--current-source-file
-                                products-dir derived-data ios-version)
-                             raw-object-files))
-             ;; Copy resource bundles for linked modules into app bundle
-             (copied-resources (swiftui-preview-dynamic--copy-app-resources 
-                                products-dir app-dir object-files))
-             (target-triple (format "arm64-apple-ios%s-simulator" ios-version))
-              (sdk-path (swiftui-preview-core-sdk-path))
-              (toolchain-path (swiftui-preview-core-toolchain-path))
-             ;; Detect if object files need profiling runtime
-             (needs-profiling (cl-some
-                               (lambda (f)
-                                 (zerop (call-process "nm" nil nil nil "-g" f "-s" "__DATA" "__llvm_prf_cnts")))
-                               object-files))
-             ;; Detect if object files need thread sanitizer
-             (needs-tsan (cl-some
-                          (lambda (f)
-                            (zerop (call-process "nm" nil nil nil "-g" f "-s" "__DATA" "__tsan_default_options")))
-                          object-files))
-             ;; Profile runtime library path
-             (clang-rt-dir (car (directory-files
-                                 (concat toolchain-path "/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang")
-                                 t "^[0-9]" t)))
-             ;; Find GeneratedModuleMaps for ObjC/mixed modules
-             (generated-modulemaps-dir
-              (let ((dir (expand-file-name 
-                          "Build/Intermediates.noindex/GeneratedModuleMaps-iphonesimulator" 
-                          derived-data)))
-                (when (file-directory-p dir) dir)))
-             ;; Find ObjC include dirs from SourcePackages (for transitive module deps)
-             (objc-include-dirs
-              (let ((checkouts (expand-file-name "SourcePackages/checkouts" derived-data))
-                    (dirs '()))
-                (when (file-directory-p checkouts)
-                  (dolist (inc-dir (directory-files-recursively checkouts "^include$" t))
-                    (when (file-directory-p inc-dir)
-                      (push inc-dir dirs))))
-                (nreverse dirs)))
-             ;; Build with swiftc - compile and link in one step
-             (build-args (append 
-                          (list "xcrun" "--sdk" "iphonesimulator"
-                                "swiftc"
-                                "-parse-as-library"  ;; Required for @main attribute
-                                preview-swift
-                                "-o" executable
-                                "-sdk" sdk-path
-                                "-target" target-triple
-                                ;; Module search paths
-                                "-I" products-dir
-                                ;; Framework search paths  
-                                "-F" products-dir
-                                "-F" (concat sdk-path "/System/Library/Frameworks")
-                                ;; Library search paths for linking
-                                "-L" products-dir
-                                "-L" (concat toolchain-path "/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/iphonesimulator")
-                                ;; System frameworks
-                                "-framework" "SwiftUI"
-                                "-framework" "UIKit"
-                                "-framework" "Foundation"
-                                "-framework" "Combine"
-                                "-framework" "CoreGraphics"
-                                "-framework" "CoreFoundation")
-                          ;; Generated module maps for ObjC/mixed modules
-                          (when generated-modulemaps-dir
-                            (list "-I" generated-modulemaps-dir))
-                          ;; ObjC include dirs for transitive module dependencies
-                          (cl-mapcan (lambda (dir) (list "-Xcc" "-I" "-Xcc" dir))
-                                     objc-include-dirs)
-                          ;; Conditionally add thread sanitizer
-                          (when needs-tsan '("-sanitize=thread"))
-                          ;; Conditionally link profiling runtime
-                          (when (and needs-profiling clang-rt-dir)
-                            (list (expand-file-name "lib/darwin/libclang_rt.profile_iossim.a" clang-rt-dir)))
-                          ;; Add all object files
-                          object-files)))
-        
-        (when swiftui-preview-dynamic-verbose
-          (message "[Preview] iOS version: %s" ios-version)
-          (message "[Preview] Target: %s" target-triple)
-          (message "[Preview] Object files: %s" object-files)
-          (message "[Preview] Copied resources: %s" copied-resources)
-          (message "[Preview] swiftc command: %s" (string-join build-args " ")))
-        
-        (with-current-buffer output-buffer
-          (let ((inhibit-read-only t))
-            (erase-buffer)
-            (insert "Building PreviewHost with swiftc...\n")
-            (insert (format "Products dir: %s\n" products-dir))
-            (insert (format "Object files: %s\n" (string-join (mapcar #'file-name-nondirectory object-files) ", ")))
-            (insert (format "Resource bundles: %s\n\n" 
-                            (if copied-resources 
-                                (string-join copied-resources ", ")
-                              "none")))))
-        
-        (swiftui-preview-dynamic--notify-update 'swiftui-preview
-         :percent 30 :message "Compiling preview...")
-        
-        (setq swiftui-preview-dynamic--build-callback callback)
-        (setq swiftui-preview-dynamic--build-context
-              (list :derived-data derived-data
-                    :app-path app-dir))
-        
-        (let ((process (make-process
-                        :name "swiftui-preview-build"
-                        :buffer output-buffer
-                        :command build-args
-                        :sentinel #'swiftui-preview-dynamic--swiftc-sentinel)))
-          (message "Building preview with swiftc... (async)")
-          process)))))
+             ;; Check recompile cache -- if same source file was already
+             ;; recompiled in this generate-all session, reuse the .o
+             (cached (and swiftui-preview-dynamic--recompile-cache
+                         swiftui-preview-dynamic--current-source-file
+                         (equal (plist-get swiftui-preview-dynamic--recompile-cache :source-file)
+                                swiftui-preview-dynamic--current-source-file)
+                         (file-exists-p (plist-get swiftui-preview-dynamic--recompile-cache :fresh-o))))
+             ;; Prepare recompilation spec (does NOT run the compiler yet)
+             ;; Skip if we have a valid cache hit
+             (recompile-spec
+              (when (and swiftui-preview-dynamic--current-source-file
+                         (not cached))
+                (swiftui-preview-dynamic--recompile-stale-sources
+                 raw-object-files
+                 swiftui-preview-dynamic--current-source-file
+                 products-dir derived-data ios-version)))
+             ;; Continuation: runs after async recompile (or immediately if no recompile)
+             (continue-build
+              (lambda (object-files)
+                ;; Copy resource bundles for linked modules into app bundle
+                (let* ((copied-resources (swiftui-preview-dynamic--copy-app-resources
+                                          products-dir app-dir object-files))
+                       (target-triple (format "arm64-apple-ios%s-simulator" ios-version))
+                       (sdk-path (swiftui-preview-core-sdk-path))
+                       (toolchain-path (swiftui-preview-core-toolchain-path))
+                       ;; Detect profiling/tsan from the original build configuration
+                       ;; by checking a single representative .o file (fast)
+                       (sample-o (car object-files))
+                       (needs-profiling
+                        (when sample-o
+                          (zerop (call-process "nm" nil nil nil
+                                              "-g" sample-o "-s" "__DATA" "__llvm_prf_cnts"))))
+                       (needs-tsan
+                        (when sample-o
+                          (zerop (call-process "nm" nil nil nil
+                                              "-g" sample-o "-s" "__DATA" "__tsan_default_options"))))
+                       ;; Profile runtime library path
+                       (clang-rt-dir (car (directory-files
+                                           (concat toolchain-path "/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang")
+                                           t "^[0-9]" t)))
+                       ;; Find GeneratedModuleMaps for ObjC/mixed modules
+                       (generated-modulemaps-dir
+                        (let ((dir (expand-file-name
+                                    "Build/Intermediates.noindex/GeneratedModuleMaps-iphonesimulator"
+                                    derived-data)))
+                          (when (file-directory-p dir) dir)))
+                       ;; Find ObjC include dirs from SourcePackages (for transitive module deps)
+                       (objc-include-dirs
+                        (swiftui-preview-dynamic--find-objc-include-dirs derived-data))
+                       ;; Build with swiftc - compile and link in one step
+                       (build-args (append
+                                    (list "xcrun" "--sdk" "iphonesimulator"
+                                          "swiftc"
+                                          "-parse-as-library"  ;; Required for @main attribute
+                                          preview-swift
+                                          "-o" executable
+                                          "-sdk" sdk-path
+                                          "-target" target-triple
+                                          ;; Module search paths
+                                          "-I" products-dir
+                                          ;; Framework search paths
+                                          "-F" products-dir
+                                          "-F" (concat sdk-path "/System/Library/Frameworks")
+                                          ;; Library search paths for linking
+                                          "-L" products-dir
+                                          "-L" (concat toolchain-path "/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/iphonesimulator")
+                                          ;; System frameworks
+                                          "-framework" "SwiftUI"
+                                          "-framework" "UIKit"
+                                          "-framework" "Foundation"
+                                          "-framework" "Combine"
+                                          "-framework" "CoreGraphics"
+                                          "-framework" "CoreFoundation")
+                                    ;; Generated module maps for ObjC/mixed modules
+                                    (when generated-modulemaps-dir
+                                      (list "-I" generated-modulemaps-dir))
+                                    ;; ObjC include dirs for transitive module dependencies
+                                    (cl-mapcan (lambda (dir) (list "-Xcc" "-I" "-Xcc" dir))
+                                               objc-include-dirs)
+                                    ;; Conditionally add thread sanitizer
+                                    (when needs-tsan '("-sanitize=thread"))
+                                    ;; Conditionally link profiling runtime
+                                    (when (and needs-profiling clang-rt-dir)
+                                      (list (expand-file-name "lib/darwin/libclang_rt.profile_iossim.a" clang-rt-dir)))
+                                    ;; Add all object files
+                                    object-files)))
+
+                  (when swiftui-preview-dynamic-verbose
+                    (message "[Preview] iOS version: %s" ios-version)
+                    (message "[Preview] Target: %s" target-triple)
+                    (message "[Preview] Object files: %s" object-files)
+                    (message "[Preview] Copied resources: %s" copied-resources)
+                    (message "[Preview] swiftc command: %s" (string-join build-args " ")))
+
+                  (with-current-buffer output-buffer
+                    (let ((inhibit-read-only t))
+                      (erase-buffer)
+                      (insert "Building PreviewHost with swiftc...\n")
+                      (insert (format "Products dir: %s\n" products-dir))
+                      (insert (format "Object files: %s\n" (string-join (mapcar #'file-name-nondirectory object-files) ", ")))
+                      (insert (format "Resource bundles: %s\n\n"
+                                      (if copied-resources
+                                          (string-join copied-resources ", ")
+                                        "none")))))
+
+                  (swiftui-preview-dynamic--notify-update 'swiftui-preview
+                   :percent 30 :message "Compiling preview...")
+
+                  (setq swiftui-preview-dynamic--build-callback callback)
+                  (setq swiftui-preview-dynamic--build-context
+                        (list :derived-data derived-data
+                              :app-path app-dir))
+
+                  (let ((process (make-process
+                                  :name "swiftui-preview-build"
+                                  :buffer output-buffer
+                                  :command build-args
+                                  :sentinel #'swiftui-preview-dynamic--swiftc-sentinel)))
+                    (message "Building preview with swiftc... (async)")
+                    process)))))
+
+        ;; Kick off: recompile async if needed, then continue to build
+        (cond
+         ;; Cache hit: reuse previously recompiled .o files
+         ;; Copy the cached .o into the current temp-dir so it survives
+         ;; cleanup of the previous temp-dir
+         (cached
+          (let* ((cached-o (plist-get swiftui-preview-dynamic--recompile-cache :fresh-o))
+                 (local-o (expand-file-name (file-name-nondirectory cached-o)
+                                            swiftui-preview-dynamic--temp-dir))
+                 (cached-objects (plist-get swiftui-preview-dynamic--recompile-cache :object-files))
+                 ;; Replace the cached .o path with the local copy in object-files
+                 (updated-objects (mapcar (lambda (f)
+                                           (if (equal f cached-o) local-o f))
+                                         cached-objects)))
+            (copy-file cached-o local-o t)
+            ;; Update cache to point to the new copy so it survives
+            ;; deletion of the previous temp-dir
+            (plist-put swiftui-preview-dynamic--recompile-cache :fresh-o local-o)
+            (plist-put swiftui-preview-dynamic--recompile-cache :object-files updated-objects)
+            (when swiftui-preview-dynamic-verbose
+              (message "[Preview] Recompile CACHED: copied %s -> %s"
+                       (file-name-nondirectory cached-o)
+                       swiftui-preview-dynamic--temp-dir))
+            (funcall continue-build updated-objects)))
+         ;; Need to recompile: run async, then cache result and continue
+         (recompile-spec
+          (let ((source-file swiftui-preview-dynamic--current-source-file))
+            (swiftui-preview-dynamic--recompile-async
+             recompile-spec
+             (lambda (object-files)
+               ;; Cache the result for subsequent previews from the same file.
+               ;; Copy the .o to a stable cache dir outside temp-dir so it
+               ;; survives temp-dir cleanup after capture completes.
+               (let ((fresh-o (plist-get recompile-spec :fresh-o)))
+                 (when (and fresh-o (file-exists-p fresh-o))
+                   (let* ((cache-dir (make-temp-file "swiftui-recompile-cache-" t))
+                          (cached-o (expand-file-name
+                                     (file-name-nondirectory fresh-o) cache-dir)))
+                     (copy-file fresh-o cached-o t)
+                     ;; Update object-files to point to the cached copy
+                     (let ((cached-objects (mapcar (lambda (f)
+                                                    (if (equal f fresh-o) cached-o f))
+                                                  object-files)))
+                       (setq swiftui-preview-dynamic--recompile-cache
+                             (list :source-file source-file
+                                   :fresh-o cached-o
+                                   :cache-dir cache-dir
+                                   :object-files cached-objects))))))
+               (funcall continue-build object-files)))))
+         ;; No recompile needed
+         (t
+          (funcall continue-build raw-object-files)))))))
 
 (defun swiftui-preview-dynamic--swiftc-sentinel (process _event)
   "Handle swiftc build PROCESS completion _EVENT."
@@ -1336,52 +1429,52 @@ When nil (default), capture runs headless for faster performance."
 (defun swiftui-preview-dynamic--capture (app-path simulator-udid output-path)
   "Install APP-PATH, launch, and wait for internal snapshot to OUTPUT-PATH.
 The app renders the view internally with transparent background and saves to file.
+The output path is embedded in the generated Swift code at build time,
+so no environment variable propagation is needed.
 Returns OUTPUT-PATH on success."
-  (let ((bundle-id "com.swift-development.preview-host")
-        (process-environment (cons (format "SIMCTL_CHILD_PREVIEW_OUTPUT_PATH=%s" output-path)
-                                   process-environment)))
-    
+  (let ((bundle-id "com.swift-development.preview-host"))
+
     ;; Terminate any existing instance and uninstall to avoid stale binary
     (swiftui-preview-dynamic--simctl (list "terminate" simulator-udid bundle-id))
     (swiftui-preview-dynamic--simctl (list "uninstall" simulator-udid bundle-id))
-    
+
     ;; Ensure output directory exists
     (make-directory (file-name-directory output-path) t)
-    
+
     ;; Delete old output file if exists
     (when (file-exists-p output-path)
       (delete-file output-path))
-    
+
     ;; Install fresh
     (swiftui-preview-dynamic--notify-update 'swiftui-preview
      :percent 70 :message "Installing...")
     (unless (swiftui-preview-dynamic--simctl (list "install" simulator-udid app-path))
       (error "Failed to install preview app"))
-    
+
     ;; Only open Simulator window if explicitly requested
     (when swiftui-preview-dynamic-show-simulator
       (if (fboundp 'swift-async-run-sync)
           (swift-async-run-sync '("open" "-a" "Simulator") :timeout 5)
         (call-process "open" nil nil nil "-a" "Simulator"))
       (sleep-for 1))
-    
-    ;; Launch app - environment variable SIMCTL_CHILD_PREVIEW_OUTPUT_PATH
-    ;; is passed to the app as PREVIEW_OUTPUT_PATH
-    ;; The app will render the view internally and save to this path
+
+    ;; Launch app - output path is embedded in the Swift code
     (swiftui-preview-dynamic--notify-update 'swiftui-preview
      :percent 80 :message "Capturing...")
+    (when swiftui-preview-dynamic-verbose
+      (message "[Preview] Sync capture: launching app, polling for %s" output-path))
     (swiftui-preview-dynamic--simctl (list "launch" simulator-udid bundle-id))
-    
+
     ;; Wait for the app to generate the preview and exit
     ;; The app calls exit(0) after saving, so we poll for the file
-    (let ((timeout 10.0)
-          (poll-interval 0.2)
+    (let ((timeout 15.0)
+          (poll-interval 0.3)
           (elapsed 0.0))
       (while (and (< elapsed timeout)
                   (not (file-exists-p output-path)))
         (sleep-for poll-interval)
         (setq elapsed (+ elapsed poll-interval)))
-      
+
       (unless (file-exists-p output-path)
         ;; Fallback: try simctl screenshot if internal capture failed
         (message "Internal capture timed out, falling back to screenshot...")
@@ -1389,73 +1482,75 @@ Returns OUTPUT-PATH on success."
          (list "io" simulator-udid "screenshot" output-path))
         (when (file-exists-p output-path)
           (swiftui-preview-dynamic--crop-image output-path))))
-    
+
     ;; Terminate app (may already be terminated)
     (swiftui-preview-dynamic--simctl (list "terminate" simulator-udid bundle-id))
-    
+
     (if (file-exists-p output-path)
         output-path
       (error "Failed to generate preview"))))
 
-(defalias 'swiftui-preview-dynamic--poll-for-file
-  #'swiftui-preview-core-poll-for-file
-  "Poll for file existence.  Delegates to core.")
+(defalias 'swiftui-preview-dynamic--watch-for-file
+  #'swiftui-preview-core-watch-for-file
+  "Watch for file creation via OS notifications.  Delegates to core.")
 
 (defalias 'swiftui-preview-dynamic--simctl-async
   #'swiftui-preview-core-simctl-async
   "Run simctl asynchronously.  Delegates to core.")
 
 (defun swiftui-preview-dynamic--capture-launch-and-poll
-    (simulator-udid bundle-id output-path launch-env callback)
+    (simulator-udid bundle-id output-path callback)
   "Launch preview app on SIMULATOR-UDID and poll for OUTPUT-PATH.
 BUNDLE-ID is the app bundle identifier.
-LAUNCH-ENV is the process-environment to use for simctl launch
-so that SIMCTL_CHILD_PREVIEW_OUTPUT_PATH reaches the app.
+The output path is embedded in the generated Swift code, so no
+environment variable propagation is needed.
 Calls CALLBACK with OUTPUT-PATH on success."
   (swiftui-preview-dynamic--notify-update 'swiftui-preview
    :percent 80 :message "Capturing...")
-  ;; Bind process-environment so simctl launch passes the env var to the app
-  (let ((process-environment launch-env))
-    (swiftui-preview-dynamic--simctl-async
-     (list "launch" simulator-udid bundle-id)
-     (lambda (_)
-       (swiftui-preview-dynamic--poll-for-file
-        output-path 10.0 0.2
-        (lambda (found-path)
-          (if found-path
-              (progn
-                (swiftui-preview-dynamic--simctl-async
-                 (list "terminate" simulator-udid bundle-id) nil)
-                (funcall callback found-path))
-            ;; Fallback: screenshot
-            (message "Internal capture timed out, falling back to screenshot...")
-            (swiftui-preview-dynamic--simctl-async
-             (list "io" simulator-udid "screenshot" output-path)
-             (lambda (_)
-               (when (file-exists-p output-path)
-                 (swiftui-preview-dynamic--crop-image output-path))
-               (swiftui-preview-dynamic--simctl-async
-                (list "terminate" simulator-udid bundle-id) nil)
-               (if (file-exists-p output-path)
-                   (funcall callback output-path)
-                 (error "Failed to generate preview")))))))))))
+  (when swiftui-preview-dynamic-verbose
+    (message "[Preview] Launching app, polling for: %s" output-path))
+  (swiftui-preview-dynamic--simctl-async
+   (list "launch" simulator-udid bundle-id)
+   (lambda (_)
+     (when swiftui-preview-dynamic-verbose
+       (message "[Preview] App launched, polling for output file..."))
+      (swiftui-preview-dynamic--watch-for-file
+       output-path 15.0
+       (lambda (found-path)
+        (if found-path
+            (progn
+              (when swiftui-preview-dynamic-verbose
+                (message "[Preview] Internal capture SUCCESS: %s" found-path))
+              (swiftui-preview-dynamic--simctl-async
+               (list "terminate" simulator-udid bundle-id) nil)
+              (funcall callback found-path))
+          ;; Fallback: screenshot
+          (message "[Preview] Internal capture timed out, falling back to screenshot...")
+          (swiftui-preview-dynamic--simctl-async
+           (list "io" simulator-udid "screenshot" output-path)
+           (lambda (_)
+             (when (file-exists-p output-path)
+               (swiftui-preview-dynamic--crop-image output-path))
+             (swiftui-preview-dynamic--simctl-async
+              (list "terminate" simulator-udid bundle-id) nil)
+             (if (file-exists-p output-path)
+                 (funcall callback output-path)
+               (error "Failed to generate preview"))))))))))
 
 (defun swiftui-preview-dynamic--capture-async (app-path simulator-udid output-path callback)
   "Install APP-PATH on SIMULATOR-UDID, capture to OUTPUT-PATH asynchronously.
 Calls CALLBACK with OUTPUT-PATH on success, signals error on failure.
-Uses timer-based polling instead of blocking sleep-for."
-  (let* ((bundle-id "com.swift-development.preview-host")
-         ;; Capture launch environment with SIMCTL_CHILD_ prefix so that
-         ;; `simctl launch' propagates it to the app.  Stored as a lexical
-         ;; value because callbacks run later from timers/sentinels where
-         ;; a dynamic `process-environment' binding is no longer active.
-         (launch-env (cons (format "SIMCTL_CHILD_PREVIEW_OUTPUT_PATH=%s" output-path)
-                           process-environment)))
+The output path is embedded in the generated Swift code at build time,
+so no environment variable propagation is needed."
+  (let ((bundle-id "com.swift-development.preview-host"))
     ;; Ensure output directory exists
     (make-directory (file-name-directory output-path) t)
     ;; Delete old output file
     (when (file-exists-p output-path)
       (delete-file output-path))
+    (when swiftui-preview-dynamic-verbose
+      (message "[Preview] Capture async: install %s, expect output at %s"
+               (file-name-nondirectory app-path) output-path))
     ;; Terminate + uninstall old instance, then install + launch
     (swiftui-preview-dynamic--simctl-async
      (list "terminate" simulator-udid bundle-id)
@@ -1479,20 +1574,27 @@ Uses timer-based polling instead of blocking sleep-for."
                     (lambda ()
                       (swiftui-preview-dynamic--capture-launch-and-poll
                        simulator-udid bundle-id output-path
-                       launch-env callback))))
+                       callback))))
                (swiftui-preview-dynamic--capture-launch-and-poll
                 simulator-udid bundle-id output-path
-                launch-env callback)))
+                callback)))
            (lambda (err)
              (error "Failed to install preview app: %s" err)))))))))
 
 ;;; Main Entry Points
 
 ;;;###autoload
-(defun swiftui-preview-dynamic-generate ()
+(defun swiftui-preview-dynamic-generate (&optional preview-body preview-name)
   "Generate SwiftUI preview using dynamic target injection.
 Works with Xcode projects and workspaces.
 For SPM packages, use `swiftui-preview-spm-generate'.
+
+When PREVIEW-BODY is provided, use it directly instead of extracting
+from the buffer.  This enables generating a specific preview when
+multiple #Preview blocks exist.
+
+PREVIEW-NAME, when non-nil, is used to create a unique output filename
+\(e.g., \"Light\" produces \"HomeView-Light.png\" instead of \"HomeView.png\").
 
 If testability is not enabled, this will automatically enable it
 and rebuild the project before generating the preview."
@@ -1515,9 +1617,14 @@ and rebuild the project before generating the preview."
   ;; Save file first so buffer and disk are in sync
   (save-buffer)
   
-  ;; Get preview body and color scheme from current buffer
-  (let* ((preview-body (swiftui-preview--get-first-preview-body))
-         (color-scheme (swiftui-preview-core-detect-color-scheme-from-buffer)))
+  ;; Get preview body and color scheme
+  (let* ((preview-body (or preview-body (swiftui-preview--get-first-preview-body)))
+         ;; Detect color scheme from the specific preview body, not the
+         ;; whole buffer -- important when multiple previews have different
+         ;; color schemes
+         (color-scheme (if preview-body
+                           (swiftui-preview-core-detect-color-scheme preview-body)
+                         (swiftui-preview-core-detect-color-scheme-from-buffer))))
     (unless preview-body
       (user-error "No #Preview block found in file"))
     
@@ -1551,10 +1658,11 @@ and rebuild the project before generating the preview."
              (project-root (plist-get project-info :root)))
         
         ;; Handle based on project type
-        (pcase project-type
+         (pcase project-type
            ((or 'xcode-project 'xcode-workspace)
             (swiftui-preview-dynamic--generate-for-xcode
-             preview-body project-path project-root color-scheme))
+             preview-body project-path project-root color-scheme
+             preview-name))
           ('spm-package
            (if (fboundp 'swiftui-preview-spm-generate)
                (swiftui-preview-spm-generate)
@@ -1600,12 +1708,14 @@ XCODEPROJ-PATH, TEMP-DIR for cleanup.  ERR is the error."
   (when (and temp-dir (file-exists-p temp-dir))
     (delete-directory temp-dir t)))
 
-(defun swiftui-preview-dynamic--generate-for-xcode (preview-body project-path project-root &optional color-scheme)
+(defun swiftui-preview-dynamic--generate-for-xcode (preview-body project-path project-root &optional color-scheme preview-name)
   "Generate preview for Xcode project.
 PREVIEW-BODY is the extracted #Preview content.
 PROJECT-PATH is path to .xcodeproj or .xcworkspace.
 PROJECT-ROOT is the project root directory.
 COLOR-SCHEME is \"dark\", \"light\", or nil (detected from buffer).
+PREVIEW-NAME, when non-nil, is appended to the output filename for
+unique naming (e.g., \"Light\" -> \"HomeView-Light.png\").
 
 This function is fully asynchronous - it does not block Emacs.
 All subprocess calls (module detection, simulator lookup, Ruby scripts,
@@ -1616,7 +1726,8 @@ builds, and capture) run through `swift-async-run' with callback chains."
          (is-workspace (string-suffix-p ".xcworkspace" project-path))
          ;; Capture imports synchronously (pure elisp buffer scan, instant)
          (imports (swiftui-preview-dynamic--extract-imports))
-         (output-path (swiftui-preview-dynamic--get-output-path project-root filename))
+         (output-path (swiftui-preview-dynamic--get-output-path
+                        project-root filename preview-name))
          (temp-dir (make-temp-file "swiftui-preview-" t)))
 
     ;; Store for cleanup and source recompilation
@@ -1659,9 +1770,12 @@ builds, and capture) run through `swift-async-run' with callback chains."
                                (swiftui-preview-dynamic--notify-update
                                 'swiftui-preview
                                 :percent 10 :message "Generating host...")
-                               (swiftui-preview-dynamic--generate-preview-host
-                                preview-body imports temp-dir
-                                module-name color-scheme)
+                                (when swiftui-preview-dynamic-verbose
+                                  (message "[Preview] Embedding output-path in Swift: %s"
+                                           output-path))
+                                (swiftui-preview-dynamic--generate-preview-host
+                                 preview-body imports temp-dir
+                                 module-name color-scheme output-path)
                                ;; Step 5+6+7+8: Build and capture
                                (let ((proceed-to-build
                                       (lambda ()
@@ -1775,25 +1889,29 @@ ERROR-MSG is the error message to display."
 
 ;;;###autoload
 (defun swiftui-preview-dynamic-select ()
-  "Select which #Preview to generate if multiple exist."
+  "Select which #Preview to generate if multiple exist.
+Prompts the user with preview names and generates the selected one."
   (interactive)
   (let ((previews (swiftui-preview--detect-preview-definitions)))
     (if (null previews)
         (user-error "No #Preview blocks found")
-      (if (= (length previews) 1)
-          (swiftui-preview-dynamic-generate)
-        ;; Multiple previews - let user choose
-        (let* ((choices (mapcar (lambda (p)
-                                  (cons (or (plist-get p :name) "Preview")
-                                        (plist-get p :body)))
-                                (cl-remove-if-not
-                                 (lambda (p) (eq (plist-get p :type) 'preview-macro))
-                                 previews)))
-               (_selected (completing-read "Select preview: "
-                                           (mapcar #'car choices)
-                                           nil t)))
-          ;; TODO: Pass selected preview body to generation
-          (swiftui-preview-dynamic-generate))))))
+      (let ((macro-previews (cl-remove-if-not
+                             (lambda (p) (eq (plist-get p :type) 'preview-macro))
+                             previews)))
+        (if (<= (length macro-previews) 1)
+            (swiftui-preview-dynamic-generate)
+          ;; Multiple previews - let user choose
+          (let* ((choices (mapcar (lambda (p)
+                                    (cons (or (plist-get p :name) "Preview")
+                                          (plist-get p :body)))
+                                  macro-previews))
+                 (selected-name (completing-read "Select preview: "
+                                                 (mapcar #'car choices)
+                                                 nil t))
+                 (selected-body (cdr (assoc selected-name choices))))
+            (if selected-body
+                (swiftui-preview-dynamic-generate selected-body)
+              (user-error "No body found for preview '%s'" selected-name))))))))
 
 ;;; Live Preview Mode
 

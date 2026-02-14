@@ -29,6 +29,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'filenotify)
 (require 'json)
 (require 'swift-async nil t)
 
@@ -36,6 +37,7 @@
 (declare-function ios-simulator-simulator-identifier "ios-simulator")
 (declare-function ios-simulator-setup-simulator-dwim "ios-simulator")
 (declare-function ios-simulator-booted-simulator "ios-simulator")
+(declare-function ios-simulator-get-all-booted-simulators "ios-simulator")
 (declare-function swift-async-run "swift-async")
 (declare-function swift-async-run-sync "swift-async")
 (declare-function swift-cache-with "swift-cache")
@@ -137,13 +139,24 @@ boot, already-booted, and Simulator.app launch."
 (defun swiftui-preview-core-ensure-simulator-booted-async
     (udid callback)
   "Ensure simulator with UDID is booted, then call CALLBACK.
-Uses `ios-simulator-setup-simulator-dwim' (async) and waits
-briefly for the simulator to settle."
+If the simulator is already booted, calls CALLBACK immediately.
+Otherwise uses `ios-simulator-setup-simulator-dwim' and waits 1s
+for it to settle."
   (if (fboundp 'ios-simulator-setup-simulator-dwim)
-      (progn
-        (ios-simulator-setup-simulator-dwim udid)
-        ;; Give the simulator a moment to settle before proceeding
-        (run-at-time 1 nil callback))
+      (let ((already-booted
+             (and (fboundp 'ios-simulator-get-all-booted-simulators)
+                  (cl-find udid
+                           (ios-simulator-get-all-booted-simulators)
+                           :key #'cdr :test #'string=))))
+        (if already-booted
+            ;; Already booted -- proceed immediately
+            (progn
+              (when swiftui-preview-core-verbose
+                (message "[Preview Core] Simulator already booted, skipping delay"))
+              (funcall callback))
+          ;; Need to boot -- kick off and wait 1s
+          (ios-simulator-setup-simulator-dwim udid)
+          (run-at-time 1 nil callback)))
     (funcall callback)))
 
 ;;; simctl Wrappers
@@ -184,67 +197,64 @@ nil so async pipelines continue (useful for terminate/uninstall)."
   "Install APP-PATH, launch, and wait for snapshot (synchronous).
 SIMULATOR-UDID is the target simulator.
 OUTPUT-PATH is where the preview image will be saved.
+The output path is embedded in the generated Swift code at build time,
+so no environment variable propagation is needed.
 BUNDLE-ID is the app\\='s bundle identifier.
 Returns OUTPUT-PATH on success."
-  (let ((process-environment
-         (cons (format "SIMCTL_CHILD_PREVIEW_OUTPUT_PATH=%s"
-                       output-path)
-               process-environment)))
-    ;; Terminate any existing instance
-    (swiftui-preview-core-simctl
-     (list "terminate" simulator-udid bundle-id))
+  ;; Terminate any existing instance
+  (swiftui-preview-core-simctl
+   (list "terminate" simulator-udid bundle-id))
 
-    ;; Ensure output directory exists and remove old file
-    (make-directory (file-name-directory output-path) t)
-    (when (file-exists-p output-path)
-      (delete-file output-path))
+  ;; Ensure output directory exists and remove old file
+  (make-directory (file-name-directory output-path) t)
+  (when (file-exists-p output-path)
+    (delete-file output-path))
 
-    ;; Install
-    (message "Installing preview app...")
-    (unless (swiftui-preview-core-simctl
-             (list "install" simulator-udid app-path))
-      (error "Failed to install preview app"))
+  ;; Install
+  (message "Installing preview app...")
+  (unless (swiftui-preview-core-simctl
+           (list "install" simulator-udid app-path))
+    (error "Failed to install preview app"))
 
-    ;; Launch
-    (message "Launching preview app...")
-    (swiftui-preview-core-simctl
-     (list "launch" simulator-udid bundle-id))
+  ;; Launch -- output path is embedded in the Swift code
+  (message "Launching preview app...")
+  (swiftui-preview-core-simctl
+   (list "launch" simulator-udid bundle-id))
 
-    ;; Wait for the app to generate the preview and exit
-    (message "Waiting for preview generation...")
-    (let ((timeout swiftui-preview-core-capture-timeout)
-          (poll-interval 0.2)
-          (elapsed 0.0))
-      (while (and (< elapsed timeout)
-                  (not (file-exists-p output-path)))
-        (sleep-for poll-interval)
-        (setq elapsed (+ elapsed poll-interval)))
+  ;; Wait for the app to generate the preview and exit
+  (message "Waiting for preview generation...")
+  (let ((timeout swiftui-preview-core-capture-timeout)
+        (poll-interval 0.3)
+        (elapsed 0.0))
+    (while (and (< elapsed timeout)
+                (not (file-exists-p output-path)))
+      (sleep-for poll-interval)
+      (setq elapsed (+ elapsed poll-interval)))
 
-      (unless (file-exists-p output-path)
-        ;; Fallback: try simctl screenshot
-        (message "Internal capture timed out, falling back to screenshot...")
-        (swiftui-preview-core-simctl
-         (list "io" simulator-udid "screenshot" output-path))))
+    (unless (file-exists-p output-path)
+      ;; Fallback: try simctl screenshot
+      (message "Internal capture timed out, falling back to screenshot...")
+      (swiftui-preview-core-simctl
+       (list "io" simulator-udid "screenshot" output-path))))
 
-    ;; Terminate app
-    (swiftui-preview-core-simctl
-     (list "terminate" simulator-udid bundle-id))
+  ;; Terminate app
+  (swiftui-preview-core-simctl
+   (list "terminate" simulator-udid bundle-id))
 
-    (if (file-exists-p output-path)
-        output-path
-      (error "Failed to generate preview"))))
+  (if (file-exists-p output-path)
+      output-path
+    (error "Failed to generate preview")))
 
-(defun swiftui-preview-core-poll-for-file
-    (path timeout interval callback)
-  "Poll for PATH to exist using a timer, then call CALLBACK.
-TIMEOUT is max wait in seconds.  INTERVAL is poll frequency.
+(defun swiftui-preview-core--poll-for-file (path timeout callback)
+  "Poll for PATH using a timer, then call CALLBACK.
+TIMEOUT is max wait in seconds.  Polls every 0.3 seconds.
 CALLBACK receives PATH if found, or nil if timed out.
-Does not block Emacs."
+Used as fallback when `file-notify' is unavailable."
   (let ((timer nil)
         (start-time (float-time)))
     (setq timer
           (run-at-time
-           0 interval
+           0 0.3
            (lambda ()
              (cond
               ((file-exists-p path)
@@ -253,6 +263,66 @@ Does not block Emacs."
               ((> (- (float-time) start-time) timeout)
                (when (timerp timer) (cancel-timer timer))
                (funcall callback nil))))))))
+
+(defun swiftui-preview-core-watch-for-file (path timeout callback)
+  "Watch for PATH to appear, then call CALLBACK.
+TIMEOUT is max wait in seconds.
+CALLBACK receives PATH if found, or nil if timed out.
+Tries `file-notify-add-watch' on the parent directory (kqueue on
+macOS) for near-instant detection.  Falls back to timer-based
+polling if file descriptors are exhausted.  Does not block Emacs."
+  (let* ((dir (file-name-directory path))
+         (target-name (file-name-nondirectory path))
+         (watch-desc nil)
+         (timeout-timer nil)
+         (fired nil)  ; guard against double-fire
+         (cleanup (lambda ()
+                    (when (and watch-desc (file-notify-valid-p watch-desc))
+                      (file-notify-rm-watch watch-desc)
+                      (setq watch-desc nil))
+                    (when (timerp timeout-timer)
+                      (cancel-timer timeout-timer)
+                      (setq timeout-timer nil)))))
+    ;; Ensure directory exists so we can watch it
+    (make-directory dir t)
+    ;; Check if file already exists (race condition guard)
+    (if (file-exists-p path)
+        (funcall callback path)
+      ;; Try file-notify; fall back to polling on descriptor exhaustion
+      (condition-case _err
+          (progn
+            (setq watch-desc
+                  (file-notify-add-watch
+                   dir '(change)
+                   (lambda (event)
+                     (when (and (not fired)
+                                (memq (nth 1 event) '(created changed))
+                                (let ((event-file (nth 2 event)))
+                                  (string= (file-name-nondirectory
+                                            (if (stringp event-file)
+                                                event-file ""))
+                                           target-name)))
+                       (setq fired t)
+                       (funcall cleanup)
+                       (funcall callback path)))))
+            ;; Timeout safety net
+            (setq timeout-timer
+                  (run-at-time
+                   timeout nil
+                   (lambda ()
+                     (unless fired
+                       (setq fired t)
+                       (funcall cleanup)
+                       ;; Last-chance check
+                       (if (file-exists-p path)
+                           (funcall callback path)
+                         (funcall callback nil)))))))
+        (file-error
+         ;; file-notify failed (no descriptors left, etc.) -- use polling
+         (when swiftui-preview-core-verbose
+           (message "[Preview Core] file-notify unavailable, using polling for %s"
+                    (file-name-nondirectory path)))
+         (swiftui-preview-core--poll-for-file path timeout callback))))))
 
 ;;; Ruby Script Helpers
 
@@ -341,81 +411,131 @@ Calls CALLBACK with parsed JSON result on success."
 
 ;;; Snapshot Swift Code
 
-(defconst swiftui-preview-core--snapshot-code
-  "
+(defun swiftui-preview-core--snapshot-code (output-path)
+  "Generate Swift snapshot code that writes the preview PNG to OUTPUT-PATH.
+OUTPUT-PATH is embedded as a string literal so the app does not depend
+on environment variables (which `simctl launch' does not propagate)."
+  (format "
 // MARK: - Snapshot Logic
 
-func snapshotPreview() {
-    let previewView = PreviewContent()
+/// Find the content bounding box (top and bottom row) in a CGImage.
+/// Scans from top-down and bottom-up to find the first/last rows with
+/// non-background pixels.  Background color is sampled from the
+/// bottom-right corner.
+/// Returns (topRow, bottomRow) in pixel coordinates.
+func findContentBounds(in cgImage: CGImage) -> (top: Int, bottom: Int) {
+    let w = cgImage.width
+    let h = cgImage.height
+    guard w > 0, h > 0,
+          let data = cgImage.dataProvider?.data,
+          let ptr = CFDataGetBytePtr(data) else { return (0, h) }
 
-    let screenWidth: CGFloat = UIScreen.main.bounds.width
-    let screenHeight: CGFloat = UIScreen.main.bounds.height
+    let bpp = cgImage.bitsPerPixel / 8
+    let bpr = cgImage.bytesPerRow
+    guard bpp >= 3 else { return (0, h) }
 
-    // Measure with the correct interface style so colors resolve
-    let measureController = UIHostingController(rootView: previewView)
-    measureController.overrideUserInterfaceStyle = kInterfaceStyle
-    measureController.view.backgroundColor = .clear
-    measureController.view.frame = CGRect(
-        origin: .zero,
-        size: CGSize(width: screenWidth, height: screenHeight))
-    measureController.view.layoutIfNeeded()
+    // Sample background color from bottom-right corner
+    let refOffset = (h - 1) * bpr + (w - 1) * bpp
+    let bgR = ptr[refOffset]
+    let bgG = ptr[refOffset + 1]
+    let bgB = ptr[refOffset + 2]
 
-    let fittedSize = measureController.sizeThatFits(
-        in: CGSize(width: screenWidth,
-                   height: UIView.layoutFittingExpandedSize.height))
+    let tolerance: UInt8 = 4
 
-    let contentWidth = min(fittedSize.width, screenWidth)
-    let contentHeight = min(fittedSize.height, screenHeight)
-
-    let padding: CGFloat = 20
-    let finalSize = CGSize(
-        width: contentWidth + padding * 2,
-        height: contentHeight + padding * 2
-    )
-
-    // Use systemBackground for explicit dark/light, clear otherwise
-    let bgColor: Color = kHasExplicitColorScheme
-        ? Color(uiColor: .systemBackground)
-        : Color.clear
-
-    let paddedView = previewView
-        .frame(width: contentWidth, height: contentHeight)
-        .padding(padding)
-        .background(bgColor)
-
-    let finalController = UIHostingController(rootView: paddedView)
-    finalController.overrideUserInterfaceStyle = kInterfaceStyle
-    finalController.view.frame = CGRect(origin: .zero, size: finalSize)
-    finalController.view.backgroundColor = kHasExplicitColorScheme
-        ? .systemBackground
-        : .clear
-    if !kHasExplicitColorScheme {
-        finalController.view.isOpaque = false
-        for subview in finalController.view.subviews {
-            subview.backgroundColor = .clear
-            subview.isOpaque = false
-        }
+    func isBackground(_ offset: Int) -> Bool {
+        let dr = abs(Int(ptr[offset]) - Int(bgR))
+        let dg = abs(Int(ptr[offset + 1]) - Int(bgG))
+        let db = abs(Int(ptr[offset + 2]) - Int(bgB))
+        return dr <= Int(tolerance) && dg <= Int(tolerance) && db <= Int(tolerance)
     }
-    finalController.view.layoutIfNeeded()
+
+    // Sample every 4th pixel per row for speed
+    let step = max(1, bpp * 4)
+
+    // Scan from top to find first content row
+    var topRow = 0
+    for row in 0..<h {
+        let rowBase = row * bpr
+        var found = false
+        for col in stride(from: 0, to: w * bpp, by: step) {
+            if !isBackground(rowBase + col) {
+                found = true
+                break
+            }
+        }
+        if found { topRow = row; break }
+    }
+
+    // Scan from bottom to find last content row
+    var bottomRow = h
+    for row in stride(from: h - 1, through: 0, by: -1) {
+        let rowBase = row * bpr
+        var found = false
+        for col in stride(from: 0, to: w * bpp, by: step) {
+            if !isBackground(rowBase + col) {
+                found = true
+                break
+            }
+        }
+        if found { bottomRow = row + 1; break }
+    }
+
+    return (topRow, bottomRow)
+}
+
+func snapshotPreview() {
+    // Capture the app's own key window -- this is the window that is
+    // already displaying PreviewContent() via the SwiftUI App lifecycle.
+    // By screenshotting the live window we get NavigationView, toolbar,
+    // ScrollView, async-loaded state, and everything else for free.
+    guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+          let window = scene.windows.first else {
+        print(\"ERROR: No active window found\")
+        exit(1)
+    }
+
+    let screenSize = window.bounds.size
+    let scale = UIScreen.main.scale
 
     let format = UIGraphicsImageRendererFormat()
-    format.scale = UIScreen.main.scale
+    format.scale = scale
     format.opaque = false
 
-    let renderer = UIGraphicsImageRenderer(size: finalSize, format: format)
-    let image = renderer.image { context in
-        finalController.view.drawHierarchy(
-            in: CGRect(origin: .zero, size: finalSize),
+    let renderer = UIGraphicsImageRenderer(size: screenSize, format: format)
+    let fullImage = renderer.image { _ in
+        window.drawHierarchy(
+            in: CGRect(origin: .zero, size: screenSize),
             afterScreenUpdates: true)
     }
 
-    guard let data = image.pngData() else {
+    guard let cgFull = fullImage.cgImage else {
+        print(\"ERROR: Failed to get CGImage\")
+        exit(1)
+    }
+
+    // Find where the actual content starts and ends (in pixel coordinates)
+    let bounds = findContentBounds(in: cgFull)
+    let paddingPx = Int(16 * scale)
+    let cropTop = max(bounds.top - paddingPx, 0)
+    let cropBottom = min(bounds.bottom + paddingPx, cgFull.height)
+
+    print(\"DEBUG: screen=\\(Int(screenSize.width))x\\(Int(screenSize.height)) contentTop=\\(bounds.top)px contentBottom=\\(bounds.bottom)px cropTop=\\(cropTop)px cropBottom=\\(cropBottom)px\")
+
+    // Crop to content bounds + padding on both sides
+    let cropRect = CGRect(x: 0, y: cropTop, width: cgFull.width, height: cropBottom - cropTop)
+    guard let croppedCG = cgFull.cropping(to: cropRect) else {
+        print(\"ERROR: Failed to crop image\")
+        exit(1)
+    }
+
+    let croppedImage = UIImage(cgImage: croppedCG, scale: scale, orientation: .up)
+    guard let data = croppedImage.pngData() else {
         print(\"ERROR: Failed to create PNG data\")
         exit(1)
     }
 
-    let outputPath = ProcessInfo.processInfo.environment[\"PREVIEW_OUTPUT_PATH\"]
-        ?? \"/tmp/swift-development-preview.png\"
+    let outputPath = \"%s\"
+    print(\"DEBUG: Writing preview to: \\(outputPath)\")
 
     let url = URL(fileURLWithPath: outputPath)
     try? FileManager.default.createDirectory(
@@ -424,8 +544,10 @@ func snapshotPreview() {
 
     do {
         try data.write(to: url)
+        let finalW = croppedCG.width
+        let finalH = croppedCG.height
         print(\"Preview saved to: \\(outputPath)\")
-        print(\"Size: \\(Int(finalSize.width))x\\(Int(finalSize.height))\")
+        print(\"Size: \\(finalW)x\\(finalH)\")
         let styleName = kInterfaceStyle == .dark ? \"dark\"
             : kInterfaceStyle == .light ? \"light\" : \"none\"
         print(\"Style: \\(styleName)\")
@@ -436,12 +558,12 @@ func snapshotPreview() {
 
     exit(0)
 }
-"
-  "Swift code for snapshot functionality with color scheme support.")
+" output-path))
 
 (defun swiftui-preview-core-generate-host-swift
     (preview-body imports
-     &optional filename color-scheme testable-module use-testable live)
+     &optional filename color-scheme testable-module use-testable live
+     output-path)
   "Generate PreviewHostApp.swift content with color scheme support.
 PREVIEW-BODY is the extracted #Preview content.
 IMPORTS is list of modules to import.
@@ -450,7 +572,9 @@ COLOR-SCHEME is \"dark\", \"light\", or nil.
 TESTABLE-MODULE is the module name for @testable import.
 USE-TESTABLE non-nil to use @testable on TESTABLE-MODULE.
 LIVE non-nil generates a live app (no snapshot, no exit) for
-interactive use in the simulator."
+interactive use in the simulator.
+OUTPUT-PATH is the absolute path where the snapshot PNG will be written.
+Embedded as a string literal in the generated Swift code."
   (let* ((fname (or filename "SwiftUI Preview"))
          (interface-style (cond
                            ((equal color-scheme "dark") ".dark")
@@ -472,9 +596,21 @@ interactive use in the simulator."
 // Generated by swift-development (live mode)
 
 %s
+import UIKit
 
 @main
 struct PreviewHostApp: App {
+    init() {
+        // Ensure UINavigationBar renders visibly in the minimal preview host.
+        // Without this, navigation bars may be fully transparent because the
+        // preview app has no global appearance configuration.
+        let appearance = UINavigationBarAppearance()
+        appearance.configureWithDefaultBackground()
+        UINavigationBar.appearance().standardAppearance = appearance
+        UINavigationBar.appearance().compactAppearance = appearance
+        UINavigationBar.appearance().scrollEdgeAppearance = appearance
+    }
+
     var body: some Scene {
         WindowGroup {
             PreviewContent()
@@ -500,11 +636,22 @@ let kHasExplicitColorScheme: Bool = (kInterfaceStyle != .unspecified)
 
 @main
 struct PreviewHostApp: App {
+    init() {
+        let appearance = UINavigationBarAppearance()
+        appearance.configureWithDefaultBackground()
+        UINavigationBar.appearance().standardAppearance = appearance
+        UINavigationBar.appearance().compactAppearance = appearance
+        UINavigationBar.appearance().scrollEdgeAppearance = appearance
+    }
+
     var body: some Scene {
         WindowGroup {
             PreviewContent()
                 .onAppear {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    // Allow enough time for @StateObject init, .task {},
+                    // .onAppear data loading, and at least one layout pass
+                    // with populated content before taking the snapshot.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                         snapshotPreview()
                     }
                 }
@@ -518,22 +665,25 @@ struct PreviewContent: View {
     }
 }
 %s" fname import-statements interface-style indented-body
-              swiftui-preview-core--snapshot-code))))
+              (swiftui-preview-core--snapshot-code
+               (or output-path "/tmp/swift-development-preview.png"))))))
 
 (defun swiftui-preview-core-write-host-app
     (preview-body imports temp-dir
-     &optional filename color-scheme testable-module use-testable live)
+     &optional filename color-scheme testable-module use-testable live
+     output-path)
   "Write PreviewHostApp.swift to TEMP-DIR.
 PREVIEW-BODY is the extracted #Preview content.
 IMPORTS is list of modules to import.
 FILENAME is optional source file name for comment.
 COLOR-SCHEME, TESTABLE-MODULE, USE-TESTABLE passed to generate.
 LIVE non-nil generates a live (interactive) app.
+OUTPUT-PATH is the absolute path for the snapshot PNG.
 Returns path to written file."
   (let ((host-content (swiftui-preview-core-generate-host-swift
                        preview-body imports filename
                        color-scheme testable-module use-testable
-                       live))
+                       live output-path))
         (host-file (expand-file-name
                     "PreviewHostApp.swift" temp-dir)))
     (make-directory temp-dir t)

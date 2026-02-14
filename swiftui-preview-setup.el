@@ -26,11 +26,6 @@
   :group 'swiftui-preview
   :prefix "swiftui-preview-setup-")
 
-(defcustom swiftui-preview-setup-auto-install t
-  "If non-nil, offer to automatically install missing dependencies."
-  :type 'boolean
-  :group 'swiftui-preview-setup)
-
 (defvar swiftui-preview-setup--wizard-buffer "*SwiftUI Preview Setup*"
   "Buffer name for setup wizard.")
 

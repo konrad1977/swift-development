@@ -47,6 +47,7 @@
 (declare-function xcode-project-build-folder "xcode-project")
 (declare-function ios-simulator-simulator-name "ios-simulator")
 (declare-function ios-simulator-simulator-id "ios-simulator")
+(declare-function swiftui-preview-core-watch-for-file "swiftui-preview-core")
 
 (defgroup swiftui-preview nil
   "SwiftUI preview support for swift-development."
@@ -142,13 +143,14 @@ during the preview pipeline.  Toggle interactively with
   :type 'boolean
   :group 'swiftui-preview)
 
-(defcustom swiftui-preview-scale nil
-  "Image scale factor for preview rendering (e.g., 1.0, 2.0, 3.0).
-If nil, uses device's native scale. Lower values = smaller file size.
-Examples: 1.0 = @1x, 2.0 = @2x (Retina), 3.0 = @3x (iPhone Pro)"
-  :type '(choice (const :tag "Device native scale" nil)
-                 (number :tag "Custom scale (1.0-3.0)"))
+(defcustom swiftui-preview-pin-mode nil
+  "If non-nil, pin the preview window to the current preview.
+When enabled, switching buffers will not hide or update the
+preview window.  Toggle interactively with
+`swiftui-preview-toggle-pin-mode'."
+  :type 'boolean
   :group 'swiftui-preview)
+
 
 (defcustom swiftui-preview-fit-to-window t
   "If non-nil, scale preview image to fit the window.
@@ -205,6 +207,16 @@ Used to debounce buffer-change reactions after auto-show.")
 (defvar swiftui-preview--last-build-failed nil
   "Non-nil if last preview build failed.
 Used to retry preview generation after fixing errors.")
+
+(defvar swiftui-preview--generate-all-active nil
+  "Non-nil while `swiftui-preview-generate-all' is running.
+Suppresses individual `swiftui-preview--display-image' calls so
+that the final stacked display is not overwritten.")
+
+(defvar-local swiftui-preview--image-paths nil
+  "List of (NAME . PATH) pairs for multi-image preview display.
+Set by `swiftui-preview--display-images', used by
+`swiftui-preview--revert-multi-buffer' and `swiftui-preview--on-buffer-change'.")
 
 ;;; Directory Management
 
@@ -268,8 +280,14 @@ If nil, uses file-based naming if enabled, otherwise uses number."
 (require 'swiftui-preview-standalone nil t)
 
 ;;;###autoload
-(defun swiftui-preview-generate ()
+(defun swiftui-preview-generate (&optional preview-body preview-name)
   "Generate SwiftUI preview using the best available method.
+When PREVIEW-BODY is provided, generate that specific preview body
+instead of auto-detecting from the buffer.
+
+PREVIEW-NAME, when non-nil, is used to create a unique output filename
+\(e.g., \"Light\" produces \"HomeView-Light.png\").
+
 Automatically detects project type and uses:
 - Dynamic target injection for Xcode projects
 - SPM project creation for Swift packages
@@ -288,7 +306,7 @@ any setup or additional packages in your project."
   ;; Dispatch to appropriate generator
   (cond
    ((fboundp 'swiftui-preview-dynamic-generate)
-    (swiftui-preview-dynamic-generate))
+    (swiftui-preview-dynamic-generate preview-body preview-name))
    ((fboundp 'swiftui-preview-standalone-generate)
     (swiftui-preview-standalone-generate))
    (t
@@ -297,20 +315,212 @@ any setup or additional packages in your project."
 ;;;###autoload
 (defun swiftui-preview-generate-all ()
   "Generate previews for all #Preview blocks in current file.
-Creates multiple preview images, one for each #Preview block."
+Generates each preview sequentially, then displays all stacked
+vertically in the preview buffer."
   (interactive)
   (let ((previews (swiftui-preview--detect-preview-definitions)))
+    (when swiftui-preview-debug
+      (message "[SwiftUI Preview] generate-all: detected %d definitions"
+               (length previews))
+      (dolist (p previews)
+        (message "[SwiftUI Preview]   type=%s name=%s body-len=%d"
+                 (plist-get p :type)
+                 (plist-get p :name)
+                 (length (or (plist-get p :body) "")))))
     (if (null previews)
         (user-error "No #Preview blocks found")
-      (let ((preview-macros (cl-remove-if-not
+      (let ((macro-previews (cl-remove-if-not
                              (lambda (p) (eq (plist-get p :type) 'preview-macro))
                              previews)))
-        (if (<= (length preview-macros) 1)
+        (if (<= (length macro-previews) 1)
             (swiftui-preview-generate)
-          (message "Found %d previews. Generating all..." (length preview-macros))
-          ;; TODO: Implement multi-preview generation
-          ;; For now, just generate the first one
-          (swiftui-preview-generate))))))
+          (message "Found %d previews. Generating all..." (length macro-previews))
+          ;; Suppress individual display-image calls during chain
+          (setq swiftui-preview--generate-all-active t)
+          (when swiftui-preview-debug
+            (message "[SwiftUI Preview] generate-all: flag SET, starting chain"))
+          ;; Generate sequentially: each preview builds asynchronously,
+          ;; so we chain them using timers to avoid overlapping builds.
+          ;; After the last one, display all images stacked.
+          (swiftui-preview--generate-chain macro-previews 0))))))
+
+(defun swiftui-preview--generate-chain (previews index &optional source-buffer image-alist)
+  "Generate preview at INDEX in PREVIEWS list, then chain to next.
+Each preview generation is async.  After kicking off a build, we poll
+for the output file to appear before starting the next preview.  This
+avoids the problem where Preview N+1's capture pipeline terminates
+Preview N's running app (they share the same bundle ID).
+
+Each preview is saved with a unique filename based on its name
+\(e.g., \"HomeView-Preview-1.png\").
+SOURCE-BUFFER is the Swift buffer to generate from; defaults to
+`current-buffer' on the first call and is captured for timer callbacks.
+IMAGE-ALIST accumulates (NAME . PATH) pairs for final stacked display."
+  (let ((buf (or source-buffer (current-buffer)))
+        (images (or image-alist '())))
+    (when (< index (length previews))
+      (let* ((preview (nth index previews))
+             (body (plist-get preview :body))
+             (name (or (plist-get preview :name)
+                       (format "Preview %d" (1+ index))))
+             (sanitized (replace-regexp-in-string "[[:space:]]+" "-" name))
+             (total (length previews))
+             ;; Compute expected output path using the same function
+             ;; that the build pipeline uses
+             (expected-path
+              (with-current-buffer buf
+                (when-let* ((project-root (swift-project-root))
+                            (filename (file-name-nondirectory
+                                       (buffer-file-name))))
+                  (if (fboundp 'swiftui-preview-dynamic--get-output-path)
+                      (swiftui-preview-dynamic--get-output-path
+                       project-root filename name)
+                    ;; Fallback: mirror the dynamic path manually
+                    (let ((preview-dir (expand-file-name
+                                        ".swift-development/previews"
+                                        project-root))
+                          (base (file-name-sans-extension filename)))
+                      (make-directory preview-dir t)
+                      (expand-file-name
+                       (format "%s-%s.png" base sanitized)
+                       preview-dir)))))))
+        (when swiftui-preview-debug
+          (message "[SwiftUI Preview] chain[%d/%d]: name=%s sanitized=%s"
+                   (1+ index) total name sanitized)
+          (message "[SwiftUI Preview] chain[%d/%d]: expected-path=%s"
+                   (1+ index) total expected-path)
+          (message "[SwiftUI Preview] chain[%d/%d]: body-len=%d"
+                   (1+ index) total (length (or body ""))))
+        ;; Delete old output file so we can detect when the new one appears
+        (when (and expected-path (file-exists-p expected-path))
+          (delete-file expected-path)
+          (when swiftui-preview-debug
+            (message "[SwiftUI Preview] chain[%d/%d]: deleted old file"
+                     (1+ index) total)))
+        (message "Generating preview %d/%d: %s" (1+ index) total name)
+        (with-current-buffer buf
+          (swiftui-preview-generate body name))
+        ;; Record expected output for final display
+        (when expected-path
+          (push (cons name expected-path) images))
+        (if (< (1+ index) total)
+            ;; More previews: wait for this one's output file before starting next
+            (progn
+              (when swiftui-preview-debug
+                (message "[SwiftUI Preview] chain: waiting for %s before next"
+                         (file-name-nondirectory (or expected-path "?"))))
+              (swiftui-preview--wait-then-chain
+               expected-path previews (1+ index) buf images))
+          ;; Last preview kicked off -- watch for all images to appear
+          (let ((final-images (nreverse images)))
+            (when swiftui-preview-debug
+              (message "[SwiftUI Preview] chain: last preview kicked off, watching for %d files"
+                       (length final-images)))
+            (swiftui-preview--watch-for-all-images
+             final-images total buf)))))))
+
+(defun swiftui-preview--wait-then-chain
+    (expected-path previews next-index source-buffer image-alist)
+  "Wait for EXPECTED-PATH to appear, then chain to NEXT-INDEX in PREVIEWS.
+Uses OS file notifications via `swiftui-preview-core-watch-for-file'
+for near-instant detection.  Falls back after `swiftui-preview-timeout'.
+SOURCE-BUFFER and IMAGE-ALIST are passed through to `--generate-chain'."
+  (let ((timeout (or swiftui-preview-timeout 30))
+        (start-time (float-time)))
+    (swiftui-preview-core-watch-for-file
+     expected-path timeout
+     (lambda (found-path)
+       (let ((elapsed (- (float-time) start-time)))
+         (cond
+          ;; File appeared -- chain to next preview
+          (found-path
+           (when swiftui-preview-debug
+             (message "[SwiftUI Preview] chain: file ready after %.1fs, starting next"
+                      elapsed))
+           ;; Small delay to let capture cleanup finish
+           (run-with-timer
+            1 nil
+            (lambda ()
+              (when (buffer-live-p source-buffer)
+                (swiftui-preview--generate-chain
+                 previews next-index source-buffer image-alist)))))
+          ;; Timeout -- chain anyway so we don't get stuck
+          (t
+           (when swiftui-preview-debug
+             (message "[SwiftUI Preview] chain: TIMEOUT waiting for %s, proceeding"
+                      (file-name-nondirectory (or expected-path "?"))))
+           (when (buffer-live-p source-buffer)
+             (swiftui-preview--generate-chain
+              previews next-index source-buffer image-alist)))))))))
+
+
+(defun swiftui-preview--clear-generate-all-state ()
+  "Clear generate-all flag and recompile cache after a delay."
+  (run-with-timer 3 nil
+                  (lambda ()
+                    (setq swiftui-preview--generate-all-active nil)
+                    (when (boundp 'swiftui-preview-dynamic--recompile-cache)
+                      (when-let* ((cache swiftui-preview-dynamic--recompile-cache)
+                                  (dir (plist-get cache :cache-dir)))
+                        (when (file-directory-p dir)
+                          (delete-directory dir t)))
+                      (setq swiftui-preview-dynamic--recompile-cache nil))
+                    (when swiftui-preview-debug
+                      (message "[SwiftUI Preview] generate-all flag CLEARED")))))
+
+(defun swiftui-preview--watch-for-all-images (image-alist total source-buffer)
+  "Watch for all images in IMAGE-ALIST via OS file notifications.
+TOTAL is the preview count for the completion message.
+SOURCE-BUFFER is the Swift buffer to record as last-buffer.
+Sets up one `swiftui-preview-core-watch-for-file' watcher per image.
+When all have arrived (or timeout), displays the stacked result."
+  (let* ((timeout (or swiftui-preview-timeout 30))
+         (remaining (length image-alist))
+         (arrived '())
+         (done nil))
+    (when swiftui-preview-debug
+      (message "[SwiftUI Preview] watch-all: starting, %d files, timeout=%ds"
+               remaining timeout))
+    (dolist (item image-alist)
+      (let ((name (car item))
+            (path (cdr item)))
+        (swiftui-preview-core-watch-for-file
+         path timeout
+         (lambda (found-path)
+           (unless done
+             (if found-path
+                 (progn
+                   (push (cons name path) arrived)
+                   (when swiftui-preview-debug
+                     (message "[SwiftUI Preview] watch-all: %s arrived (%d/%d)"
+                              name (length arrived) total))
+                   ;; Check if all images have arrived
+                   (when (= (length arrived) total)
+                     (setq done t)
+                     (when swiftui-preview-debug
+                       (message "[SwiftUI Preview] watch-all: ALL files found"))
+                     (swiftui-preview--display-images image-alist source-buffer)
+                     (message "All %d previews generated" total)
+                     (swiftui-preview--clear-generate-all-state)))
+               ;; This particular file timed out
+               (progn
+                 (setq remaining (1- remaining))
+                 (when swiftui-preview-debug
+                   (message "[SwiftUI Preview] watch-all: %s TIMEOUT (%d remaining)"
+                            name remaining))
+                 ;; If all watchers resolved (arrived + timed out), show what we have
+                 (when (= (+ (length arrived) (- total remaining)) total)
+                   (setq done t)
+                   (if arrived
+                       (let ((existing (cl-remove-if-not
+                                        (lambda (it) (file-exists-p (cdr it)))
+                                        image-alist)))
+                         (swiftui-preview--display-images existing source-buffer)
+                         (message "%d/%d previews generated (some timed out)"
+                                  (length existing) total))
+                     (message "Preview generation timed out"))
+                    (swiftui-preview--clear-generate-all-state)))))))))))
+
 
 ;;;###autoload
 (defun swiftui-preview-select ()
@@ -321,43 +531,6 @@ Creates multiple preview images, one for each #Preview block."
     (swiftui-preview-generate)))
 
 ;;; Polling and Display
-
-(defun swiftui-preview--start-polling ()
-  "Start polling for preview image."
-  (setq swiftui-preview--poll-timer
-        (run-with-timer swiftui-preview-poll-interval
-                       swiftui-preview-poll-interval
-                       #'swiftui-preview--poll-for-image)))
-
-(defun swiftui-preview--poll-for-image ()
-  "Poll for preview image. Called by timer."
-  (let ((elapsed (float-time (time-subtract (current-time)
-                                            swiftui-preview--poll-start-time))))
-    (cond
-     ;; Timeout
-     ((> elapsed swiftui-preview-timeout)
-      (cancel-timer swiftui-preview--poll-timer)
-      (setq swiftui-preview--poll-timer nil)
-      (swiftui-preview--cleanup)
-      (message "Preview generation timed out after %d seconds."
-               swiftui-preview-timeout))
-
-     ;; Image found
-     ((file-exists-p swiftui-preview--current-preview-path)
-      (cancel-timer swiftui-preview--poll-timer)
-      (setq swiftui-preview--poll-timer nil)
-      (when swiftui-preview-debug
-        (message "[SwiftUI Preview] Preview image found after %.1f seconds" elapsed))
-
-      ;; Display the preview image
-      (swiftui-preview--display-image swiftui-preview--current-preview-path)
-      (swiftui-preview--cleanup)
-      (message "Preview generated: %s" swiftui-preview--current-preview-path))
-
-     ;; Keep waiting
-     (t
-      (when swiftui-preview-debug
-        (message "[SwiftUI Preview] Polling... %.1fs elapsed" elapsed))))))
 
 (defun swiftui-preview--create-scaled-image (image-path &optional window)
   "Create an image from IMAGE-PATH scaled to fit WINDOW.
@@ -388,57 +561,194 @@ and `swiftui-preview-max-height' to determine scaling."
 
 (defun swiftui-preview--display-image (image-path)
   "Display preview IMAGE-PATH in Emacs.
-Updates the current preview path to track which preview is being shown."
-  (let ((buffer (get-buffer-create swiftui-preview-buffer-name))
-        (mtime (file-attribute-modification-time
-               (file-attributes image-path))))
-    ;; Update current preview path to match what we're displaying
-    (setq swiftui-preview--current-preview-path image-path)
-    ;; Remember which buffer this preview is for
-    (setq swiftui-preview--last-buffer (current-buffer))
-    ;; Record display time for debouncing
-    (setq swiftui-preview--last-display-time (current-time))
+Updates the current preview path to track which preview is being shown.
+Skipped when `swiftui-preview--generate-all-active' is non-nil or
+when the preview buffer is showing multi-image content."
+  ;; During generate-all, suppress individual display calls
+  (when swiftui-preview--generate-all-active
+    (when swiftui-preview-debug
+      (message "[SwiftUI Preview] display-image SKIPPED (generate-all active): %s"
+               (file-name-nondirectory image-path))))
+  ;; Also skip if preview buffer is currently showing multi-image
+  (when (and (not swiftui-preview--generate-all-active)
+             (let ((pbuf (get-buffer swiftui-preview-buffer-name)))
+               (and pbuf (buffer-local-value 'swiftui-preview--image-paths pbuf))))
+    (when swiftui-preview-debug
+      (message "[SwiftUI Preview] display-image SKIPPED (multi-image shown): %s"
+               (file-name-nondirectory image-path))))
+  (unless (or swiftui-preview--generate-all-active
+              (let ((pbuf (get-buffer swiftui-preview-buffer-name)))
+                (and pbuf (buffer-local-value 'swiftui-preview--image-paths pbuf))))
+    (let ((buffer (get-buffer-create swiftui-preview-buffer-name))
+          (mtime (file-attribute-modification-time
+                  (file-attributes image-path))))
+      ;; Update current preview path to match what we're displaying
+      (setq swiftui-preview--current-preview-path image-path)
+      ;; Remember which buffer this preview is for
+      (setq swiftui-preview--last-buffer (current-buffer))
+      ;; Record display time for debouncing
+      (setq swiftui-preview--last-display-time (current-time))
 
-    ;; Display buffer first to get correct window dimensions
-    (display-buffer buffer
-                   `(display-buffer-in-side-window
-                     (side . right)
-                     (slot . 0)
-                     (window-width . ,swiftui-preview-window-width)
-                     (preserve-size . (t . nil))))
+      ;; Display buffer first to get correct window dimensions
+      (display-buffer buffer
+                      `(display-buffer-in-side-window
+                        (side . right)
+                        (slot . 0)
+                        (window-width . ,swiftui-preview-window-width)
+                        (preserve-size . (t . nil))))
 
-    ;; Now populate buffer with correctly scaled image
-    (let ((preview-window (get-buffer-window buffer)))
-      (with-current-buffer buffer
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          ;; Clear image cache to force reload
-          (clear-image-cache t)
-          (insert-image (swiftui-preview--create-scaled-image image-path preview-window))
-          ;; Use special-mode as base instead of image-mode to avoid resize conflicts
-          (special-mode)
-          (setq-local swiftui-preview--image-path image-path)
-          (setq-local swiftui-preview--last-mtime mtime)
-          (setq-local revert-buffer-function #'swiftui-preview--revert-buffer)
-          ;; Set up keybindings
-          (local-set-key (kbd "g") 'swiftui-preview-generate)
-          (local-set-key (kbd "r") 'swiftui-preview--refresh-current)
-          (local-set-key (kbd "q") 'quit-window)))))
+      ;; Now populate buffer with correctly scaled image
+      (let ((preview-window (get-buffer-window buffer)))
+        (with-current-buffer buffer
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            ;; Clear image cache to force reload
+            (clear-image-cache t)
+            (insert-image (swiftui-preview--create-scaled-image
+                           image-path preview-window))
+            ;; Use special-mode as base instead of image-mode
+            (special-mode)
+            (setq-local swiftui-preview--image-path image-path)
+            (setq-local swiftui-preview--last-mtime mtime)
+            (setq-local revert-buffer-function
+                        #'swiftui-preview--revert-buffer)
+            ;; Set up keybindings
+            (local-set-key (kbd "g") 'swiftui-preview-generate)
+            (local-set-key (kbd "r") 'swiftui-preview--refresh-current)
+            (local-set-key (kbd "q") 'quit-window)))))
 
-  ;; Set up window resize hook for this buffer
-  (add-hook 'window-size-change-functions #'swiftui-preview--on-window-resize))
+    ;; Set up window resize hook for this buffer
+    (add-hook 'window-size-change-functions
+              #'swiftui-preview--on-window-resize)))
+
+(defface swiftui-preview-label-face
+  '((t :inherit font-lock-comment-face :height 0.9))
+  "Face for preview name labels in multi-preview display."
+  :group 'swiftui-preview)
+
+(defun swiftui-preview--create-scaled-image-for-count
+    (image-path window count)
+  "Create an image from IMAGE-PATH scaled to fit WINDOW shared with COUNT images.
+Like `swiftui-preview--create-scaled-image' but divides the available
+height by COUNT so all previews fit without scrolling."
+  (let* ((win (or window (selected-window)))
+         (win-width (when (window-live-p win)
+                      (- (window-body-width win t) 20)))
+         (win-height (when (window-live-p win)
+                       (- (window-body-height win t) 20)))
+         (max-w (cond
+                 (swiftui-preview-max-width swiftui-preview-max-width)
+                 (swiftui-preview-fit-to-window (or win-width 400))
+                 (t 1000)))
+         ;; Divide height by count, minus space for labels (~30px each)
+         (per-image-height (when win-height
+                             (max 100 (/ (- win-height (* count 30))
+                                         count))))
+         (max-h (cond
+                 (swiftui-preview-max-height swiftui-preview-max-height)
+                 (swiftui-preview-fit-to-window (or per-image-height 400))
+                 (t nil)))
+         (image-data (with-temp-buffer
+                       (set-buffer-multibyte nil)
+                       (insert-file-contents-literally image-path)
+                       (buffer-string))))
+    (if max-h
+        (create-image image-data nil t :max-width max-w :max-height max-h)
+      (create-image image-data nil t :max-width max-w))))
+
+(defun swiftui-preview--display-images (image-alist &optional source-buffer)
+  "Display multiple preview images stacked vertically.
+IMAGE-ALIST is a list of (NAME . PATH) cons cells where NAME is
+the display label and PATH is the image file path.  Only existing
+files are shown.  Images are scaled to share the window height.
+SOURCE-BUFFER, when non-nil, is recorded as `swiftui-preview--last-buffer'
+so that `on-buffer-change' does not immediately hide the preview."
+  (let* ((existing (cl-remove-if-not (lambda (item) (file-exists-p (cdr item)))
+                                     image-alist))
+         (count (length existing))
+         (buffer (get-buffer-create swiftui-preview-buffer-name)))
+    (when swiftui-preview-debug
+      (message "[SwiftUI Preview] display-images: %d images to show" count)
+      (dolist (item existing)
+        (message "[SwiftUI Preview]   %s -> %s" (car item) (cdr item))))
+    (when existing
+      ;; Record display time for debouncing
+      (setq swiftui-preview--last-display-time (current-time))
+      (setq swiftui-preview--last-buffer (or source-buffer (current-buffer)))
+
+      ;; Display buffer first to get correct window dimensions
+      (display-buffer buffer
+                      `(display-buffer-in-side-window
+                        (side . right)
+                        (slot . 0)
+                        (window-width . ,swiftui-preview-window-width)
+                        (preserve-size . (t . nil))))
+
+      (let ((preview-window (get-buffer-window buffer)))
+        (with-current-buffer buffer
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            (clear-image-cache t)
+            (dolist (item existing)
+              (let ((name (car item))
+                    (path (cdr item)))
+                ;; Insert label
+                (insert (propertize (format " %s" name)
+                                   'face 'swiftui-preview-label-face))
+                (insert "\n")
+                ;; Insert image scaled to share window height
+                (insert-image
+                 (swiftui-preview--create-scaled-image-for-count
+                  path preview-window count))
+                (insert "\n\n")))
+            (special-mode)
+            (setq-local swiftui-preview--image-paths existing)
+            (setq-local revert-buffer-function
+                        #'swiftui-preview--revert-multi-buffer)
+            (local-set-key (kbd "g") 'swiftui-preview-generate)
+            (local-set-key (kbd "r") 'swiftui-preview--refresh-current)
+            (local-set-key (kbd "q") 'quit-window)
+            (goto-char (point-min)))))
+
+      (add-hook 'window-size-change-functions
+                #'swiftui-preview--on-window-resize))))
+
+(defun swiftui-preview--revert-multi-buffer (&rest _)
+  "Revert the preview buffer when showing multiple images."
+  (when-let* ((paths (buffer-local-value 'swiftui-preview--image-paths
+                                         (current-buffer))))
+    (let ((inhibit-read-only t)
+          (win (get-buffer-window (current-buffer)))
+          (count (length paths)))
+      (erase-buffer)
+      (clear-image-cache t)
+      (dolist (item paths)
+        (let ((name (car item))
+              (path (cdr item)))
+          (when (file-exists-p path)
+            (insert (propertize (format " %s" name)
+                                'face 'swiftui-preview-label-face))
+            (insert "\n")
+            (insert-image (swiftui-preview--create-scaled-image-for-count
+                           path win count))
+            (insert "\n\n"))))
+      (goto-char (point-min)))))
 
 (defun swiftui-preview--revert-buffer (&rest _)
   "Revert the preview buffer by reloading the image."
-  (when-let* ((image-path (buffer-local-value 'swiftui-preview--image-path (current-buffer))))
-    (let ((inhibit-read-only t)
-          (win (get-buffer-window (current-buffer))))
-      (erase-buffer)
-      (clear-image-cache t)
-      (insert-image (swiftui-preview--create-scaled-image image-path win))
-      (setq-local swiftui-preview--last-mtime
-                  (file-attribute-modification-time
-                   (file-attributes image-path))))))
+  ;; Check if this is a multi-image buffer
+  (if (bound-and-true-p swiftui-preview--image-paths)
+      (swiftui-preview--revert-multi-buffer)
+    (when-let* ((image-path (buffer-local-value 'swiftui-preview--image-path
+                                                (current-buffer))))
+      (let ((inhibit-read-only t)
+            (win (get-buffer-window (current-buffer))))
+        (erase-buffer)
+        (clear-image-cache t)
+        (insert-image (swiftui-preview--create-scaled-image image-path win))
+        (setq-local swiftui-preview--last-mtime
+                    (file-attribute-modification-time
+                     (file-attributes image-path)))))))
 
 (defun swiftui-preview--refresh-current ()
   "Refresh the current preview image to fit window."
@@ -492,7 +802,14 @@ Updates the current preview path to track which preview is being shown."
   (setq swiftui-preview-debug (not swiftui-preview-debug))
   (message "SwiftUI Preview debug mode: %s" (if swiftui-preview-debug "ON" "OFF")))
 
-
+;;;###autoload
+(defun swiftui-preview-toggle-pin-mode ()
+  "Toggle pin mode for the preview window.
+When enabled, the preview stays fixed when switching buffers."
+  (interactive)
+  (setq swiftui-preview-pin-mode (not swiftui-preview-pin-mode))
+  (message "SwiftUI Preview pin mode: %s"
+           (if swiftui-preview-pin-mode "ON (pinned)" "OFF")))
 
 ;;; Utility Commands
 
@@ -579,12 +896,6 @@ Updates the current preview path to track which preview is being shown."
                    (file-name-nondirectory (buffer-file-name))
                  "this buffer")))))
 
-
-(defun swiftui-preview--has-preview-setup-p ()
-  "Check if current buffer has .setupSwiftDevelopmentPreview() modifier."
-  (save-excursion
-    (goto-char (point-min))
-    (re-search-forward "setupSwiftDevelopmentPreview" nil t)))
 
 (defun swiftui-preview--parse-balanced-braces (start-pos)
   "Parse balanced braces starting from START-POS.
@@ -698,38 +1009,41 @@ Supports all #Preview variants:
       ;; Detect #Preview macros with all parameter variants
       (when swiftui-preview-detect-preview-macro
         (goto-char (point-min))
-        ;; Match #Preview followed by optional params and opening brace
-        (while (re-search-forward "#Preview[[:space:]]*" nil t)
-          (let ((preview-name nil)
-                (preview-traits nil)
-                (brace-start nil)
-                (body nil))
-            ;; Check for parameters in parentheses
-            (when (looking-at "(")
-              (let ((params-start (point))
-                    (params-end (save-excursion
-                                  (forward-sexp)
-                                  (point))))
-                (let ((params-str (buffer-substring-no-properties
-                                   (1+ params-start) (1- params-end))))
-                  ;; Extract name if present (first string literal)
-                  (when (string-match "\"\\([^\"]+\\)\"" params-str)
-                    (setq preview-name (match-string 1 params-str)))
-                  ;; Extract traits if present
-                  (when (string-match "traits:[[:space:]]*\\([^,)]+\\)" params-str)
-                    (setq preview-traits (string-trim (match-string 1 params-str)))))
-                (goto-char params-end)))
-            ;; Skip whitespace to find opening brace
-            (skip-chars-forward " \t\n")
-            (when (looking-at "{")
-              (setq brace-start (point))
-              (setq body (swiftui-preview--extract-preview-body brace-start))
-              (when body
-                (push (list :type 'preview-macro
-                           :name (or preview-name "Preview")
-                           :body (string-trim body)
-                           :traits preview-traits)
-                      previews))))))
+        (let ((preview-counter 0))
+          ;; Match #Preview followed by optional params and opening brace
+          (while (re-search-forward "#Preview[[:space:]]*" nil t)
+            (let ((preview-name nil)
+                  (preview-traits nil)
+                  (brace-start nil)
+                  (body nil))
+              ;; Check for parameters in parentheses
+              (when (looking-at "(")
+                (let ((params-start (point))
+                      (params-end (save-excursion
+                                    (forward-sexp)
+                                    (point))))
+                  (let ((params-str (buffer-substring-no-properties
+                                     (1+ params-start) (1- params-end))))
+                    ;; Extract name if present (first string literal)
+                    (when (string-match "\"\\([^\"]+\\)\"" params-str)
+                      (setq preview-name (match-string 1 params-str)))
+                    ;; Extract traits if present
+                    (when (string-match "traits:[[:space:]]*\\([^,)]+\\)" params-str)
+                      (setq preview-traits (string-trim (match-string 1 params-str)))))
+                  (goto-char params-end)))
+              ;; Skip whitespace to find opening brace
+              (skip-chars-forward " \t\n")
+              (when (looking-at "{")
+                (setq brace-start (point))
+                (setq body (swiftui-preview--extract-preview-body brace-start))
+                (when body
+                  (setq preview-counter (1+ preview-counter))
+                  (push (list :type 'preview-macro
+                             :name (or preview-name
+                                       (format "Preview %d" preview-counter))
+                             :body (string-trim body)
+                             :traits preview-traits)
+                        previews)))))))
 
       ;; Detect PreviewProvider protocol
       (when swiftui-preview-detect-preview-provider
@@ -759,20 +1073,6 @@ Returns nil if no #Preview found."
       (when (eq (plist-get preview :type) 'preview-macro)
         (setq last-body (plist-get preview :body))))
     last-body))
-
-(defun swiftui-preview--get-preview-by-name (name)
-  "Get the preview definition with NAME from current buffer.
-Returns the plist or nil if not found."
-  (let ((previews (swiftui-preview--detect-preview-definitions)))
-    (cl-find-if (lambda (p)
-                  (equal (plist-get p :name) name))
-                previews)))
-
-(defun swiftui-preview--list-preview-names ()
-  "List all preview names in current buffer.
-Returns a list of strings."
-  (let ((previews (swiftui-preview--detect-preview-definitions)))
-    (mapcar (lambda (p) (plist-get p :name)) previews)))
 
 (defun swiftui-preview--has-any-preview-p ()
   "Check if current buffer has any type of preview definition.
@@ -823,17 +1123,23 @@ Called from swift-mode-hook when swiftui-preview-auto-show-on-open is t."
 
 (defun swiftui-preview--auto-update-on-save ()
   "Automatically regenerate preview when saving Swift file.
-Only triggers if preview buffer is currently visible, OR if the last
-build failed (to allow automatic retry after fixing errors)."
+Only triggers if preview buffer is currently visible, a live preview
+is running in the simulator, OR if the last build failed (to allow
+automatic retry after fixing errors)."
   (when (and swiftui-preview-auto-update-on-save
              (buffer-file-name)
              (string-match-p "\\.swift$" (buffer-file-name))
              (or (get-buffer-window swiftui-preview-buffer-name)
+                 ;; Live mode: preview runs in simulator, no Emacs buffer needed
+                 (and (boundp 'swiftui-preview-dynamic-live-mode)
+                      swiftui-preview-dynamic-live-mode
+                      (boundp 'swiftui-preview-dynamic--live-simulator-udid)
+                      swiftui-preview-dynamic--live-simulator-udid)
                  swiftui-preview--last-build-failed))
     ;; Capture current buffer context immediately
     (let* ((saved-buffer (current-buffer))
            (saved-file (buffer-file-name))
-           (project-root (swift-project-root))
+           (project-root (swift-project-root nil t))
            (expected-preview (when project-root
                               (swiftui-preview--get-preview-path project-root)))
            (preview-buffer (get-buffer swiftui-preview-buffer-name))
@@ -849,28 +1155,60 @@ build failed (to allow automatic retry after fixing errors)."
         (message "  Displayed preview: %s" swiftui-preview--current-preview-path)
         (message "  Needs update: %s" needs-update))
 
-      ;; Always generate from the saved buffer context
-      (with-current-buffer saved-buffer
-        (when swiftui-preview-debug
-          (message "  Generating from buffer: %s (file: %s)"
-                   (buffer-name)
-                   (file-name-nondirectory (buffer-file-name))))
-        (swiftui-preview-generate)))))
+      ;; Invalidate the recompile cache so the changed source file
+      ;; is actually recompiled (the cache is keyed on source-file and
+      ;; would otherwise skip recompilation for the same file).
+      (when (boundp 'swiftui-preview-dynamic--recompile-cache)
+        (setq swiftui-preview-dynamic--recompile-cache nil))
+
+      ;; Generate from the saved buffer context.
+      ;; If preview buffer is showing multi-image (from generate-all),
+      ;; regenerate all previews to keep the stacked display.
+      (let ((showing-multi (and preview-buffer
+                                (buffer-local-value
+                                 'swiftui-preview--image-paths
+                                 preview-buffer))))
+        (with-current-buffer saved-buffer
+          (when swiftui-preview-debug
+            (message "  Generating from buffer: %s (file: %s) multi: %s"
+                     (buffer-name)
+                     (file-name-nondirectory (buffer-file-name))
+                     (if showing-multi "YES" "NO")))
+          (if showing-multi
+              (swiftui-preview-generate-all)
+            (swiftui-preview-generate)))))))
 
 (defun swiftui-preview--on-buffer-change ()
   "Automatically switch or hide preview when buffer change.
 Switches preview if new buffer has one, hides preview window if it doesn't.
-This is always enabled as it's fundamental preview behavior."
-  (let ((preview-window (get-buffer-window swiftui-preview-buffer-name))
-        (current-buf (current-buffer))
-        (time-since-display (when swiftui-preview--last-display-time
-                             (float-time (time-subtract (current-time)
-                                                       swiftui-preview--last-display-time)))))
+This is always enabled as it's fundamental preview behavior.
+Does nothing while `swiftui-preview--generate-all-active' is non-nil.
+Does not hide multi-image (generate-all) previews.
+Skipped entirely when `swiftui-preview-pin-mode' is non-nil."
+  (unless (or swiftui-preview--generate-all-active
+              swiftui-preview-pin-mode)
+  (let* ((preview-window (get-buffer-window swiftui-preview-buffer-name))
+         (preview-buf (get-buffer swiftui-preview-buffer-name))
+         (showing-multi (and preview-buf
+                             (buffer-local-value 'swiftui-preview--image-paths
+                                                 preview-buf)))
+         (current-buf (current-buffer))
+         (time-since-display (when swiftui-preview--last-display-time
+                              (float-time (time-subtract (current-time)
+                                                        swiftui-preview--last-display-time)))))
+    (when (and swiftui-preview-debug preview-window)
+      (message "[SwiftUI Preview] on-buffer-change: buf=%s showing-multi=%s flag=%s since=%.1fs"
+               (buffer-name current-buf)
+               (if showing-multi "YES" "NO")
+               (if swiftui-preview--generate-all-active "YES" "NO")
+               (or time-since-display -1.0)))
     (when (and preview-window
+               ;; Don't touch multi-image previews
+               (not showing-multi)
                ;; Only act if we're in a different buffer than last time
                (not (eq current-buf swiftui-preview--last-buffer))
                ;; Don't act if we're IN the preview buffer itself
-               (not (eq current-buf (get-buffer swiftui-preview-buffer-name)))
+               (not (eq current-buf preview-buf))
                ;; Don't act if we're in a minibuffer or special buffer
                (not (minibufferp current-buf))
                (not (string-prefix-p " " (buffer-name current-buf)))
@@ -879,7 +1217,7 @@ This is always enabled as it's fundamental preview behavior."
       (if (and (buffer-file-name)
                (string-match-p "\\.swift$" (buffer-file-name)))
           ;; We're in a Swift file, check if it has a preview
-          (let* ((project-root (swift-project-root))
+          (let* ((project-root (swift-project-root nil t))
                  (preview-path (when project-root
                                 (swiftui-preview--get-preview-path project-root))))
             (if (and preview-path (file-exists-p preview-path))
@@ -897,7 +1235,7 @@ This is always enabled as it's fundamental preview behavior."
         ;; Not a Swift file, hide preview window
         (when swiftui-preview-debug
           (message "[SwiftUI Preview] Not a Swift file, hiding preview window"))
-        (ignore-errors (delete-window preview-window))))))
+        (ignore-errors (delete-window preview-window)))))))
 
 ;;;###autoload
 (defun swiftui-preview-test-auto-show ()
@@ -1092,6 +1430,11 @@ Useful for debugging or checking the current UI state."
           (if (bound-and-true-p swiftui-preview-dynamic-live-mode)
               "ON" "OFF")))
 
+(defun swiftui-preview--pin-mode-description ()
+  "Return description for pin mode toggle showing current state."
+  (format "Toggle pin mode (%s)"
+          (if swiftui-preview-pin-mode "ON" "OFF")))
+
 ;;;###autoload
 (transient-define-prefix swiftui-preview-transient ()
   "SwiftUI Preview actions."
@@ -1117,7 +1460,9 @@ Useful for debugging or checking the current UI state."
   ["Settings"
    [("S" "Setup wizard" swiftui-preview-setup)
     ("g" "Toggle debug" swiftui-preview-toggle-debug)
-    ("n" "Toggle notifications" swiftui-preview-toggle-notifications)]]
+    ("n" "Toggle notifications" swiftui-preview-toggle-notifications)
+    ("P" swiftui-preview-toggle-pin-mode
+     :description swiftui-preview--pin-mode-description)]]
   [("q" "Quit" transient-quit-one)])
 
 (provide 'swiftui-preview)

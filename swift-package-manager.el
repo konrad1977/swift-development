@@ -24,7 +24,6 @@
 
 ;; Forward declarations
 (defvar swift-development-force-package-resolution)
-(defvar swift-development-use-periphery)
 (defvar swift-development-analysis-mode)
 (declare-function xcode-project-project-root "xcode-project")
 (declare-function xcode-project-get-workspace-or-project "xcode-project")
@@ -227,7 +226,8 @@ Press '?' to open the actions menu.
 (transient-define-prefix spm-dispatch ()
   "Swift Package Manager actions."
   ["Package Actions"
-   [("u" "Update package..." spm-update-package)
+   [("n" "Create package..." spm-create-package)
+    ("u" "Update package..." spm-update-package)
     ("U" "Update all packages" spm-update-all)
     ("a" "Add package..." spm-add-package)
     ("d" "Remove package..." spm-remove-package)]
@@ -241,6 +241,62 @@ Press '?' to open the actions menu.
    [("q" "Quit" quit-window)]])
 
 ;;; Interactive commands
+
+(defconst spm--package-types
+  '(("library" . "A package with a library target")
+    ("executable" . "A package with an executable target")
+    ("tool" . "A package with an executable using swift-argument-parser")
+    ("build-tool-plugin" . "A package with a build tool plugin")
+    ("command-plugin" . "A package with a command plugin")
+    ("macro" . "A package with a macro target")
+    ("empty" . "An empty package"))
+  "Available Swift package types for `swift package init'.")
+
+;;;###autoload
+(defun spm-create-package (directory name type)
+  "Create a new Swift package named NAME of TYPE in DIRECTORY.
+DIRECTORY is where the package folder will be created.
+NAME is the package name (also used as the folder name).
+TYPE is the package type (library, executable, etc.)."
+  (interactive
+   (let* ((dir (read-directory-name "Parent directory: " default-directory))
+          (name (read-string "Package name: "))
+          (type (completing-read
+                 "Package type: "
+                 (mapcar #'car spm--package-types) nil t nil nil "library")))
+     (list dir name type)))
+  (when (string-empty-p (string-trim name))
+    (user-error "Package name cannot be empty"))
+  (let* ((package-dir (expand-file-name name directory)))
+    (when (file-exists-p package-dir)
+      (user-error "Directory %s already exists" package-dir))
+    (spm--notify (format "Creating %s package '%s'..." type name))
+    (make-directory package-dir t)
+    (let* ((default-directory package-dir)
+           (cmd (format "swift package init --type %s --name %s"
+                        (shell-quote-argument type)
+                        (shell-quote-argument name)))
+           (output-buffer (generate-new-buffer " *spm-create*")))
+      (make-process
+       :name "spm-create-package"
+       :buffer output-buffer
+       :command (list shell-file-name shell-command-switch cmd)
+       :noquery t
+       :sentinel
+       (lambda (proc _event)
+         (when (memq (process-status proc) '(exit signal))
+           (let ((exit-code (process-exit-status proc))
+                 (output (with-current-buffer output-buffer
+                           (buffer-string))))
+             (kill-buffer output-buffer)
+             (if (= exit-code 0)
+                 (progn
+                   (spm--notify (format "Package '%s' created successfully" name) 3)
+                   (find-file (expand-file-name "Package.swift" package-dir)))
+               (delete-directory package-dir t)
+               (spm--notify
+                (format "Failed to create package: %s" (string-trim output))
+                5)))))))))
 
 ;;;###autoload
 (defun spm-list-dependencies ()
@@ -576,7 +632,8 @@ This builds all package dependencies once so they're cached for future builds."
 (transient-define-prefix spm-transient ()
   "Swift Package Manager."
   ["Swift Package Manager"
-   [("l" "List dependencies" spm-list-dependencies)
+   [("n" "Create package..." spm-create-package)
+    ("l" "List dependencies" spm-list-dependencies)
     ("a" "Add package..." spm-add-package)
     ("u" "Update package..." spm-update-package)
     ("U" "Update all" spm-update-all)]

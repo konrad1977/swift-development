@@ -38,9 +38,7 @@
 (declare-function spinner-start "spinner" (type))
 (declare-function spinner-stop "spinner" (&optional spinner))
 
-;; Periphery (error parsing and display)
-(declare-function periphery-run-parser "periphery" (output))
-(declare-function periphery-run-test-parser "periphery" (output callback))
+;; Periphery (error parsing and display) - accessed via swift-error-proxy
 (declare-function periphery-kill-buffer "periphery" ())
 (declare-function periphery-clear "periphery" ())
 (declare-function periphery-helper:filter-keep-beginning-paths "periphery-helper" (text))
@@ -2662,7 +2660,8 @@ even when some files have errors, showing all errors at once."
     ("W o" "Toggle Build Output" swift-development-toggle-build-output-buffer)
     ("W s" "Toggle Simulator Log" ios-simulator-toggle-buffer)]]
   ["Packages"
-   [("P" "Resolve packages" spm-resolve)
+   [("N" "Create package..." spm-create-package)
+    ("P" "Resolve packages" spm-resolve)
     ("L" "List dependencies" spm-list-dependencies)
     ("U" "Update all packages" spm-update-all)]]
   ["Sub-Menus"

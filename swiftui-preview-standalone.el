@@ -62,14 +62,6 @@
     "Observation" "SwiftData")
   "List of system frameworks that can be used in standalone previews.")
 
-(defun swiftui-preview-standalone--has-only-system-imports-p ()
-  "Check if current buffer only uses system framework imports."
-  (let ((imports (swiftui-preview-core-extract-imports)))
-    (cl-every (lambda (imp)
-                (member imp
-                        swiftui-preview-standalone--system-frameworks))
-              imports)))
-
 (defun swiftui-preview-standalone--non-system-imports ()
   "Get list of non-system imports in current buffer."
   (let ((imports (swiftui-preview-core-extract-imports)))
@@ -81,17 +73,22 @@
 ;;; Build
 
 (defun swiftui-preview-standalone--prepare-sources
-    (swift-file preview-body imports temp-dir)
+    (swift-file preview-body imports temp-dir &optional output-path)
   "Prepare SWIFT-FILE for building with PREVIEW-BODY and IMPORTS.
 Writes the host app via core and copies the source file
 with #Preview blocks and @main removed.
-TEMP-DIR is the build directory.  Returns the host file path."
+TEMP-DIR is the build directory.
+OUTPUT-PATH is the absolute path for the snapshot PNG (embedded in Swift).
+Returns the host file path."
   (let* ((filename (file-name-nondirectory swift-file))
          (color-scheme
           (swiftui-preview-core-detect-color-scheme preview-body)))
     ;; Generate host app with snapshot support via core
+    ;; output-path is embedded in the Swift code so the app knows where
+    ;; to write the PNG without relying on environment variables
     (swiftui-preview-core-write-host-app
-     preview-body imports temp-dir filename color-scheme)
+     preview-body imports temp-dir filename color-scheme
+     nil nil nil output-path)
 
     ;; Copy original source, removing #Preview and @main
     (let ((orig-copy (expand-file-name filename temp-dir))
@@ -195,7 +192,7 @@ Works with Swift files that only use system framework imports."
       ;; Prepare sources (host app + cleaned source)
       (message "Generating preview host for %s..." filename)
       (swiftui-preview-standalone--prepare-sources
-       swift-file preview-body imports temp-dir)
+       swift-file preview-body imports temp-dir output-path)
 
       ;; Build
       (let ((app-path

@@ -45,7 +45,6 @@
 (declare-function xcode-build-config-build-app-command "xcode-build-config")
 (declare-function swift-notification-send "swift-notification")
 (declare-function periphery-run-test-parser "periphery")
-(declare-function periphery-run-parser "periphery")
 (declare-function swift-error-proxy-parse-output "swift-error-proxy")
 (declare-function swift-error-proxy-has-errors-p "swift-error-proxy")
 
