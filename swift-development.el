@@ -1,8 +1,8 @@
 ;;; swift-development.el --- Package for compiling and running Swift apps in Emacs -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 Mikael Konradsson
+;; Copyright (C) 2026 Mikael Konradsson
 ;; Author: Mikael Konradsson
-;; Version: 0.6.0
+;; Version: 0.6.1
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: swift, ios, xcode, development
 ;; URL: https://github.com/konrad1977/swift-development

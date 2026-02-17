@@ -1,8 +1,8 @@
 ;;; swift-incremental-build.el --- Incremental build pipeline for Swift -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 Mikael Konradsson
+;; Copyright (C) 2026 Mikael Konradsson
 ;; Author: Mikael Konradsson
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: swift, ios, xcode, development
 ;; URL: https://github.com/konrad1977/swift-development
