@@ -782,9 +782,12 @@ Returns non-nil if resolved within the last 30 minutes."
 Calls CALLBACK with t on success, nil on failure.
 Does not block Emacs - resolution happens in background process."
   (interactive)
-  (let* ((project-root (xcode-project-project-root))
-         (workspace-or-project (xcode-project-get-workspace-or-project))
-         (scheme (xcode-project-scheme-display-name)))
+  (let* ((project-root (xcode-project-project-root)))
+    (unless project-root
+      (when callback (funcall callback nil))
+      (cl-return-from xcode-build-config-resolve-packages-async nil))
+    (let* ((workspace-or-project (xcode-project-get-workspace-or-project))
+           (scheme (xcode-project-scheme-display-name)))
     
     ;; Check if already resolving
     (when (and xcode-build-config--package-resolution-process
@@ -833,10 +836,10 @@ Does not block Emacs - resolution happens in background process."
                        (xcode-build-config--notify
                         (propertize "Package resolution failed" 'face 'error) 3)
                        (when callback (funcall callback nil))))
-                   ;; Clean up buffer
-                   (when (buffer-live-p (process-buffer proc))
-                     (kill-buffer (process-buffer proc))))))))
-      t)))
+                    ;; Clean up buffer
+                    (when (buffer-live-p (process-buffer proc))
+                      (kill-buffer (process-buffer proc))))))))
+      t))))
 
 (defun xcode-build-config-ensure-packages-resolved ()
   "Ensure packages are resolved before building.

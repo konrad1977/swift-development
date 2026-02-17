@@ -121,19 +121,24 @@ WARNING: Enabling this may cause Emacs to freeze with long cache keys."
 
 (defmacro swift-cache-with (key ttl &rest body)
   "Execute BODY and cache result with KEY and TTL.
-If KEY exists in cache and is not expired, return cached value without executing BODY."
+If KEY exists in cache and is not expired, return cached value
+without executing BODY.  Nil and empty string results are never
+cached so that transient failures are retried on next access."
   (declare (indent 2))
   `(let ((cached-value (swift-cache-get ,key 'swift-cache--not-found)))
      (if (not (eq cached-value 'swift-cache--not-found))
          cached-value
        (let ((result (progn ,@body)))
-         (swift-cache-set ,key result ,ttl)
+         (when (and result (not (equal result "")))
+           (swift-cache-set ,key result ,ttl))
          result))))
 
 ;; Project-specific cache helpers
 (defun swift-cache-project-key (project-root key-suffix)
-  "Generate cache key for PROJECT-ROOT with KEY-SUFFIX."
-  (format "%s::%s" (file-truename project-root) key-suffix))
+  "Generate cache key for PROJECT-ROOT with KEY-SUFFIX.
+Returns nil if PROJECT-ROOT is nil."
+  (when project-root
+    (format "%s::%s" (file-truename project-root) key-suffix)))
 
 (defun swift-cache-invalidate-project (project-root)
   "Invalidate all cache entries for PROJECT-ROOT."

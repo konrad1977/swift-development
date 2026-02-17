@@ -153,7 +153,7 @@ Interactive test explorer with tree view, XCTest and Swift Testing support, and 
 
 ### Prerequisites
 
-- Emacs 27.1 or higher
+- Emacs 28.1 or higher
 - See the [Dependencies](#dependencies) section above for required system tools and packages
 
 ### Setup
@@ -198,16 +198,24 @@ swift-development/
 ├── swift-cache.el                 # Unified caching system
 ├── swift-file-watcher.el          # File change detection
 ├── swift-features.el              # Additional Swift features
-├── swift-error-handler.el         # Error parsing and handling
+├── swift-error-proxy.el           # Unified error parsing and handling
+├── swift-async.el                 # Robust async process utilities
 ├── swift-lsp.el                   # LSP integration
 ├── swift-notification.el          # Unified notification system
+├── swift-incremental-build.el     # Incremental build pipeline (bypasses xcodebuild)
 ├── swiftui-preview.el             # SwiftUI preview support
+├── swiftui-preview-core.el        # Core SwiftUI preview utilities
+├── swiftui-preview-dynamic.el     # Dynamic target injection preview
+├── swiftui-preview-standalone.el  # Standalone Swift file preview
+├── swiftui-preview-spm.el         # SPM package SwiftUI preview
+├── swiftui-preview-setup.el       # Setup wizard for SwiftUI Preview
 ├── swift-refactor.el              # Refactoring tools
 ├── ios-simulator.el               # iOS Simulator integration
 ├── ios-device.el                  # Physical device management
 ├── swift-package-manager.el       # SPM dependency UI and build integration
 ├── swift-macro-manager.el         # Swift macro approval management (Swift 5.9+)
 ├── swift-test-explorer.el         # Test explorer with tree view and test running
+├── xcode-archive.el               # Archive, export, and distribute to TestFlight
 ├── xcode-instruments.el           # Instruments profiling integration
 ├── localizeable-mode.el           # Localization file editing
 ├── apple-docs-query.el            # Apple documentation lookup
@@ -276,6 +284,9 @@ Persistent project settings that survive Emacs restarts. Settings are stored per
 Settings are stored in `.swift-development/` directory in your project root:
 - `.swift-development/settings` - Project configuration (~500 bytes)
 - `.swift-development/device-cache` - Cached simulator devices (optional, created on simulator selection)
+- `.swift-development/incremental-commands-<scheme>` - Cached compile + link commands for incremental builds
+- `.swift-development/dependency-graph-<scheme>` - Reverse dependency graph for cascade rebuilds
+- `.swift-development/swiftmodule-hashes-<scheme>` - Persistent `.swiftmodule` hashes for API change detection
 
 **Auto-launch simulator:**
 When `swift-development-auto-launch-simulator` is `t` (default), the simulator automatically starts when you open a project with saved settings. Disable with:
@@ -1023,6 +1034,96 @@ Quick documentation lookup from Emacs.
 - `apple-docs/query` - Search Apple Developer Documentation
 - `hacking-ws/query` - Search Hacking with Swift tutorials
 
+### swift-incremental-build.el
+
+Incremental build pipeline that bypasses `xcodebuild` for fast edit-compile-run cycles. Instead of running a full build (~189s), it replays only the compile and link steps needed for changed modules (~7-14s). Can be toggled on/off via `swift-incremental-build-toggle` or the `swift-incremental-build-enabled` customization variable.
+
+**How it works:**
+
+Xcode uses a "debug dylib" architecture where SPM modules are compiled into relocatable `.o` files and linked into a single `App.debug.dylib`. The incremental build pipeline exploits this by:
+
+1. Detecting which SPM modules have changed files (via `swift-file-watcher`)
+2. Filtering out third-party modules (detected via `-suppress-warnings` in compile commands)
+3. Recompiling only the changed internal module (`swiftc -incremental`)
+4. Checking for API changes via `.swiftmodule` hash comparison
+5. Cascade-recompiling downstream internal modules if API changed
+6. Re-linking each module's `.o` (`clang -r`)
+7. Re-linking the debug dylib (`clang -dynamiclib`)
+8. Patching the `.app` bundle and re-signing
+9. Installing and launching on the iOS Simulator
+
+**Third-party module filtering:**
+
+Modules are classified as internal or third-party at parse time by checking for the `-suppress-warnings` flag in their swiftc command (Xcode adds this flag to all third-party SPM dependencies, never to internal ones). Third-party modules are:
+- Excluded from the changed-modules list (file changes are ignored)
+- Excluded from cascade rebuilds (never recompiled as downstream)
+- Excluded from source scanning when building the dependency graph (performance)
+- Marked with `[3p]` in diagnostic commands
+
+**API change detection:**
+
+After compiling each module, the `.swiftmodule` hash (public interface) is compared against a **persistent hash store** saved to disk. If the hash differs from the stored value, downstream internal modules are automatically added to the build queue. The persistent store eliminates hash flip-flop that occurred when comparing Products vs Intermediates directories directly, since stripping `-experimental-emit-module-separately` produces different binary output. Hashes are updated after each comparison and survive Emacs restarts.
+
+**Dependency graph:**
+
+The reverse dependency graph is built from actual `import` statements in source files. Only internal module sources are scanned (third-party modules are skipped). The graph is:
+- Cached to disk (`dependency-graph-<scheme>`) for instant loading on Emacs restart
+- Built asynchronously via idle timer if the disk cache is missing (does not block builds)
+- Automatically cleared when switching schemes
+
+**Command sources:**
+
+- **`.compile` database** (from `xcode-build-server`) provides compile commands with topological ordering for all modules
+- **Build log parsing** extracts link commands (`clang -r` per module, `clang -dynamiclib` for the dylib)
+- Both sources are **automatically merged** and cached to disk for persistence across sessions
+- After every full `xcodebuild`, commands are **automatically extracted** from the build output
+
+**Bootstrap workflow:**
+
+On a fresh setup (no cached commands), run a single full `xcodebuild` — compile and link commands are extracted automatically. Alternatively, use `swift-incremental-build-extract-commands` to manually extract from a saved build log file.
+
+**Key commands:**
+- `swift-incremental-build-compile-and-run` (`C-c b i`) - Incremental build + install + launch
+- `swift-incremental-build-compile` (`C-c b I`) - Incremental build only (no install)
+- `swift-incremental-build-extract-commands` (`C-c b e`) - Extract commands from a build log file
+- `swift-incremental-build-toggle` - Toggle incremental builds on/off
+- `swift-incremental-build-show-modules` - Display cached modules and their command status
+- `swift-incremental-build-show-compile-database` - Show `.compile` database contents (with `[internal]`/`[3rd-party]` counts)
+- `swift-incremental-build-show-dependency-graph` - Show the reverse dependency graph (with `[3p]` markers)
+- `swift-incremental-build-status` - Show full diagnostics (including enabled/disabled state)
+- `swift-incremental-build-cancel` - Cancel an in-progress build
+- `swift-incremental-build-clear-cache` - Clear all cached commands and in-memory state
+- `swift-incremental-build-toggle-debug` - Toggle verbose debug logging
+
+**Customization:**
+```elisp
+;; Enable/disable incremental builds (default: t)
+(setq swift-incremental-build-enabled t)
+
+;; Codesign identity for re-signing the .app bundle (default: "-")
+(setq swift-incremental-build-codesign-identity "-")
+
+;; Max modules to build incrementally (default: 4, falls back to xcodebuild)
+(setq swift-incremental-build-max-modules 4)
+
+;; Max modules for cascade rebuild on API change (default: 25)
+(setq swift-incremental-build-max-cascade-modules 25)
+```
+
+**Automatic integration:**
+
+When `swift-development-compile-and-run` or `swift-development-compile-app` is called, the package automatically checks if an incremental build is possible (via `swift-incremental-build-ready-p`). This check verifies that: (1) incremental builds are enabled, (2) all changed modules have cached compile and link commands, and (3) the dylib link command is available. If any check fails, it falls back to full `xcodebuild`. After each full build, commands are automatically extracted and cached for next time. Switching schemes automatically clears the incremental build cache.
+
+**Three-stage fallback:**
+1. **Incremental build** - Compile only changed internal modules
+2. **Cascade rebuild** - If API changes detected or build fails with "Undefined symbols", rebuild downstream internal modules
+3. **Full xcodebuild** - Last resort if cascade also fails
+
+**Disk cache files** (in `.swift-development/` at project root):
+- `incremental-commands-<scheme>` - Cached compile + link commands for all modules
+- `dependency-graph-<scheme>` - Reverse dependency graph (import-based)
+- `swiftmodule-hashes-<scheme>` - Persistent `.swiftmodule` hashes for API change detection
+
 ## Build Performance & Optimization
 
 The package includes several commands to optimize build performance for different scenarios.
@@ -1240,37 +1341,21 @@ M-x ios-simulator-appcontainer
 
 ## Error Handling & Diagnostics
 
-The package includes comprehensive error handling and diagnostic tools.
+The package includes comprehensive error handling and diagnostic tools via `swift-error-proxy.el`.
 
-### Error Log Management
+### Error Management
 
-**`swift-error-handler-show-log`** - Display the error log buffer
+**`swift-error-proxy-toggle-buffer`** - Toggle the error/compilation buffer
 
-Shows all captured build errors and warnings in a dedicated buffer.
+Shows or hides captured build errors and warnings.
 
-```elisp
-M-x swift-error-handler-show-log
-```
+**`swift-error-proxy-clear`** - Clear accumulated errors
 
-**`swift-error-handler-clear-log`** - Clear the error log
+Clears all error messages and the compilation buffer.
 
-Clears all accumulated error messages.
+**`swift-error-proxy-parse-output`** - Parse build output for errors
 
-```elisp
-M-x swift-error-handler-clear-log
-```
-
-**`swift-error-handler-validate-environment`** - Validate Swift development environment
-
-Checks your environment for common issues:
-- Xcode installation
-- Command line tools
-- Swift toolchain
-- Required dependencies
-
-```elisp
-M-x swift-error-handler-validate-environment
-```
+Automatically called after builds to extract and display errors. Supports both synchronous and async parsing with context-aware backends.
 
 ### Build Diagnostics
 
@@ -1811,7 +1896,7 @@ The rebuild detection system checks modification times to avoid unnecessary buil
   ;; Diagnostics & Cleaning
   (define-key swift-mode-map (kbd "C-c C-k") 'xcode-project:reset)
   (define-key swift-mode-map (kbd "C-c K") 'xcode-project-deep-clean)
-  (define-key swift-mode-map (kbd "C-c e") 'swift-error-handler-show-log)
+  (define-key swift-mode-map (kbd "C-c e") 'swift-error-proxy-toggle-buffer)
   (define-key swift-mode-map (kbd "C-c d") 'swift-development-diagnose)
 
   ;; Xcode Tools
@@ -1950,7 +2035,27 @@ Developed for efficient iOS/macOS development in Emacs.
 
 ## Changelog
 
-### Latest Updates (2025-12-18)
+### Latest Updates (2026-02-17)
+
+#### Incremental Build Pipeline
+- **New module: `swift-incremental-build.el`**
+  - Bypasses full `xcodebuild` by replaying only changed module compile/link steps
+  - Typical incremental cycle: ~7-14s vs ~189s full build
+  - Automatic API change detection via `.swiftmodule` hash comparison
+  - Real dependency graph from `import` statement analysis for precise cascade rebuilds
+  - Three-stage fallback: incremental -> cascade -> full xcodebuild
+  - `.compile` database integration (from `xcode-build-server`) for compile commands
+  - Build log parsing for link commands
+  - Persistent command cache across Emacs sessions
+  - Concurrent build guard (auto-cancels previous build)
+
+#### New Modules
+- **`swift-error-proxy.el`** - Unified error parsing proxy (replaces `swift-error-handler.el`)
+- **`swift-async.el`** - Robust async process utilities
+- **`xcode-archive.el`** - Archive, export, and distribute to TestFlight
+- **SwiftUI Preview refactor** - Split into `swiftui-preview-core.el`, `swiftui-preview-dynamic.el`, `swiftui-preview-standalone.el`, `swiftui-preview-spm.el`, `swiftui-preview-setup.el`
+
+### Updates (2025-12-18)
 
 #### 🔔 Unified Notification System
 - **Consistent notifications across all modules**

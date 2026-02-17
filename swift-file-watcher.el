@@ -121,6 +121,10 @@ Increase this value if you have very large projects."
 (defvar swift-file-watcher--change-count 0
   "Number of file changes since last build.")
 
+(defvar swift-file-watcher--changed-files (make-hash-table :test 'equal)
+  "Hash set of file paths changed since last build.
+Keys are absolute file paths, values are t.")
+
 ;;; ============================================================================
 ;;; Watched Extensions (from swift-development)
 ;;; ============================================================================
@@ -262,22 +266,27 @@ EVENT is a list (DESCRIPTOR ACTION FILE [FILE1])."
     (when (and (memq action '(created changed renamed))
                file
                (swift-file-watcher--should-watch-file-p file))
-      ;; Debounce rapid changes
+      ;; Track changed file immediately (before debounce) so rapid edits
+      ;; to multiple files are never lost.
+      (setq swift-file-watcher--change-count (1+ swift-file-watcher--change-count))
+      (puthash file t swift-file-watcher--changed-files)
+
+      ;; Debounce the dirty flag + mode-line update
       (when swift-file-watcher--debounce-timer
         (cancel-timer swift-file-watcher--debounce-timer))
-      
+
       (setq swift-file-watcher--debounce-timer
             (run-with-timer
              swift-file-watcher-debounce-delay nil
              (lambda ()
                (setq swift-file-watcher--dirty-p t
-                     swift-file-watcher--last-change (cons (current-time) file)
-                     swift-file-watcher--change-count (1+ swift-file-watcher--change-count))
-               
+                     swift-file-watcher--last-change (cons (current-time) file))
+
                (when swift-file-watcher-debug
-                 (message "[FileWatcher] Marked dirty: %s" 
-                          (file-name-nondirectory file)))
-               
+                 (message "[FileWatcher] Marked dirty: %s (%d files tracked)"
+                          (file-name-nondirectory file)
+                          (hash-table-count swift-file-watcher--changed-files)))
+
                ;; Force mode-line update if indicator is enabled
                (when swift-file-watcher-show-indicator
                  (force-mode-line-update t))))))))
@@ -304,6 +313,7 @@ Sets up file-notify watchers for relevant directories."
         swift-file-watcher--dirty-p nil
         swift-file-watcher--last-change nil
         swift-file-watcher--change-count 0)
+  (clrhash swift-file-watcher--changed-files)
   
   ;; Find directories to watch
   (let* ((dirs (swift-file-watcher--find-watch-dirs swift-file-watcher--project-root))
@@ -383,9 +393,10 @@ This is an instant check (no I/O) when watcher is active."
 ;;;###autoload
 (defun swift-file-watcher-mark-built ()
   "Mark the project as successfully built.
-Resets the dirty flag and change counter."
+Resets the dirty flag, change counter, and changed files set."
   (setq swift-file-watcher--dirty-p nil
         swift-file-watcher--change-count 0)
+  (clrhash swift-file-watcher--changed-files)
   
   (when swift-file-watcher-debug
     (message "[FileWatcher] Marked as built"))
@@ -393,6 +404,15 @@ Resets the dirty flag and change counter."
   ;; Force mode-line update if indicator is enabled
   (when swift-file-watcher-show-indicator
     (force-mode-line-update t)))
+
+;;;###autoload
+(defun swift-file-watcher-changed-files ()
+  "Return list of file paths changed since last build.
+Returns nil if no files have been tracked."
+  (let ((files '()))
+    (maphash (lambda (file _) (push file files))
+             swift-file-watcher--changed-files)
+    files))
 
 ;;;###autoload
 (defun swift-file-watcher-mark-dirty ()
@@ -572,6 +592,7 @@ trigger for files saved from within Emacs on macOS."
       (setq swift-file-watcher--dirty-p t
             swift-file-watcher--last-change (cons (current-time) file)
             swift-file-watcher--change-count (1+ swift-file-watcher--change-count))
+      (puthash file t swift-file-watcher--changed-files)
       (when swift-file-watcher-debug
         (message "[FileWatcher] After-save marked dirty: %s"
                  (file-name-nondirectory file)))
@@ -579,6 +600,30 @@ trigger for files saved from within Emacs on macOS."
         (force-mode-line-update t)))))
 
 (add-hook 'after-save-hook #'swift-file-watcher--after-save-hook)
+
+;;; ============================================================================
+;;; After-Revert Hook (for external changes e.g. Claude Code, git)
+;;; ============================================================================
+
+(defun swift-file-watcher--after-revert-hook ()
+  "Mark project as dirty when a watched file is reverted.
+Catches external modifications (e.g. from Claude Code, git checkout,
+or other tools that write files without going through Emacs)."
+  (when (and swift-file-watcher--project-root
+             (buffer-file-name)
+             (swift-file-watcher--should-watch-file-p (buffer-file-name)))
+    (let ((file (buffer-file-name)))
+      (setq swift-file-watcher--dirty-p t
+            swift-file-watcher--last-change (cons (current-time) file)
+            swift-file-watcher--change-count (1+ swift-file-watcher--change-count))
+      (puthash file t swift-file-watcher--changed-files)
+      (when swift-file-watcher-debug
+        (message "[FileWatcher] Revert marked dirty: %s"
+                 (file-name-nondirectory file)))
+      (when swift-file-watcher-show-indicator
+        (force-mode-line-update t)))))
+
+(add-hook 'after-revert-hook #'swift-file-watcher--after-revert-hook)
 
 ;;; ============================================================================
 ;;; Cleanup

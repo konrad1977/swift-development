@@ -764,6 +764,9 @@ Sets `xcode-project--current-xcode-scheme' and loads settings."
     (let ((scheme (car schemes)))
       (when scheme
         (setq xcode-project--current-xcode-scheme scheme)
+        ;; Clear stale incremental build cache from previous scheme
+        (when (fboundp 'swift-incremental-build-clear-cache)
+          (swift-incremental-build-clear-cache))
         (when (fboundp 'swift-project-settings-load-for-scheme)
           (swift-project-settings-load-for-scheme (xcode-project-project-root) scheme))
         ;; Persist to disk so the scheme is remembered across buffers/sessions
@@ -782,6 +785,9 @@ Sets `xcode-project--current-xcode-scheme' and loads settings."
     (let ((selected (xcode-project-build-menu :title "Choose scheme: " :list schemes)))
       (when selected
         (setq xcode-project--current-xcode-scheme selected)
+        ;; Clear stale incremental build cache from previous scheme
+        (when (fboundp 'swift-incremental-build-clear-cache)
+          (swift-incremental-build-clear-cache))
         (when (fboundp 'swift-project-settings-load-for-scheme)
           (swift-project-settings-load-for-scheme (xcode-project-project-root) selected))
         ;; Persist to disk so the scheme is remembered across buffers/sessions
@@ -878,6 +884,9 @@ Sets `xcode-project--current-xcode-scheme' and saves to settings."
                                                  :list filtered-schemes)))
         (when selected
           (setq xcode-project--current-xcode-scheme selected)
+          ;; Clear stale incremental build cache from previous scheme
+          (when (fboundp 'swift-incremental-build-clear-cache)
+            (swift-incremental-build-clear-cache))
           (when (fboundp 'swift-project-settings-load-for-scheme)
             (swift-project-settings-load-for-scheme (xcode-project-project-root) selected))
           ;; Save to settings

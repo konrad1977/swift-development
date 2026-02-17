@@ -235,8 +235,9 @@ When non-nil, apply syntax highlighting to log messages."
     (ios-simulator-mode-teardown)))
 
 
-(defvar ios-simulator--installation-process nil
-  "Process object for the current app installation.")
+(defvar ios-simulator--installation-processes (make-hash-table :test 'equal)
+  "Hash table mapping simulator IDs to their installation process objects.
+Allows parallel installations on multiple simulators without conflicts.")
 
 (defvar-local ios-simulator--current-simulator-name nil)
 (defvar-local current-simulator-id nil)
@@ -331,10 +332,11 @@ DEVICE-LIST should be the output of `ios-simulator--parse-device-list'."
 
 (defun ios-simulator-cleanup ()
   "Clean up simulator resources."
-  (when (and ios-simulator--installation-process
-             (process-live-p ios-simulator--installation-process))
-    (delete-process ios-simulator--installation-process))
-  (setq ios-simulator--installation-process nil))
+  (maphash (lambda (_id proc)
+             (when (and proc (process-live-p proc))
+               (delete-process proc)))
+           ios-simulator--installation-processes)
+  (clrhash ios-simulator--installation-processes))
 
 (defun ios-simulator-cleanup-global-state ()
   "Clean up global hash tables to prevent memory leaks.
@@ -344,6 +346,8 @@ This is called on `kill-emacs-hook' to ensure proper cleanup."
     (clrhash ios-simulator--active-simulators))
   (when (hash-table-p ios-simulator--simulator-buffers)
     (clrhash ios-simulator--simulator-buffers))
+  (when (hash-table-p ios-simulator--installation-processes)
+    (clrhash ios-simulator--installation-processes))
   ;; Clear legacy cache variables
   (setq ios-simulator--cached-devices nil
         ios-simulator--cache-timestamp nil
@@ -474,6 +478,10 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
           current-root-folder-simulator rootfolder
           current-app-name applicationName)
 
+    (when ios-simulator-debug
+      (message "install-and-run-app called with terminate-first=%s, %d simulators"
+               terminate-first (length target-simulator-ids)))
+
     ;; Launch on all target simulators
     (dolist (simulator-id target-simulator-ids)
       (let* ((simulatorName (ios-simulator-simulator-name-from :id simulator-id))
@@ -510,16 +518,24 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
               (xcode-project--current-build-folder build-folder)
               (current-terminate-first terminate-first))
           (if current-terminate-first
-              ;; Terminate app asynchronously
-              (make-process
-               :name (format "terminate-app-%s" current-sim-id)
-               :command (list "xcrun" "simctl" "terminate" current-sim-id current-app-id)
-               :noquery t
-               :sentinel (lambda (proc event)
-                           ;; Only proceed when process has actually exited
-                           (when (memq (process-status proc) '(exit signal))
-                             ;; Install immediately after termination
-                             (ios-simulator-install-app
+              ;; Terminate app asynchronously, then install
+              (let ((terminate-handled nil))
+                (when ios-simulator-debug
+                  (message "Terminating app %s on %s before install" current-app-id current-sim-id))
+                (make-process
+                 :name (format "terminate-app-%s" current-sim-id)
+                 :command (list "xcrun" "simctl" "terminate" current-sim-id current-app-id)
+                 :noquery t
+                 :sentinel (lambda (proc event)
+                             (when ios-simulator-debug
+                               (message "Terminate sentinel: event=%s handled=%s status=%s"
+                                        (string-trim event) terminate-handled (process-status proc)))
+                             ;; Only proceed once when process has actually exited
+                             (when (and (not terminate-handled)
+                                        (memq (process-status proc) '(exit signal)))
+                               (setq terminate-handled t)
+                               ;; Install immediately after termination
+                               (ios-simulator-install-app
                             :simulatorID current-sim-id
                             :build-folder xcode-project--current-build-folder
                             :appname current-app-name
@@ -534,103 +550,213 @@ If ios-simulator--target-simulators is set, launches on all specified simulators
                                            :appIdentifier current-app-id
                                            :applicationName current-app-name
                                            :simulatorName current-sim-name
-                                           :simulatorID current-sim-id
-                                           :buffer launch-buffer
-                                           :terminate-running current-terminate-first))))))))
+                                            :simulatorID current-sim-id
+                                            :buffer launch-buffer
+                                            :terminate-running current-terminate-first))))))))
             ;; Install directly without terminating
-            (ios-simulator-install-app
-             :simulatorID current-sim-id
-             :build-folder xcode-project--current-build-folder
-             :appname current-app-name
-             :callback (lambda ()
-                         (when ios-simulator-debug
-                           (message "App installation completed on %s, launching app" current-sim-name))
-                         ;; Ensure buffer is still alive, recreate if needed
-                         (let ((launch-buffer (if (buffer-live-p current-buffer)
-                                                 current-buffer
-                                               (get-buffer-create current-buffer-name))))
-                           (ios-simulator-launch-app
-                            :appIdentifier current-app-id
-                            :applicationName current-app-name
-                            :simulatorName current-sim-name
-                            :simulatorID current-sim-id
-                            :buffer launch-buffer
-                            :terminate-running current-terminate-first)))))))))
+            (progn
+              (when ios-simulator-debug
+                (message "Installing directly (no terminate) on %s" current-sim-id))
+              (ios-simulator-install-app
+               :simulatorID current-sim-id
+               :build-folder xcode-project--current-build-folder
+               :appname current-app-name
+               :callback (lambda ()
+                           (when ios-simulator-debug
+                             (message "App installation completed on %s, launching app" current-sim-name))
+                           ;; Ensure buffer is still alive, recreate if needed
+                           (let ((launch-buffer (if (buffer-live-p current-buffer)
+                                                   current-buffer
+                                                 (get-buffer-create current-buffer-name))))
+                             (ios-simulator-launch-app
+                              :appIdentifier current-app-id
+                              :applicationName current-app-name
+                              :simulatorName current-sim-name
+                              :simulatorID current-sim-id
+                              :buffer launch-buffer
+                              :terminate-running current-terminate-first)))))))))))
 
-(cl-defun ios-simulator-install-app (&key simulatorID &key build-folder &key appname &key callback)
-  "Install app (as SIMULATORID and BUILD-FOLDER APPNAME) and call CALLBACK when done."
-  (let* ((folder build-folder)
+(defun ios-simulator--app-fingerprint (app-path)
+  "Quick fingerprint of APP-PATH based on mtime and size of main binary.
+Checks the binary inside the .app bundle for reliable change detection,
+since directory mtime is unreliable on macOS."
+  (when (file-directory-p app-path)
+    (let* ((app-name (file-name-sans-extension (file-name-nondirectory app-path)))
+           (binary (expand-file-name app-name app-path))
+           (target (if (file-exists-p binary) binary app-path))
+           (attrs (file-attributes target)))
+      (when attrs
+        (format "%s:%d"
+                (format-time-string "%s" (file-attribute-modification-time attrs))
+                (or (file-attribute-size attrs) 0))))))
+
+(defun ios-simulator--fingerprint-cache-key (simulatorID appname)
+  "Generate cache key for installed app fingerprint on SIMULATORID for APPNAME."
+  (format "sim-installed::%s::%s" simulatorID appname))
+
+(cl-defun ios-simulator-install-app (&key simulatorID &key build-folder
+                                          &key appname &key callback
+                                          &key retry-count)
+  "Install app on SIMULATORID from BUILD-FOLDER/APPNAME.app.
+Call CALLBACK when done.  RETRY-COUNT tracks auto-retry attempts (internal)."
+  (let* ((retry-count (or retry-count 0))
+         (folder build-folder)
          ;; Remove shell quotes if present to get clean path for file operations
          (install-path (if (and folder (string-match "^['\"]\\(.*\\)['\"]$" folder))
                           (match-string 1 folder)
                         folder))
          (app-path (format "%s%s.app" install-path appname))
          (command (list "xcrun" "simctl" "install" simulatorID app-path)))
+
+    ;; Validate .app path before attempting install
+    (unless (file-directory-p app-path)
+      (message "Installation aborted: .app bundle not found at %s" app-path)
+      (when (fboundp 'xcode-project-notify)
+        (xcode-project-notify
+         :message (format "Install failed: %s.app not found"
+                          (propertize appname 'face 'error))
+         :seconds 5
+         :reset t))
+      (when (fboundp 'swift-notification-progress-cancel)
+        (swift-notification-progress-cancel 'swift-build))
+      (cl-return-from ios-simulator-install-app))
+
+    ;; Check fingerprint cache — skip install if app hasn't changed since last install
+    (let* ((fingerprint (ios-simulator--app-fingerprint app-path))
+           (cache-key (ios-simulator--fingerprint-cache-key simulatorID appname))
+           (cached-fp (when (and fingerprint (fboundp 'swift-cache-get))
+                        (swift-cache-get cache-key))))
+      (when (and cached-fp fingerprint (string= cached-fp fingerprint)
+                 (= retry-count 0))
+        (when ios-simulator-debug
+          (message "App unchanged (fingerprint match), skipping install"))
+        (when (fboundp 'swift-notification-progress-update)
+          (swift-notification-progress-update 'swift-build :percent 85
+                                              :message "Skipped (unchanged)"))
+        (when callback (funcall callback))
+        (cl-return-from ios-simulator-install-app)))
+
     (when ios-simulator-debug
-      (message "Installing app: %s" app-path)
+      (message "Installing app: %s (attempt %d)" app-path (1+ retry-count))
       (message "App path exists: %s" (file-exists-p app-path)))
 
     (when (fboundp 'xcode-project-notify)
       (xcode-project-notify
-       :message (format "Installing %s..." (propertize appname 'face 'font-lock-constant-face))))
+       :message (format "Installing %s..."
+                        (propertize appname 'face 'font-lock-constant-face))))
 
     ;; Update progress bar
     (when (fboundp 'swift-notification-progress-update)
-      (swift-notification-progress-update 'swift-build :percent 75 :message "Installing app..."))
+      (swift-notification-progress-update 'swift-build :percent 75
+                                          :message "Installing app..."))
 
-    ;; Kill any existing installation process to prevent duplicates
-    (when (and ios-simulator--installation-process
-               (process-live-p ios-simulator--installation-process))
-      (when ios-simulator-debug
-        (message "Killing existing installation process"))
-      (delete-process ios-simulator--installation-process))
+    ;; Kill any existing installation process for THIS simulator
+    (let ((existing (gethash simulatorID ios-simulator--installation-processes)))
+      (when (and existing (process-live-p existing))
+        (when ios-simulator-debug
+          (message "Killing existing installation process for %s" simulatorID))
+        (delete-process existing)))
 
-    ;; Direct process creation without buffer
-    (setq ios-simulator--installation-process
-          (make-process
-           :name "ios-simulator-install"
-           :command command
-           :noquery t
-           :sentinel (lambda (process event)
-                       (condition-case install-err
-                           (progn
-                             (when ios-simulator-debug
-                               (message "Installation process event: %s" event))
-                              ;; Handle all process exit events (finished, exited abnormally, etc.)
-                              (when (memq (process-status process) '(exit signal))
-                                (if (= 0 (process-exit-status process))
-                                    (progn
-                                      ;; Use run-with-timer to avoid "call-process invoked recursively"
-                                      ;; when knockknock notifications use call-process internally
-                                      (run-with-timer
-                                       0 nil
-                                       (lambda ()
-                                         (when (fboundp 'xcode-project-notify)
-                                           (xcode-project-notify
-                                            :message (format "%s installed"
-                                                             (propertize appname 'face 'success))
-                                            :seconds 2
-                                            :reset t))
-                                         (when (fboundp 'swift-notification-progress-update)
-                                           (swift-notification-progress-update 'swift-build :percent 85 :message "Installed"))))
-                                      (when callback (funcall callback)))
-                                  (progn
-                                    ;; Use run-with-timer here too for consistency
-                                    (run-with-timer
-                                     0 nil
-                                     (lambda ()
-                                       (when (fboundp 'xcode-project-notify)
-                                         (xcode-project-notify
-                                          :message (format "Installation failed: %s"
-                                                           (propertize appname 'face 'error))
-                                          :seconds 3
-                                          :reset t))
-                                       (when (fboundp 'swift-notification-progress-cancel)
-                                         (swift-notification-progress-cancel 'swift-build))))
-                                    (message "App installation failed with exit code: %d"
-                                             (process-exit-status process))))))
-                         (error
-                          (message "Error in installation sentinel: %s" (error-message-string install-err)))))))))
+    ;; Start installation process
+    (puthash simulatorID
+             (make-process
+              :name (format "ios-sim-install-%s"
+                            (substring simulatorID 0 (min 8 (length simulatorID))))
+              :command command
+              :noquery t
+              :sentinel
+              (lambda (process event)
+                (condition-case install-err
+                    (progn
+                      (when ios-simulator-debug
+                        (message "Installation process event: %s (exit %d)"
+                                 event (process-exit-status process)))
+                      ;; Ignore killed processes (from delete-process when a newer install starts)
+                      ;; Handle process exit events (but not killed processes)
+                      (when (and (memq (process-status process) '(exit signal))
+                                 (not (string-match-p "killed" event)))
+                        (let ((exit-code (process-exit-status process)))
+                          (cond
+                           ;; Success
+                           ((= exit-code 0)
+                            ;; Cache fingerprint for skip-install optimization
+                            (let ((fp (ios-simulator--app-fingerprint app-path)))
+                              (when (and fp (fboundp 'swift-cache-set))
+                                (swift-cache-set
+                                 (ios-simulator--fingerprint-cache-key simulatorID appname)
+                                 fp 3600)))
+                            ;; Use run-with-timer to avoid "call-process invoked recursively"
+                            ;; when knockknock notifications use call-process internally
+                            (run-with-timer
+                             0 nil
+                             (lambda ()
+                               (when (fboundp 'xcode-project-notify)
+                                 (xcode-project-notify
+                                  :message (format "%s installed"
+                                                   (propertize appname 'face 'success))
+                                  :seconds 2
+                                  :reset t))
+                               (when (fboundp 'swift-notification-progress-update)
+                                 (swift-notification-progress-update
+                                  'swift-build :percent 85 :message "Installed"))))
+                            (when callback (funcall callback)))
+
+                           ;; Exit code 9: simulator not booted or invalid UUID — retry once
+                           ((and (= exit-code 9) (< retry-count 1))
+                            (message "Install failed (exit 9): simulator %s not booted, booting and retrying..."
+                                     (substring simulatorID 0 (min 8 (length simulatorID))))
+                            (make-process
+                             :name "boot-retry-install"
+                             :command (list "xcrun" "simctl" "boot" simulatorID)
+                             :noquery t
+                             :sentinel
+                             (lambda (_boot-proc boot-event)
+                               (when (string-match "\\(?:finished\\|exited\\)" boot-event)
+                                 ;; Delay for simulator to settle after boot
+                                 (run-with-timer
+                                  1.0 nil
+                                  (lambda ()
+                                    (ios-simulator-install-app
+                                     :simulatorID simulatorID
+                                     :build-folder build-folder
+                                     :appname appname
+                                     :callback callback
+                                     :retry-count (1+ retry-count))))))))
+
+                           ;; Exit code 2: invalid/corrupt .app bundle or bad path
+                           ((= exit-code 2)
+                            (run-with-timer
+                             0 nil
+                             (lambda ()
+                               (when (fboundp 'xcode-project-notify)
+                                 (xcode-project-notify
+                                  :message "Install failed: invalid .app bundle"
+                                  :seconds 5
+                                  :reset t))
+                               (when (fboundp 'swift-notification-progress-cancel)
+                                 (swift-notification-progress-cancel 'swift-build))))
+                            (message "App installation failed (exit 2): .app bundle invalid or corrupt at %s"
+                                     app-path))
+
+                           ;; Any other exit code
+                           (t
+                            (run-with-timer
+                             0 nil
+                             (lambda ()
+                               (when (fboundp 'xcode-project-notify)
+                                 (xcode-project-notify
+                                  :message (format "Installation failed: %s (exit %d)"
+                                                   (propertize appname 'face 'error)
+                                                   exit-code)
+                                  :seconds 3
+                                  :reset t))
+                               (when (fboundp 'swift-notification-progress-cancel)
+                                 (swift-notification-progress-cancel 'swift-build))))
+                            (message "App installation failed with exit code: %d" exit-code))))))
+                  (error
+                   (message "Error in installation sentinel: %s"
+                            (error-message-string install-err))))))
+             ios-simulator--installation-processes)))
 
 
 (defun ios-simulator-get-app-name-fast (build-folder)
@@ -1813,6 +1939,10 @@ This is like a factory reset - removes all apps, data, and settings."
       (swift-async-run-sync
        (list "xcrun" "simctl" "erase" sim-id)
        :timeout 15)
+      ;; Invalidate all fingerprint caches for this simulator
+      (when (fboundp 'swift-cache-invalidate-pattern)
+        (swift-cache-invalidate-pattern
+         (regexp-quote (format "sim-installed::%s" sim-id))))
       (message "Simulator erased. Rebooting...")
       (ios-simulator-boot-simulator-with-id sim-id))))
 
@@ -2040,6 +2170,10 @@ CELLULAR: cellular bars 0-4"
       (swift-async-run-sync
        (list "xcrun" "simctl" "uninstall" sim-id bundle-id)
        :timeout 10)
+      ;; Invalidate fingerprint cache so next install isn't skipped
+      (when (fboundp 'swift-cache-invalidate-pattern)
+        (swift-cache-invalidate-pattern
+         (regexp-quote (format "sim-installed::%s" sim-id))))
       (message "Uninstalled %s" bundle-id))))
 
 (defun ios-simulator-uninstall-current-app ()

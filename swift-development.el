@@ -29,6 +29,7 @@
 (require 'xcode-build-config nil t) ;; Build configuration and command construction
 (require 'xcode-project nil t) ;; For notification system
 (require 'swift-notification nil t) ;; Unified notification system with progress bars
+(require 'swift-incremental-build nil t) ;; Incremental build pipeline
 (require 'swift-refactor nil t) ;; Code refactoring tools
 (require 'xcode-archive nil t) ;; Archive, export, and TestFlight distribution
 
@@ -50,6 +51,12 @@
 
 ;; Swift macro manager
 (declare-function spm-macro-check-and-offer-approval "swift-macro-manager" (build-output))
+
+;; Incremental build
+(declare-function swift-incremental-build-ready-p "swift-incremental-build")
+(declare-function swift-incremental-build-compile-and-run "swift-incremental-build")
+(declare-function swift-incremental-build-compile "swift-incremental-build")
+(declare-function swift-incremental-build-extract-from-build-output "swift-incremental-build")
 
 ;; Swift test explorer
 (declare-function swift-test-explorer-show "swift-test-explorer")
@@ -193,6 +200,10 @@ Value is \\='unset if no choice has been made yet.")
 (defvar swift-development--force-next-build nil
   "When non-nil, force build regardless of file watcher status.
 Set to t after scheme change or reset, cleared after successful build.")
+
+(defvar swift-development--force-full-build nil
+  "When non-nil, the next build uses xcodebuild (skipping incremental).
+Automatically reset to nil after one build.")
 
 (defvar swift-development--build-context nil
   "Captured build context for the current build session.
@@ -702,6 +713,11 @@ Returns a cons cell (PROCESS . LOG-BUFFER) where LOG-BUFFER accumulates the buil
                                                         'swift-build :percent 60 :message "Build complete"))))
                                                   ;; Run xcode-build-server parse asynchronously
                                                   (swift-development-run-xcode-build-server-parse output)
+                                                  ;; Extract incremental build commands for next time
+                                                  (when (fboundp 'swift-incremental-build-extract-from-build-output)
+                                                    (run-with-timer
+                                                     0.5 nil
+                                                     #'swift-incremental-build-extract-from-build-output output))
                                                   (when (and callback (functionp callback))
                                                     (funcall callback output))
                                                   (swift-development-cleanup))
@@ -862,20 +878,41 @@ If FORCE is non-nil, always recompile even if sources are unchanged."
               (ios-simulator-setup-simulator-dwim sim-id))))
 
         ;; Check if rebuild is needed (fast synchronous check)
-        (if (and (not force) (not (swift-development-needs-rebuild-p)))
+        ;; force-full-build bypasses this check too
+        (if (and (not force)
+                 (not swift-development--force-full-build)
+                 (not (swift-development-needs-rebuild-p)))
             (progn
               ;; Finish progress bar - build was skipped
               (when (fboundp 'swift-notification-progress-finish)
                 (swift-notification-progress-finish 'swift-build "Build up-to-date"))
-              (when (fboundp 'xcode-project-notify)
-                (xcode-project-notify
-                 :message (propertize "Build up-to-date, skipping compilation" 'face 'success)
-                 :seconds 2
-                 :reset t))
+              (swift-notification-send
+               :message (propertize "Build: skipped (sources unchanged)" 'face 'success)
+               :seconds 3)
               ;; Run the already-built app if requested
               (swift-development--run-up-to-date-app run))
-          ;; Sources changed or force - compile
-          (swift-development--do-compile :run run)))
+          ;; Sources changed or force - try incremental first, fallback to full
+          (if (and (not force)
+                   (not swift-development--force-full-build)
+                   (not (eq swift-development--device-choice t)) ;; simulator only
+                   (fboundp 'swift-incremental-build-ready-p)
+                   (swift-incremental-build-ready-p))
+              (progn
+                ;; Cancel the swift-build progress (incremental has its own)
+                (when (fboundp 'swift-notification-progress-cancel)
+                  (swift-notification-progress-cancel 'swift-build))
+                (swift-notification-send
+                 :message (propertize "Build: incremental (bypassing xcodebuild)" 'face 'warning)
+                 :seconds 3)
+                (if run
+                    (swift-incremental-build-compile-and-run)
+                  (swift-incremental-build-compile)))
+            ;; Full xcodebuild
+            (setq swift-development--force-full-build nil)
+            (swift-notification-send
+              :message (propertize "Build: full xcodebuild" 'face 'font-lock-keyword-face)
+              :seconds 3)
+            (swift-development--do-compile :run run))))
     (if (swift-development-is-a-swift-package-base-project)
         (swift-development-build-swift-package)
       (progn
@@ -1984,6 +2021,14 @@ This is the fastest way to rebuild after small changes."
                                (replace-regexp-in-string "ipad" "iPad" 
                                                         simulator-name t) t)
     ""))
+
+;;;###autoload
+(defun swift-development-force-full-build ()
+  "Force the next build to use xcodebuild (skip incremental).
+The flag is automatically cleared after one build."
+  (interactive)
+  (setq swift-development--force-full-build t)
+  (message "Next build will use full xcodebuild"))
 
 ;;;###autoload
 (defun swift-development-compile-app ()

@@ -96,10 +96,21 @@ MESSAGE is the completion message."
              (fboundp 'swift-notification-progress-cancel))
     (swift-notification-progress-cancel id)))
 
+(defvar swiftui-preview-dynamic--current-source-file nil)  ; forward decl
+
 (defun swiftui-preview-dynamic--parse-build-errors (output)
-  "Parse build OUTPUT through the error proxy."
+  "Parse build OUTPUT through the error proxy.
+Rewrites references to the generated PreviewHostApp.swift back to
+the real source file so that periphery navigation works correctly."
   (when (fboundp 'swift-error-proxy-parse-output)
-    (swift-error-proxy-parse-output output)))
+    (let ((rewritten
+           (if (and output swiftui-preview-dynamic--current-source-file)
+               (replace-regexp-in-string
+                "/[^ \n:]*PreviewHostApp\\.swift"
+                swiftui-preview-dynamic--current-source-file
+                output t t)
+             output)))
+      (swift-error-proxy-parse-output rewritten))))
 
 (defgroup swiftui-preview-dynamic nil
   "Dynamic target injection preview settings."
@@ -701,6 +712,11 @@ IOS-VERSION is the deployment target (e.g., \"17.0\")."
          (fresh-o (expand-file-name
                    (if module-o (concat module-name ".o") (concat source-base ".o"))
                    swiftui-preview-dynamic--temp-dir))
+         ;; Fresh .swiftmodule output path -- so preview-host sees
+         ;; updated type signatures (e.g. new init parameters)
+         (fresh-swiftmodule (expand-file-name
+                             (concat module-name ".swiftmodule")
+                             swiftui-preview-dynamic--temp-dir))
          ;; Common compile flags
          (common-flags
           (append
@@ -712,6 +728,10 @@ IOS-VERSION is the deployment target (e.g., \"17.0\")."
                  "-I" products-dir
                  "-F" products-dir
                  "-F" (concat sdk-path "/System/Library/Frameworks"))
+           ;; Emit fresh .swiftmodule so downstream imports see
+           ;; the updated public/internal API
+           (list "-emit-module"
+                 "-emit-module-path" fresh-swiftmodule)
            ;; Plugin paths for macros (#Preview etc.)
            (when (file-directory-p plugin-path)
              (list "-plugin-path" plugin-path))
@@ -764,6 +784,7 @@ IOS-VERSION is the deployment target (e.g., \"17.0\")."
     ;; can run the compilation asynchronously
     (list :compile-args compile-args
           :fresh-o fresh-o
+          :fresh-swiftmodule fresh-swiftmodule
           :module-o module-o
           :per-file-match per-file-match
           :object-files object-files
@@ -1167,7 +1188,11 @@ receives (app-path nil) or (nil error-msg)."
                                           "-o" executable
                                           "-sdk" sdk-path
                                           "-target" target-triple
-                                          ;; Module search paths
+                                          ;; Fresh .swiftmodule from recompile (must
+                                          ;; come BEFORE products-dir so updated
+                                          ;; type signatures take precedence)
+                                          "-I" swiftui-preview-dynamic--temp-dir
+                                          ;; Module search paths (original products)
                                           "-I" products-dir
                                           ;; Framework search paths
                                           "-F" products-dir
@@ -1232,19 +1257,25 @@ receives (app-path nil) or (nil error-msg)."
 
         ;; Kick off: recompile async if needed, then continue to build
         (cond
-         ;; Cache hit: reuse previously recompiled .o files
-         ;; Copy the cached .o into the current temp-dir so it survives
-         ;; cleanup of the previous temp-dir
+         ;; Cache hit: reuse previously recompiled .o and .swiftmodule
+         ;; Copy into the current temp-dir so they survive cleanup
          (cached
           (let* ((cached-o (plist-get swiftui-preview-dynamic--recompile-cache :fresh-o))
                  (local-o (expand-file-name (file-name-nondirectory cached-o)
                                             swiftui-preview-dynamic--temp-dir))
+                 (cached-swiftmod (plist-get swiftui-preview-dynamic--recompile-cache :fresh-swiftmodule))
                  (cached-objects (plist-get swiftui-preview-dynamic--recompile-cache :object-files))
                  ;; Replace the cached .o path with the local copy in object-files
                  (updated-objects (mapcar (lambda (f)
                                            (if (equal f cached-o) local-o f))
                                          cached-objects)))
             (copy-file cached-o local-o t)
+            ;; Copy .swiftmodule so preview-host sees fresh type signatures
+            (when (and cached-swiftmod (file-exists-p cached-swiftmod))
+              (copy-file cached-swiftmod
+                         (expand-file-name (file-name-nondirectory cached-swiftmod)
+                                           swiftui-preview-dynamic--temp-dir)
+                         t))
             ;; Update cache to point to the new copy so it survives
             ;; deletion of the previous temp-dir
             (plist-put swiftui-preview-dynamic--recompile-cache :fresh-o local-o)
@@ -1261,13 +1292,21 @@ receives (app-path nil) or (nil error-msg)."
              recompile-spec
              (lambda (object-files)
                ;; Cache the result for subsequent previews from the same file.
-               ;; Copy the .o to a stable cache dir outside temp-dir so it
-               ;; survives temp-dir cleanup after capture completes.
-               (let ((fresh-o (plist-get recompile-spec :fresh-o)))
+               ;; Copy .o and .swiftmodule to a stable cache dir outside
+               ;; temp-dir so they survive cleanup after capture completes.
+               (let ((fresh-o (plist-get recompile-spec :fresh-o))
+                     (fresh-swiftmod (plist-get recompile-spec :fresh-swiftmodule)))
                  (when (and fresh-o (file-exists-p fresh-o))
                    (let* ((cache-dir (make-temp-file "swiftui-recompile-cache-" t))
                           (cached-o (expand-file-name
-                                     (file-name-nondirectory fresh-o) cache-dir)))
+                                     (file-name-nondirectory fresh-o) cache-dir))
+                          (cached-swiftmod
+                           (when (and fresh-swiftmod (file-exists-p fresh-swiftmod))
+                             (let ((dest (expand-file-name
+                                          (file-name-nondirectory fresh-swiftmod)
+                                          cache-dir)))
+                               (copy-file fresh-swiftmod dest t)
+                               dest))))
                      (copy-file fresh-o cached-o t)
                      ;; Update object-files to point to the cached copy
                      (let ((cached-objects (mapcar (lambda (f)
@@ -1276,6 +1315,7 @@ receives (app-path nil) or (nil error-msg)."
                        (setq swiftui-preview-dynamic--recompile-cache
                              (list :source-file source-file
                                    :fresh-o cached-o
+                                   :fresh-swiftmodule cached-swiftmod
                                    :cache-dir cache-dir
                                    :object-files cached-objects))))))
                (funcall continue-build object-files)))))

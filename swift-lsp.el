@@ -23,18 +23,26 @@
   "Cache TTL in seconds (1 hour).")
 
 (defun swift-lsp--cached-sdk-path ()
-  "Get the simulator SDK path (cached for 1 hour)."
+  "Get the simulator SDK path (cached for 1 hour).
+Returns nil if the SDK path cannot be resolved."
   (swift-cache-with "swift-lsp::sdk-path" swift-lsp--cache-ttl
-    (string-trim
-     (or (swift-async-run-sync "xcrun --show-sdk-path --sdk iphonesimulator" :timeout 5)
-         ""))))
+    (let ((path (string-trim
+                 (or (swift-async-run-sync
+                      (list "xcrun" "--show-sdk-path" "--sdk" "iphonesimulator")
+                      :timeout 5)
+                     ""))))
+      (if (string-empty-p path) nil path))))
 
 (defun swift-lsp--cached-sourcekit-path ()
-  "Get the sourcekit-lsp path (cached for 1 hour)."
+  "Get the sourcekit-lsp path (cached for 1 hour).
+Returns nil if sourcekit-lsp cannot be found."
   (swift-cache-with "swift-lsp::sourcekit-path" swift-lsp--cache-ttl
-    (string-trim
-     (or (swift-async-run-sync "xcrun --find sourcekit-lsp" :timeout 5)
-         ""))))
+    (let ((path (string-trim
+                 (or (swift-async-run-sync
+                      (list "xcrun" "--find" "sourcekit-lsp")
+                      :timeout 5)
+                     ""))))
+      (if (string-empty-p path) nil path))))
 
 ;;;###autoload
 (defun lsp-arguments ()
@@ -47,27 +55,42 @@ Uses cached SDK values for better performance."
                    ;; Fallback: compute target locally with caching
                    (swift-cache-with "swift-lsp::target" swift-lsp--cache-ttl
                      (let* ((arch-str (string-trim
-                                       (or (swift-async-run-sync "clang -print-target-triple" :timeout 5) "")))
+                                       (or (swift-async-run-sync
+                                            (list "clang" "-print-target-triple")
+                                            :timeout 5)
+                                           "")))
                             (components (split-string arch-str "-"))
                             (arch (nth 0 components))
                             (vendor (nth 1 components))
                             (version (string-trim
-                                      (or (swift-async-run-sync "xcrun --sdk iphonesimulator --show-sdk-version" :timeout 5) ""))))
-                       (format "%s-%s-ios%s-simulator" arch vendor version))))))
-    (list
-     "-Xswiftc" "-sdk"
-     "-Xswiftc" sdk
-     "-Xswiftc" "-target"
-     "-Xswiftc" target
-     "-Xcc" "-DSWIFT_PACKAGE=0")))
+                                      (or (swift-async-run-sync
+                                           (list "xcrun" "--sdk" "iphonesimulator"
+                                                 "--show-sdk-version")
+                                           :timeout 5)
+                                          ""))))
+                       (when (and arch vendor version
+                                  (not (string-empty-p arch))
+                                  (not (string-empty-p version)))
+                         (format "%s-%s-ios%s-simulator" arch vendor version)))))))
+    (when (and sdk target)
+      (list
+       "-Xswiftc" "-sdk"
+       "-Xswiftc" sdk
+       "-Xswiftc" "-target"
+       "-Xswiftc" target
+       "-Xcc" "-DSWIFT_PACKAGE=0"))))
 
 ;;;###autoload
-(defun swift-lsp-eglot-server-contact (_ignored)
+(defun swift-lsp-eglot-server-contact (&optional _interactive _project)
   "Construct the list that eglot needs to start sourcekit-lsp.
+INTERACTIVE is non-nil when called from `M-x eglot'.
+PROJECT is the `project-find-functions' result.
 Uses cached paths for better startup performance."
   (let ((arglist (lsp-arguments))
         (sourcekit-lsp-path (swift-lsp--cached-sourcekit-path)))
-    (cl-pushnew sourcekit-lsp-path arglist :test #'equal)))
+    (if sourcekit-lsp-path
+        (cons sourcekit-lsp-path (or arglist '()))
+      (error "Cannot find sourcekit-lsp.  Is Xcode installed?"))))
 
 (defun swift-lsp-clear-cache ()
   "Clear LSP path caches.

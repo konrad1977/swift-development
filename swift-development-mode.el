@@ -19,6 +19,12 @@
 (require 'ios-simulator nil t)
 (require 'xcode-project nil t)
 (require 'swift-file-watcher nil t)
+(require 'swift-incremental-build nil t)
+
+;; Forward declarations for incremental build
+(declare-function swift-incremental-build-compile-and-run "swift-incremental-build")
+(declare-function swift-incremental-build-compile "swift-incremental-build")
+(declare-function swift-incremental-build-extract-commands "swift-incremental-build")
 
 (defgroup swift-development-mode nil
   "Minor mode for Swift development."
@@ -76,6 +82,11 @@ This is a convenience setting that sets `swift-file-watcher-show-indicator'."
     (define-key map (kbd "C-c C-d") #'xcode-project-start-debugging)
     (define-key map (kbd "C-c x t") #'swift-development-toggle-device-choice)
     (define-key map (kbd "C-c x c") #'xcode-project-show-current-configuration)
+
+    ;; Incremental Build Commands
+    (define-key map (kbd "C-c b i") #'swift-incremental-build-compile-and-run)
+    (define-key map (kbd "C-c b I") #'swift-incremental-build-compile)
+    (define-key map (kbd "C-c b e") #'swift-incremental-build-extract-commands)
 
     ;; Refactoring Commands
     (define-key map (kbd "M-t") #'swift-refactor-insert-todo)
