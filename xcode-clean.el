@@ -17,6 +17,16 @@
 (require 'async nil t)  ; Optional - only needed for async cleaning
 (require 'swift-notification nil t)  ; For knockknock/mode-line-hud notifications
 
+;; Forward declarations for incremental build cache invalidation
+(declare-function swift-incremental-build-clear-cache "swift-incremental-build")
+
+(defun xcode-clean--invalidate-incremental-cache ()
+  "Invalidate the incremental build cache after a clean operation.
+Cached swiftc commands reference files inside the build directory
+that no longer exist after cleaning."
+  (when (fboundp 'swift-incremental-build-clear-cache)
+    (swift-incremental-build-clear-cache)))
+
 (defun xcode-clean--notify (message &optional seconds)
   "Send notification with MESSAGE, shown for SECONDS (default 2)."
   (if (fboundp 'swift-notification-send)
@@ -123,6 +133,8 @@ If PRESERVE-MODULE-CACHE is non-nil, keep the ModuleCache folder."
 Calls CALLBACK with result string when done.
 DISPLAY-NAME is used for user messages."
   (let ((name (or display-name "project")))
+    ;; Invalidate incremental build cache before cleaning
+    (xcode-clean--invalidate-incremental-cache)
     (if (file-directory-p directory)
         (progn
           (xcode-clean--notify (format "Cleaning build folder for %s..." name) 3)
@@ -193,12 +205,14 @@ Calls CALLBACK when done."
                                      "-derivedDataPath .build"))
                          " ")))
     (xcode-clean--notify "Running xcodebuild clean..." 3)
+    ;; Invalidate incremental build cache before cleaning
+    (xcode-clean--invalidate-incremental-cache)
     (if (fboundp 'swift-async-run)
         (swift-async-run
          cmd
          (lambda (_output)
-           (xcode-clean--notify "xcodebuild clean completed" 2)
-           (when callback (funcall callback)))
+            (xcode-clean--notify "xcodebuild clean completed" 2)
+            (when callback (funcall callback)))
          :timeout 30
          :error-callback (lambda (_key err)
                            (xcode-clean--notify

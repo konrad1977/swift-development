@@ -188,6 +188,8 @@ Set to nil to disable automatic simulator launching."
 (defvar swift-development--active-build-buffer nil
   "Buffer name for the active build process.")
 (defvar swift-development--compilation-time nil)
+(defvar swift-development--last-build-time nil
+  "Formatted build time string from the last completed build.")
 (defvar swift-development--last-build-succeeded nil
   "Track if the last build succeeded.
 nil = unknown/never built, t = success, \\='failed = failed.")
@@ -393,8 +395,8 @@ Returns the build context for further use."
                  (ios-device-install-app
                   :buildfolder folder
                   :appIdentifier app-id))
-             (swift-notification-progress-cancel 'swift-build)
-             (message "Error: Could not determine build folder after build")))
+              (swift-notification-progress-finish 'swift-build "Build folder not found")
+              (message "Error: Could not determine build folder after build")))
          :device-type :device)))))
 
 (defun swift-development-run-app-after-build ()
@@ -430,8 +432,8 @@ Returns the build context for further use."
                   :build-folder folder
                   :simulatorId sim-id
                   :appIdentifier app-id))
-             (swift-notification-progress-cancel 'swift-build)
-             (message "Error: Could not determine build folder after build")))
+              (swift-notification-progress-finish 'swift-build "Build folder not found")
+              (message "Error: Could not determine build folder after build")))
          :device-type :simulator)))))
 
 (defun swift-development-check-if-build-was-successful (input-text)
@@ -609,32 +611,61 @@ Returns a cons cell (PROCESS . LOG-BUFFER) where LOG-BUFFER accumulates the buil
                    (setq swift-development--active-build-process nil)
                    (setq swift-development--active-build-buffer nil)
                    (let ((exit-status (process-exit-status process)))
-                     (if (= exit-status 0)
+                      (if (= exit-status 0)
+                          (progn
+                            (setq swift-development--last-build-succeeded t)
+                            ;; Clear force flag after successful build
+                            (setq swift-development--force-next-build nil)
+                             ;; Finish progress bar on success
+                             (let ((build-time (swift-development--compilation-time)))
+                               (setq swift-development--last-build-time build-time)
+                               (run-with-timer
+                                0 nil
+                                (lambda ()
+                                  (when (fboundp 'swift-notification-progress-finish)
+                                    (swift-notification-progress-finish
+                                     'swift-build (format "Built in %ss" build-time))))))
+                            (when (and callback (functionp callback))
+                              (funcall callback "Build succeeded")))
+                         ;; Build failed - do NOT call callback to prevent installation
                          (progn
-                           (setq swift-development--last-build-succeeded t)
-                           ;; Clear force flag after successful build
-                           (setq swift-development--force-next-build nil)
-                           (when (and callback (functionp callback))
-                             (funcall callback "Build succeeded")))
-                       ;; Build failed - do NOT call callback to prevent installation
-                       (progn
-                         (setq swift-development--last-build-succeeded 'failed)
-                         ;; Extract actual error from build buffer
-                         (let* ((build-buf (get-buffer "*Swift Build*"))
-                                (error-msg (if (and build-buf (buffer-live-p build-buf))
-                                               (with-current-buffer build-buf
-                                                 (save-excursion
-                                                   (goto-char (point-max))
-                                                   ;; Look for actual xcodebuild errors
-                                                   (if (re-search-backward xcode-build-config-simple-error-pattern nil t)
-                                                       (buffer-substring-no-properties
-                                                        (line-beginning-position)
-                                                        (min (+ (point) 500) (point-max)))
-                                                     (format "Build failed with exit status %s" exit-status))))
-                                             (format "Build failed with exit status %s" exit-status))))
-                           (swift-development-handle-build-error error-msg))
-                         ;; Reset run-once-compiled to prevent installation
-                         (setq run-once-compiled nil)))))))))
+                           (setq swift-development--last-build-succeeded 'failed)
+                           ;; Finish progress bar with failure message
+                           (let ((build-time (swift-development--compilation-time)))
+                             (run-with-timer
+                              0 nil
+                              (lambda ()
+                                (when (fboundp 'swift-notification-progress-finish)
+                                  (swift-notification-progress-finish
+                                   'swift-build (format "Build failed (%ss)" build-time))))))
+                           ;; In compilation-mode the *Swift Build* buffer already
+                          ;; contains the full xcodebuild output with clickable
+                          ;; errors.  Do NOT call handle-build-error here because
+                          ;; it dispatches to swift-error-proxy-parse-output which
+                          ;; erases the buffer and replaces it with a truncated
+                          ;; error snippet.  Instead, just show a notification.
+                          (swift-development-cleanup)
+                          (let* ((build-buf (get-buffer "*Swift Build*"))
+                                 (error-summary
+                                  (if (and build-buf (buffer-live-p build-buf))
+                                      (with-current-buffer build-buf
+                                        (save-excursion
+                                          (goto-char (point-max))
+                                          (if (re-search-backward xcode-build-config-simple-error-pattern nil t)
+                                              (truncate-string-to-width
+                                               (buffer-substring-no-properties
+                                                (line-beginning-position) (line-end-position))
+                                               80)
+                                            (format "Build failed (exit %d)" exit-status))))
+                                    (format "Build failed (exit %d)" exit-status))))
+                            (when (fboundp 'xcode-project-notify)
+                              (xcode-project-notify
+                               :message (propertize error-summary 'face 'error)))
+                            ;; Display the compilation buffer so user can see errors
+                            (when (and build-buf (buffer-live-p build-buf))
+                              (display-buffer build-buf)))
+                          ;; Reset run-once-compiled to prevent installation
+                          (setq run-once-compiled nil)))))))))
           nil))
     ;; Async implementation with make-process
     (progn
@@ -669,129 +700,136 @@ Returns a cons cell (PROCESS . LOG-BUFFER) where LOG-BUFFER accumulates the buil
         
         ;; Don't display buffer automatically - user can switch to it manually if needed
         
-        (let ((process (make-process
-                        :name "xcodebuild-background"
-                        :buffer log-buffer
-                        ;; Use exec to ensure the shell waits for the command to complete
-                        :command (list shell-file-name shell-command-switch (concat "exec " command))
-                        :noquery t   ; Detach from Emacs process list
-                        :sentinel (let ((captured-default-directory default-directory))
-                                    (lambda (proc event)
-                                      (when (memq (process-status proc) '(exit signal))
-                                        ;; Restore default-directory for all operations in sentinel
-                                        (let ((default-directory captured-default-directory))
-                                          ;; Clear active process tracking
-                                          (setq swift-development--active-build-process nil)
-                                          (setq swift-development--active-build-buffer nil)
-                                          (spinner-stop swift-development--build-progress-spinner)
-                                          (let* ((exit-status (process-exit-status proc))
-                                                 (output (with-current-buffer log-buffer
-                                                           (buffer-string))))
-                                            (when swift-development-debug
-                                              (message "Build process exited with status: %d, event: %s"
-                                                       exit-status event))
-                                            ;; Check both exit status and output
-                                            (if (and (= exit-status 0)
-                                                     (swift-development-check-if-build-was-successful output))
-                                                (progn
-                                                  (setq swift-development--last-build-succeeded t)
-                                                  ;; Clear force flag after successful build
-                                                  (setq swift-development--force-next-build nil)
+        ;; Define the process filter BEFORE creating the process to avoid
+        ;; a race condition where fast-failing builds (e.g. missing
+        ;; OutputFileMap.json) produce all output before the filter is
+        ;; registered, resulting in an empty *Swift Build Output* buffer.
+        (let* ((process-filter-fn
+                (lambda (_proc string)
+                  ;; Save to log buffer
+                  (when (buffer-live-p log-buffer)
+                    (with-current-buffer log-buffer
+                      (goto-char (point-max))
+                      (insert string)))
+                  ;; Display output to visible buffer in real-time
+                  (when (buffer-live-p output-buffer)
+                    (with-current-buffer output-buffer
+                      (let ((inhibit-read-only t))
+                        (goto-char (point-max))
+                        (insert string)
+                        ;; Auto-scroll to bottom
+                        (let ((windows (get-buffer-window-list output-buffer nil t)))
+                          (dolist (window windows)
+                            (with-selected-window window
+                              (goto-char (point-max))
+                              (recenter -1)))))))
+                  ;; Update progress bar based on build phase (only if going forward)
+                  ;; Use run-with-timer to avoid "call-process recursively" in filter
+                  (let ((new-progress nil)
+                        (new-message nil))
+                    (cond
+                     ((string-match-p "Compiling\\|CompileC\\|CompileSwift" string)
+                      (setq new-progress 15 new-message "Compiling..."))
+                     ((string-match-p "Linking\\|Ld " string)
+                      (setq new-progress 40 new-message "Linking..."))
+                     ((string-match-p "CodeSign\\|Signing" string)
+                      (setq new-progress 50 new-message "Signing..."))
+                     ((string-match-p "Touch\\|CpResource\\|ProcessInfoPlist" string)
+                      (setq new-progress 55 new-message "Finishing...")))
+                    ;; Only update if new progress is higher than current
+                    (when (and new-progress
+                               (> new-progress swift-development--current-build-progress))
+                      (setq swift-development--current-build-progress new-progress)
+                      (run-with-timer
+                       0 nil
+                       (lambda ()
+                         (when (fboundp 'swift-notification-progress-update)
+                           (swift-notification-progress-update 'swift-build
+                                                               :percent new-progress
+                                                               :message new-message))))))
+                  ;; Call update callback if provided
+                  (when (and update-callback (functionp update-callback))
+                    (funcall update-callback string))))
+               (process (make-process
+                         :name "xcodebuild-background"
+                         :buffer log-buffer
+                         ;; Use exec to ensure the shell waits for the command to complete
+                         :command (list shell-file-name shell-command-switch (concat "exec " command))
+                         :noquery t   ; Detach from Emacs process list
+                         :filter process-filter-fn
+                         :sentinel (let ((captured-default-directory default-directory))
+                                     (lambda (proc event)
+                                       (when (memq (process-status proc) '(exit signal))
+                                         ;; Restore default-directory for all operations in sentinel
+                                         (let ((default-directory captured-default-directory))
+                                           ;; Clear active process tracking
+                                           (setq swift-development--active-build-process nil)
+                                           (setq swift-development--active-build-buffer nil)
+                                           (spinner-stop swift-development--build-progress-spinner)
+                                           (let* ((exit-status (process-exit-status proc))
+                                                  (output (with-current-buffer log-buffer
+                                                            (buffer-string))))
+                                             (when swift-development-debug
+                                               (message "Build process exited with status: %d, event: %s"
+                                                        exit-status event))
+                                             ;; Check both exit status and output
+                                             (if (and (= exit-status 0)
+                                                      (swift-development-check-if-build-was-successful output))
+                                                 (progn
+                                                   (setq swift-development--last-build-succeeded t)
+                                                   ;; Clear force flag after successful build
+                                                   (setq swift-development--force-next-build nil)
+                                                   (when (buffer-live-p output-buffer)
+                                                     (with-current-buffer output-buffer
+                                                       (let ((inhibit-read-only t))
+                                                         (goto-char (point-max))
+                                                         (insert "\nBUILD SUCCEEDED\n"))))
+                                                   ;; Update progress to 60% (build done, ready for install)
+                                                   (setq swift-development--current-build-progress 60)
+                                                   ;; Use run-with-timer to avoid "call-process recursively"
+                                                     (let ((build-time (swift-development--compilation-time)))
+                                                       (setq swift-development--last-build-time build-time)
+                                                       (run-with-timer
+                                                        0 nil
+                                                        (lambda ()
+                                                          (when (fboundp 'swift-notification-progress-update)
+                                                            (swift-notification-progress-update
+                                                             'swift-build :percent 60
+                                                             :message (format "Built in %ss" build-time))))))
+                                                   ;; Run xcode-build-server parse asynchronously
+                                                   (swift-development-run-xcode-build-server-parse output)
+                                                   ;; Extract incremental build commands for next time
+                                                   (when (fboundp 'swift-incremental-build-extract-from-build-output)
+                                                     (run-with-timer
+                                                      0.5 nil
+                                                      #'swift-incremental-build-extract-from-build-output output))
+                                                   (when (and callback (functionp callback))
+                                                     (funcall callback output))
+                                                   (swift-development-cleanup))
+                                                 (progn
+                                                   (setq swift-development--last-build-succeeded 'failed)
+                                                    ;; Finish progress bar with failure message (use timer to avoid recursive call-process)
+                                                    (let ((build-time (swift-development--compilation-time)))
+                                                      (run-with-timer
+                                                       0 nil
+                                                       (lambda ()
+                                                         (when (fboundp 'swift-notification-progress-finish)
+                                                           (swift-notification-progress-finish
+                                                            'swift-build (format "Build failed (%ss)" build-time))))))
                                                   (when (buffer-live-p output-buffer)
-                                                    (with-current-buffer output-buffer
-                                                      (let ((inhibit-read-only t))
-                                                        (goto-char (point-max))
-                                                        (insert "\nBUILD SUCCEEDED\n"))))
-                                                  ;; Update progress to 60% (build done, ready for install)
-                                                  (setq swift-development--current-build-progress 60)
-                                                  ;; Use run-with-timer to avoid "call-process recursively"
-                                                  (run-with-timer
-                                                   0 nil
-                                                   (lambda ()
-                                                     (when (fboundp 'swift-notification-progress-update)
-                                                       (swift-notification-progress-update
-                                                        'swift-build :percent 60 :message "Build complete"))))
-                                                  ;; Run xcode-build-server parse asynchronously
-                                                  (swift-development-run-xcode-build-server-parse output)
-                                                  ;; Extract incremental build commands for next time
-                                                  (when (fboundp 'swift-incremental-build-extract-from-build-output)
-                                                    (run-with-timer
-                                                     0.5 nil
-                                                     #'swift-incremental-build-extract-from-build-output output))
-                                                  (when (and callback (functionp callback))
-                                                    (funcall callback output))
-                                                  (swift-development-cleanup))
-                                              (progn
-                                                (setq swift-development--last-build-succeeded 'failed)
-                                                ;; Cancel progress bar on failure (use timer to avoid recursive call-process)
-                                                (run-with-timer
-                                                 0 nil
-                                                 (lambda ()
-                                                   (when (fboundp 'swift-notification-progress-cancel)
-                                                     (swift-notification-progress-cancel 'swift-build))))
-                                                (when (buffer-live-p output-buffer)
-                                                  (with-current-buffer output-buffer
-                                                    (let ((inhibit-read-only t))
-                                                      (goto-char (point-max))
-                                                      (insert (format "\nBUILD FAILED (exit status: %d)\n" exit-status)))))
-                                                ;; Run xcode-build-server parse for errors too
-                                                (swift-development-run-xcode-build-server-parse output)
-                                                (swift-development-handle-build-error output)))
-                                            (when (buffer-live-p log-buffer)
-                                              (kill-buffer log-buffer))))))))))
-
-          ;; Configure process handling
-          (set-process-query-on-exit-flag process nil)
+                                                   (with-current-buffer output-buffer
+                                                     (let ((inhibit-read-only t))
+                                                       (goto-char (point-max))
+                                                       (insert (format "\nBUILD FAILED (exit status: %d)\n" exit-status)))))
+                                                 ;; Run xcode-build-server parse for errors too
+                                                 (swift-development-run-xcode-build-server-parse output)
+                                                 (swift-development-handle-build-error output)))
+                                             (when (buffer-live-p log-buffer)
+                                               (kill-buffer log-buffer))))))))))
 
           ;; Track active build process
           (setq swift-development--active-build-process process)
           (setq swift-development--active-build-buffer (buffer-name log-buffer))
-
-          ;; Start async output processing - show output in real-time
-          (set-process-filter process
-                              (lambda (_proc string)
-                                ;; Save to log buffer
-                                (with-current-buffer log-buffer
-                                  (goto-char (point-max))
-                                  (insert string))
-                                ;; Display output to visible buffer in real-time
-                                (with-current-buffer output-buffer
-                                  (let ((inhibit-read-only t))
-                                    (goto-char (point-max))
-                                    (insert string)
-                                    ;; Auto-scroll to bottom
-                                    (let ((windows (get-buffer-window-list output-buffer nil t)))
-                                      (dolist (window windows)
-                                        (with-selected-window window
-                                          (goto-char (point-max))
-                                          (recenter -1))))))
-                                ;; Update progress bar based on build phase (only if going forward)
-                                ;; Use run-with-timer to avoid "call-process recursively" in filter
-                                (let ((new-progress nil)
-                                      (new-message nil))
-                                  (cond
-                                   ((string-match-p "Compiling\\|CompileC\\|CompileSwift" string)
-                                    (setq new-progress 15 new-message "Compiling..."))
-                                   ((string-match-p "Linking\\|Ld " string)
-                                    (setq new-progress 40 new-message "Linking..."))
-                                   ((string-match-p "CodeSign\\|Signing" string)
-                                    (setq new-progress 50 new-message "Signing..."))
-                                   ((string-match-p "Touch\\|CpResource\\|ProcessInfoPlist" string)
-                                    (setq new-progress 55 new-message "Finishing...")))
-                                  ;; Only update if new progress is higher than current
-                                  (when (and new-progress
-                                             (> new-progress swift-development--current-build-progress))
-                                    (setq swift-development--current-build-progress new-progress)
-                                    (run-with-timer
-                                     0 nil
-                                     (lambda ()
-                                       (when (fboundp 'swift-notification-progress-update)
-                                         (swift-notification-progress-update 'swift-build
-                                                                             :percent new-progress
-                                                                             :message new-message))))))
-                                ;; Call update callback if provided
-                                (when (and update-callback (functionp update-callback))
-                                  (funcall update-callback string))))
 
           (swift-development-log-debug "Running command: %s" command)
           (cons process log-buffer))))))
@@ -850,6 +888,7 @@ RUN should be non-nil to actually launch the app."
 (cl-defun swift-development-compile (&key run force)
   "Build project using xcodebuild (as RUN).
 If FORCE is non-nil, always recompile even if sources are unchanged."
+  (let ((compile-start-time (current-time)))
 
    ;; Clear error list immediately at build start
   (swift-error-proxy-clear)
@@ -867,21 +906,34 @@ If FORCE is non-nil, always recompile even if sources are unchanged."
       (progn
         ;; Setup current project first to ensure settings are loaded
         ;; Handles project switching - fast when project hasn't changed
-        (when (fboundp 'xcode-project-setup-current-project)
-          (xcode-project-setup-current-project (swift-project-root)))
+        (let ((t0 (current-time)))
+          (when (fboundp 'xcode-project-setup-current-project)
+            (xcode-project-setup-current-project (swift-project-root)))
+          (when swift-development-debug
+            (message "[Timing] setup-current-project: %.0fms"
+                     (* 1000 (float-time (time-subtract (current-time) t0))))))
 
         ;; Start simulator early (async, non-blocking) so it's ready when build completes
-        (when (and run (not (eq swift-development--device-choice t)))
-          (require 'ios-simulator)
-          (let ((sim-id (ios-simulator-simulator-identifier)))
-            (when sim-id
-              (ios-simulator-setup-simulator-dwim sim-id))))
+        (let ((t0 (current-time)))
+          (when (and run (not (eq swift-development--device-choice t)))
+            (require 'ios-simulator)
+            (let ((sim-id (ios-simulator-simulator-identifier)))
+              (when sim-id
+                (ios-simulator-setup-simulator-dwim sim-id))))
+          (when swift-development-debug
+            (message "[Timing] simulator-setup: %.0fms"
+                     (* 1000 (float-time (time-subtract (current-time) t0))))))
 
         ;; Check if rebuild is needed (fast synchronous check)
         ;; force-full-build bypasses this check too
         (if (and (not force)
                  (not swift-development--force-full-build)
-                 (not (swift-development-needs-rebuild-p)))
+                 (not (let ((t0 (current-time))
+                            (result (swift-development-needs-rebuild-p)))
+                        (when swift-development-debug
+                          (message "[Timing] needs-rebuild-p: %.0fms"
+                                   (* 1000 (float-time (time-subtract (current-time) t0)))))
+                        result)))
             (progn
               ;; Finish progress bar - build was skipped
               (when (fboundp 'swift-notification-progress-finish)
@@ -896,7 +948,12 @@ If FORCE is non-nil, always recompile even if sources are unchanged."
                    (not swift-development--force-full-build)
                    (not (eq swift-development--device-choice t)) ;; simulator only
                    (fboundp 'swift-incremental-build-ready-p)
-                   (swift-incremental-build-ready-p))
+                   (let ((t0 (current-time))
+                         (result (swift-incremental-build-ready-p)))
+                     (when swift-development-debug
+                       (message "[Timing] incremental-build-ready-p: %.0fms"
+                                (* 1000 (float-time (time-subtract (current-time) t0)))))
+                     result))
               (progn
                 ;; Cancel the swift-build progress (incremental has its own)
                 (when (fboundp 'swift-notification-progress-cancel)
@@ -919,7 +976,10 @@ If FORCE is non-nil, always recompile even if sources are unchanged."
         ;; Cancel progress bar - not a valid project
         (when (fboundp 'swift-notification-progress-cancel)
           (swift-notification-progress-cancel 'swift-build))
-        (swift-notification-send :message "Not xcodeproject nor swift package" :seconds 3)))))
+        (swift-notification-send :message "Not xcodeproject nor swift package" :seconds 3))))
+  (when swift-development-debug
+    (message "[Timing] swift-development-compile total: %.0fms"
+             (* 1000 (float-time (time-subtract (current-time) compile-start-time)))))))
 
 (cl-defun swift-development--do-compile (&key run)
   "Internal function to perform the actual compilation.
@@ -1042,19 +1102,33 @@ expensive recursive search.  Returns the first matching file or nil."
 (cl-defun swift-development--compile-target (&key run for-device)
   "Internal compile function for both simulator and device targets.
 RUN: run app after build.  FOR-DEVICE: t for physical device, nil for simulator."
+  (let ((t-target (current-time)) t0)
   (swift-development-cleanup)
+  (setq t0 (current-time))
   (xcode-build-config-setup-build-environment :for-device for-device)
   (xcode-build-config-enable-build-caching)
+  (when swift-development-debug
+    (message "[Timing] setup-build-env: %.0fms"
+             (* 1000 (float-time (time-subtract (current-time) t0)))))
   (setq swift-development--current-build-command nil)
   ;; Clear build folder cache to ensure fresh detection
   (setq xcode-project--current-build-folder nil
         xcode-project--last-device-type nil)
+  (setq t0 (current-time))
   (xcode-project-setup-project)
+  (when swift-development-debug
+    (message "[Timing] compile-target/setup-project: %.0fms"
+             (* 1000 (float-time (time-subtract (current-time) t0)))))
   (setq run-once-compiled run)
 
   ;; Capture build context before async build starts
+  (setq t0 (current-time))
   (swift-development--capture-build-context for-device)
+  (when swift-development-debug
+    (message "[Timing] capture-build-context: %.0fms"
+             (* 1000 (float-time (time-subtract (current-time) t0)))))
 
+  (setq t0 (current-time))
   (let* ((build-command (if for-device
                             (xcode-build-config-build-app-command
                              :device-id (ios-device-udid))
@@ -1071,7 +1145,8 @@ RUN: run app after build.  FOR-DEVICE: t for physical device, nil for simulator.
                          #'swift-development-run-app-after-build)))
 
     (when swift-development-debug
-      (swift-development-log-debug "Build-folder: %s" (xcode-project-derived-data-path)))
+      (swift-development-log-debug "Build-folder: %s"
+                                   (or xcode-project--current-build-folder "not cached")))
 
     (when (fboundp 'xcode-project-notify)
       (xcode-project-notify
@@ -1098,7 +1173,13 @@ RUN: run app after build.  FOR-DEVICE: t for physical device, nil for simulator.
                    (if run-once-compiled
                        (funcall run-callback)
                      (swift-development-successful-build)))
-       :update-callback nil))))
+       :update-callback nil))
+    (when swift-development-debug
+      (message "[Timing] build-command+start: %.0fms"
+               (* 1000 (float-time (time-subtract (current-time) t0)))))
+    (when swift-development-debug
+      (message "[Timing] compile-target total: %.0fms"
+               (* 1000 (float-time (time-subtract (current-time) t-target))))))))
 
 (cl-defun swift-development-compile-for-simulator (&key run)
   "Compile app for simulator with optional RUN after completion."
@@ -1323,16 +1404,27 @@ CACHE-KEY if non-nil will be used to cache results."
 
 
 (defun swift-development-get-built-app-path ()
-  "Get path to the built .app bundle."
+  "Get path to the built .app bundle.
+Uses fast methods only (no xcodebuild calls).  Tries build-folder
+glob first, then derives product name from scheme."
   (let* ((build-folder (xcode-project-build-folder
                        :device-type (if (xcode-project-run-in-simulator)
                                         :simulator
-                                      :device)))
-         (product-name (xcode-project-product-name))
-         (app-path (when (and build-folder product-name)
-                    (expand-file-name (format "%s.app" product-name) build-folder))))
-    (when (and app-path (file-exists-p app-path))
-      app-path)))
+                                      :device))))
+    (when (and build-folder (file-directory-p build-folder))
+      ;; Fast path: find .app in build folder directly (no xcodebuild needed)
+      (let ((app-bundles (directory-files build-folder t "\\.app\\'" t)))
+        (if app-bundles
+            ;; Return the first .app found (typically only one)
+            (car app-bundles)
+          ;; Fallback: derive from scheme name (still no xcodebuild)
+          (when-let* ((scheme xcode-project--current-xcode-scheme)
+                      (name (if (string-match "^\\([^(]+\\)\\s-*(.*)" scheme)
+                                (string-trim (match-string 1 scheme))
+                              scheme))
+                      (app-path (expand-file-name (format "%s.app" name) build-folder)))
+            (when (file-exists-p app-path)
+              app-path)))))))
 
 (defun swift-development-get-last-modified-file ()
   "Get the most recently modified source file in project.
@@ -2031,6 +2123,14 @@ The flag is automatically cleared after one build."
   (message "Next build will use full xcodebuild"))
 
 ;;;###autoload
+(defun swift-development-toggle-incremental-build ()
+  "Toggle incremental builds on or off permanently."
+  (interactive)
+  (if (fboundp 'swift-incremental-build-toggle)
+      (swift-incremental-build-toggle)
+    (message "Incremental build module not loaded")))
+
+;;;###autoload
 (defun swift-development-compile-app ()
   "Compile app."
   (interactive)
@@ -2064,11 +2164,22 @@ The flag is automatically cleared after one build."
 
 ;;;###autoload
 (defun swift-development-clear-derived-data ()
-  "Clear Xcode's DerivedData folder to fix stubborn build issues."
+  "Clear Xcode's DerivedData folder to fix stubborn build issues.
+Also invalidates the incremental build cache since the cached
+commands reference artifacts inside the build directory."
   (interactive)
   (let ((derived-data-path (expand-file-name "~/Library/Developer/Xcode/DerivedData"))
         (project-build-path (expand-file-name ".build" (xcode-project-project-root))))
-    
+
+    ;; Invalidate incremental build cache — cached swiftc commands
+    ;; reference files (OutputFileMap.json, .swiftdeps, etc.) that
+    ;; live inside .build/ and will no longer exist after cleaning.
+    (when (fboundp 'swift-incremental-build-clear-cache)
+      (swift-incremental-build-clear-cache))
+
+    ;; Force next build to use full xcodebuild
+    (setq swift-development--force-full-build t)
+
     ;; First clear project-specific build folder
     (when (file-directory-p project-build-path)
       (message "Clearing project build folder at %s..." project-build-path)
@@ -2637,6 +2748,11 @@ even when some files have errors, showing all errors at once."
    (format "Analysis: %s"
            (propertize (symbol-name swift-development-analysis-mode) 'face 'font-lock-constant-face))
    " | "
+   (format "Incremental: %s"
+           (if (and (boundp 'swift-incremental-build-enabled) swift-incremental-build-enabled)
+               (propertize "ON" 'face 'success)
+             (propertize "OFF" 'face 'font-lock-comment-face)))
+   " | "
    (format "Continue after errors: %s"
            (if xcode-build-config-continue-building-after-errors
                (propertize "ON" 'face 'success)
@@ -2653,6 +2769,8 @@ even when some files have errors, showing all errors at once."
   [:description swift-development--settings-status]
   ["Build Behavior"
    [("e" "Toggle continue after errors" swift-development-toggle-continue-after-errors)
+    ("i" "Toggle incremental builds" swift-development-toggle-incremental-build)
+    ("f" "Force next build to xcodebuild" swift-development-force-full-build)
     ("p" "Toggle package resolution" swift-development-toggle-package-resolution)
     ("P" "Toggle periphery mode" swift-development-toggle-periphery-mode)]]
   ["Analysis Mode"
@@ -2723,6 +2841,7 @@ even when some files have errors, showing all errors at once."
   ["Quick Settings"
    [("D" "Toggle debug" swift-development-toggle-debug)
     ("A" "Toggle analysis" swift-development-toggle-analysis-mode)
+    ("I" "Toggle incremental builds" swift-development-toggle-incremental-build)
     ("T" "Toggle device/sim" swift-development-toggle-device-choice)
     ("O" "Toggle build output" swift-development-toggle-build-output)
     ("e" "Toggle continue after errors" swift-development-toggle-continue-after-errors)]

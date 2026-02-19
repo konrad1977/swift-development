@@ -188,6 +188,247 @@ which Xcode adds automatically to all external dependencies."
   (when-let* ((data (gethash module-name swift-incremental-build--module-commands)))
     (plist-get data :third-party)))
 
+;;; Source file synchronization
+;;
+;; When new .swift files are added to (or removed from) a module,
+;; the cached compile command becomes stale because it references a
+;; fixed file list.  The functions below detect source changes on
+;; disk and patch SwiftFileList / compile command before compilation.
+
+(defun swift-incremental-build--common-source-directory (files)
+  "Find the common parent directory of source FILES.
+For SPM modules this is typically .../Sources/<Module>/."
+  (when files
+    (let ((dirs (mapcar #'file-name-directory files)))
+      (let ((prefix (car dirs)))
+        (while (and prefix
+                    (not (cl-every (lambda (d) (string-prefix-p prefix d)) dirs)))
+          (setq prefix (file-name-directory
+                        (directory-file-name prefix))))
+        prefix))))
+
+(defun swift-incremental-build--module-source-directory (module-name)
+  "Derive the source directory for MODULE-NAME.
+Tries the SwiftFileList first (from :file-lists on the cached data).
+Falls back to parsing .swift paths from the compile-command string.
+Returns the common parent directory, or nil.
+Returns nil for modules whose sources span the project root (e.g.
+the main app target) since a recursive scan would be too broad."
+  (when-let* ((data (gethash module-name swift-incremental-build--module-commands)))
+    (let ((dir
+           (or
+            ;; Primary: read paths from SwiftFileList
+            (when-let* ((file-lists (plist-get data :file-lists))
+                        (fl (car file-lists))
+                        ((stringp fl))
+                        ((file-exists-p fl)))
+              (with-temp-buffer
+                (insert-file-contents fl)
+                (let ((files (split-string (buffer-string) "\n" t)))
+                  (swift-incremental-build--common-source-directory files))))
+            ;; Fallback: parse .swift paths from the compile-command string
+            (when-let* ((cmd (plist-get data :compile-command)))
+              (swift-incremental-build--common-source-directory
+               (swift-incremental-build--extract-swift-files-from-command cmd))))))
+      ;; Safety: only return the directory if it looks like an SPM Sources dir
+      ;; or is otherwise narrow enough.  If the common dir is the project root
+      ;; or contains DerivedSources from multiple modules, the recursive scan
+      ;; would pick up thousands of unrelated files.
+      (when (and dir (string-match-p "/Sources/" dir))
+        dir))))
+
+(defun swift-incremental-build--discover-current-sources (source-dir)
+  "Find all .swift files recursively under SOURCE-DIR.
+Returns a sorted list of absolute paths."
+  (when (and source-dir (file-directory-p source-dir))
+    (sort (directory-files-recursively source-dir "\\.swift\\'")
+          #'string<)))
+
+(defun swift-incremental-build--extract-swift-files-from-command (command)
+  "Extract .swift file paths from COMMAND string.
+Returns a sorted list of absolute paths found in the command."
+  (let ((files '())
+        (start 0))
+    (while (string-match " \\(/[^ ]*\\.swift\\)\\b" command start)
+      (push (match-string 1 command) files)
+      (setq start (match-end 0)))
+    (sort files #'string<)))
+
+(defun swift-incremental-build--read-filelist-paths (command)
+  "Extract file paths from @SwiftFileList references in COMMAND.
+Returns a list of absolute .swift file paths, or nil."
+  (let ((fl-files '())
+        (start 0))
+    (while (string-match "@\\(/[^ ]*\\)" command start)
+      (let ((fl-path (match-string 1 command)))
+        (when (and (stringp fl-path) (file-exists-p fl-path))
+          (with-temp-buffer
+            (insert-file-contents fl-path)
+            (setq fl-files
+                  (append fl-files
+                          (split-string (buffer-string) "\n" t))))))
+      (setq start (match-end 0)))
+    fl-files))
+
+(defun swift-incremental-build--deduplicate-filenames-in-command (command module-name)
+  "Remove .swift files with duplicate basenames from COMMAND.
+Swift's per-file compilation mode forbids multiple files sharing the
+same filename (even in different directories) because filenames are
+used to distinguish private declarations.  This commonly happens in
+app targets that include DerivedSources from multiple dependencies
+\(e.g. GeneratedAssetSymbols.swift from several asset catalogs).
+
+Checks both inline .swift paths and files listed in @SwiftFileList.
+When duplicates are found in a filelist, rewrites the filelist file.
+When duplicates are found inline, removes them from the command string.
+Keeps the file that belongs to MODULE-NAME's own build directory.
+Returns the cleaned command string (unchanged if no duplicates)."
+  (let* ((inline-files (swift-incremental-build--extract-swift-files-from-command command))
+         (filelist-files (swift-incremental-build--read-filelist-paths command))
+         (all-files (append inline-files filelist-files))
+         (seen (make-hash-table :test 'equal))   ;; basename -> list of paths
+         (has-dupes nil))
+    ;; Group all files by basename
+    (dolist (f all-files)
+      (let ((basename (file-name-nondirectory f)))
+        (puthash basename (cons f (gethash basename seen)) seen)))
+    ;; Check for duplicates
+    (maphash (lambda (_basename paths)
+               (when (> (length paths) 1)
+                 (setq has-dupes t)))
+             seen)
+    (if (not has-dupes)
+        command
+      ;; Build set of files to remove: for each duplicate basename,
+      ;; keep the one belonging to this module, remove the rest.
+      (let ((to-remove '())
+            (module-pattern (format "/%s\\.build/" (regexp-quote module-name))))
+        (maphash
+         (lambda (_basename paths)
+           (when (> (length paths) 1)
+             ;; Prefer the path matching this module's build dir
+             (let ((own (cl-find-if
+                         (lambda (p) (string-match-p module-pattern p))
+                         paths)))
+               (dolist (p paths)
+                 (unless (equal p (or own (car paths)))
+                   (push p to-remove))))))
+         seen)
+        (when to-remove
+          (swift-incremental-build--log
+           "Removing %d duplicate-filename source files from %s compile command: %s"
+           (length to-remove) module-name
+           (mapconcat #'file-name-nondirectory to-remove ", "))
+          ;; Remove from inline paths in command string
+          (let ((result command))
+            (dolist (f to-remove)
+              (setq result (replace-regexp-in-string
+                            (concat " " (regexp-quote f) "\\b") "" result)))
+            ;; Also rewrite any @SwiftFileList files that contained duplicates
+            (let ((start 0))
+              (while (string-match "@\\(/[^ ]*\\)" command start)
+                (let ((fl-path (match-string 1 command)))
+                  (when (and (stringp fl-path) (file-exists-p fl-path))
+                    (let* ((fl-contents (with-temp-buffer
+                                          (insert-file-contents fl-path)
+                                          (split-string (buffer-string) "\n" t)))
+                           (cleaned (cl-remove-if
+                                     (lambda (f) (member f to-remove))
+                                     fl-contents)))
+                      (when (< (length cleaned) (length fl-contents))
+                        (with-temp-file fl-path
+                          (insert (mapconcat #'identity cleaned "\n") "\n"))
+                        (swift-incremental-build--log
+                         "Rewrote SwiftFileList %s (removed %d duplicates)"
+                         fl-path (- (length fl-contents) (length cleaned)))))))
+                (setq start (match-end 0))))
+            result))))))
+
+(defun swift-incremental-build--sync-module-sources (module-name)
+  "Synchronize source file list for MODULE-NAME with files on disk.
+If new files have been added or old files removed, updates:
+ - The SwiftFileList file (for commands using @filelist)
+ - The compile-command string (for commands with inline file paths)
+Returns non-nil if the file list was updated."
+  (when-let* ((data (gethash module-name swift-incremental-build--module-commands))
+              (source-dir (swift-incremental-build--module-source-directory module-name)))
+    (let* ((disk-files (swift-incremental-build--discover-current-sources source-dir))
+           (file-lists (plist-get data :file-lists))
+           (fl-path (and file-lists (car file-lists)))
+           (old-files
+            (or
+             ;; Primary: read from SwiftFileList
+             (when (and fl-path (stringp fl-path) (file-exists-p fl-path))
+               (with-temp-buffer
+                 (insert-file-contents fl-path)
+                 (sort (split-string (buffer-string) "\n" t) #'string<)))
+             ;; Fallback: parse from compile-command
+             (when-let* ((cmd (plist-get data :compile-command)))
+               (swift-incremental-build--extract-swift-files-from-command cmd))))
+           (changed (not (equal disk-files old-files))))
+      (when (and changed disk-files)
+        (swift-incremental-build--log
+         "Source files changed for %s: %d on disk vs %d cached"
+         module-name (length disk-files) (length (or old-files '())))
+        ;; 1) Update the SwiftFileList file (used by @filelist commands)
+        (when (and fl-path (stringp fl-path))
+          (with-temp-file fl-path
+            (insert (mapconcat #'identity disk-files "\n") "\n"))
+          (swift-incremental-build--log
+           "Updated SwiftFileList: %s" fl-path))
+        ;; 2) Patch inline file paths in the compile-command string.
+        ;;    Build-log commands list .swift files directly instead of @filelist.
+        (when-let* ((compile-cmd (plist-get data :compile-command))
+                    ((not (string-match-p "@/" compile-cmd))))
+          (let ((patched (swift-incremental-build--patch-inline-sources
+                          compile-cmd old-files disk-files)))
+            (when patched
+              (puthash module-name
+                       (plist-put data :compile-command patched)
+                       swift-incremental-build--module-commands)
+              (swift-incremental-build--log
+               "Patched inline sources in compile-command for %s"
+               module-name))))
+        ;; 3) Rebuild dependency graph since new files may add imports
+        (swift-incremental-build--log
+         "Scheduling dependency graph rebuild for new source files")
+        (swift-incremental-build--build-dependency-graph)
+        t))))
+
+(defun swift-incremental-build--patch-inline-sources (command old-files new-files)
+  "Patch COMMAND string, replacing OLD-FILES with NEW-FILES.
+The command is a shell string where .swift paths appear as arguments.
+Returns the patched command, or nil if no old files were found."
+  (let ((added (cl-set-difference new-files old-files :test #'equal))
+        (removed (cl-set-difference old-files new-files :test #'equal))
+        (result command)
+        (patched nil))
+    ;; Remove deleted files from command
+    (dolist (f removed)
+      (let ((escaped (regexp-quote f)))
+        ;; Match the file path possibly preceded/followed by space
+        (when (string-match-p escaped result)
+          (setq result (replace-regexp-in-string
+                        (concat " " escaped "\\b") "" result))
+          (setq patched t))))
+    ;; Add new files to command — insert them right before the first
+    ;; existing .swift file so they appear in the file list portion.
+    (when added
+      (let ((insertion (mapconcat (lambda (f) (concat " " f)) added "")))
+        ;; Find first .swift reference in the command to insert before
+        (if (string-match " /[^ ]*\\.swift\\b" result)
+            (setq result (concat (substring result 0 (match-beginning 0))
+                                 insertion
+                                 (substring result (match-beginning 0)))
+                  patched t)
+          ;; Fallback: append before -module-name
+          (when (string-match " -module-name " result)
+            (setq result (concat (substring result 0 (match-beginning 0))
+                                 insertion
+                                 (substring result (match-beginning 0)))
+                  patched t)))))
+    (when patched result)))
+
 ;;; Module detection
 
 (defun swift-incremental-build--detect-module (&optional file)
@@ -794,10 +1035,12 @@ Handles quoted paths with spaces."
   ;; We run via shell to handle the complex quoting from xcodebuild logs
   (list "bash" "-c" cmd-string))
 
-(defun swift-incremental-build--run-step (name command callback &optional working-dir)
+(defun swift-incremental-build--run-step (name command callback &optional working-dir filter-fn)
   "Run a build step NAME with COMMAND (string), calling CALLBACK on success.
 CALLBACK receives the process exit code.
-WORKING-DIR overrides default-directory if provided."
+WORKING-DIR overrides default-directory if provided.
+FILTER-FN, if non-nil, is called with each chunk of process output
+for real-time progress updates (output is still saved to the buffer)."
   (swift-incremental-build--log "Running step: %s" name)
   (let ((default-directory (or working-dir
                                (xcode-project-project-root)
@@ -810,8 +1053,18 @@ WORKING-DIR overrides default-directory if provided."
     (let ((process
            (make-process
             :name (format "swift-incr-%s" name)
-            :buffer output-buffer
+            :buffer nil  ;; We handle buffer output in the filter
             :command (swift-incremental-build--shell-command-to-list command)
+            :filter
+            (lambda (proc string)
+              ;; Always append to output buffer
+              (when (buffer-live-p output-buffer)
+                (with-current-buffer output-buffer
+                  (goto-char (point-max))
+                  (insert string)))
+              ;; Call custom filter for progress updates
+              (when (and filter-fn (functionp filter-fn))
+                (funcall filter-fn proc string)))
             :sentinel
             (lambda (proc _event)
               (when (memq (process-status proc) '(exit signal))
@@ -827,18 +1080,29 @@ WORKING-DIR overrides default-directory if provided."
 Shows error from OUTPUT-BUFFER.  When the linker reports undefined
 symbols (cross-module API mismatch), attempts cascade rebuild of
 downstream modules first.  If cascade was already attempted (or no
-downstream modules exist), falls back to full xcodebuild."
+downstream modules exist), falls back to full xcodebuild.
+Compile step failures also fall back to xcodebuild automatically."
   (let* ((elapsed (swift-incremental-build--elapsed-time))
          (output (when (buffer-live-p output-buffer)
                    (with-current-buffer output-buffer
                      (buffer-substring-no-properties (point-min) (point-max)))))
          (linker-mismatch (and output
-                               (string-match-p "Undefined symbols" output))))
+                               (string-match-p "Undefined symbols" output)))
+         (filename-collision (and output
+                                  (string-match-p "filename .* used twice" output)))
+         (is-compile-step (string-prefix-p "compile-" step-name)))
     (swift-incremental-build--log "FAILED: %s (exit %d) after %s" step-name exit-code elapsed)
     ;; Cancel progress
     (when (fboundp 'swift-notification-progress-cancel)
       (swift-notification-progress-cancel 'swift-incremental))
     (cond
+     ;; Duplicate filename error — cannot be fixed incrementally,
+     ;; fall back to full xcodebuild immediately.
+     (filename-collision
+      (swift-incremental-build--log
+       "Filename collision detected in %s, falling back to xcodebuild" step-name)
+      (swift-incremental-build--fallback-to-xcodebuild))
+
      ;; Linker mismatch + cascade not yet attempted -> try cascade
      ((and linker-mismatch
            (not swift-incremental-build--cascade-attempted)
@@ -890,7 +1154,14 @@ downstream modules exist), falls back to full xcodebuild."
        "Cascade failed, falling back to full xcodebuild")
       (swift-incremental-build--fallback-to-xcodebuild))
 
-     ;; Other failure — show error as before
+     ;; Compile step failure — fall back to xcodebuild since the
+     ;; cached swiftc command may be stale or incompatible.
+     (is-compile-step
+      (swift-incremental-build--log
+       "Compile step %s failed, falling back to xcodebuild" step-name)
+      (swift-incremental-build--fallback-to-xcodebuild))
+
+     ;; Other failure (codesign, patch, etc.) — show error
      (t
       (when (fboundp 'xcode-project-notify)
         (xcode-project-notify
@@ -932,29 +1203,122 @@ Used when cascade rebuild is not possible or has failed."
 
 ;;; Pipeline steps
 
-(defun swift-incremental-build--step-compile-module (module-name callback)
-  "Compile MODULE-NAME using cached swiftc command.
-Strips `-experimental-emit-module-separately' so the module is
-emitted inline.  Calls CALLBACK on success."
+(defun swift-incremental-build--module-working-dir (module-name)
+  "Return the working directory for MODULE-NAME.
+When the module was loaded from a .compile database the original
+`:directory' field is used.  Otherwise falls back to the module
+build directory under Intermediates.noindex so that build
+artefacts (.o, .d, .dia, .swiftdeps, .swiftconstvalues) never
+end up in the project root."
   (let* ((module-data (gethash module-name swift-incremental-build--module-commands))
-         (compile-cmd (plist-get module-data :compile-command))
-         ;; Remove -experimental-emit-module-separately so .swiftmodule
-         ;; is emitted inline rather than as a separate driver job.
-         (compile-cmd (and compile-cmd
-                           (replace-regexp-in-string
-                            " -experimental-emit-module-separately\\b" ""
-                            compile-cmd))))
-    (unless compile-cmd
-      (error "No cached compile command for module %s. Run extract-commands first" module-name))
-    (when (fboundp 'swift-notification-progress-update)
-      (swift-notification-progress-update 'swift-incremental
-                                           :percent 15
-                                           :title "Compiling"
-                                           :message module-name))
-    (swift-incremental-build--run-step
-     (format "compile-%s" module-name)
-     compile-cmd
-     callback)))
+         (dir (and module-data (plist-get module-data :directory))))
+    (when (and dir (file-directory-p dir))
+      dir)))
+
+(defun swift-incremental-build--make-compile-filter (module-name module-index total-modules)
+  "Create a process filter for compiling MODULE-NAME.
+MODULE-INDEX is 1-indexed, TOTAL-MODULES is the total count.
+Parses swiftc parseable-output JSON and progress-updates with
+the currently compiling filename.  Also detects plain
+\"Compiling <file>\" lines from swiftc -incremental output."
+  (let ((file-count 0)
+        (partial-line ""))
+    (lambda (_proc string)
+      (setq partial-line (concat partial-line string))
+      (let ((lines (split-string partial-line "\n")))
+        ;; Keep last (possibly incomplete) line for next chunk
+        (setq partial-line (car (last lines)))
+        (dolist (line (butlast lines))
+          (let ((filename nil))
+            ;; Try JSON parseable-output: {"kind":"began","name":"compile",...}
+            (when (and (string-prefix-p "{" (string-trim-left line))
+                       (string-match-p "\"began\"" line)
+                       (string-match-p "\"compile\"" line))
+              (condition-case nil
+                  (let* ((json-object-type 'alist)
+                         (json-array-type 'list)
+                         (json-key-type 'symbol)
+                         (obj (json-read-from-string line))
+                         (inputs (alist-get 'inputs obj)))
+                    (when (and inputs (car inputs))
+                      (setq filename (file-name-nondirectory
+                                      (car inputs)))))
+                (error nil)))
+            ;; Fallback: plain "Compiling <file>.swift" lines
+            (when (and (not filename)
+                       (string-match "Compiling \\([^ ]+\\.swift\\)" line))
+              (setq filename (match-string 1 line)))
+            (when filename
+              (cl-incf file-count)
+              (let* ((module-prefix
+                      (if (> total-modules 1)
+                          (format "[%d/%d] %s"
+                                  module-index total-modules module-name)
+                        module-name))
+                     ;; Progress range: 5-75% spread across modules
+                     (module-start (+ 5 (* 70.0 (/ (1- (float module-index))
+                                                    total-modules))))
+                     (module-end (+ 5 (* 70.0 (/ (float module-index)
+                                                  total-modules))))
+                     ;; Within module, advance based on files compiled
+                     ;; Cap at 90% of module range (leave room for emit-module)
+                     (file-pct (min 0.9 (* 0.1 file-count)))
+                     (pct (round (+ module-start
+                                    (* file-pct (- module-end module-start))))))
+                (run-with-timer
+                 0 nil
+                 (lambda ()
+                   (when (fboundp 'swift-notification-progress-update)
+                     (swift-notification-progress-update
+                      'swift-incremental
+                      :percent pct
+                      :title module-prefix
+                      :message (file-name-sans-extension filename)))))))))))))
+
+(defun swift-incremental-build--step-compile-module (module-name callback
+                                                     &optional module-index total-modules)
+  "Compile MODULE-NAME using cached swiftc command.
+MODULE-INDEX (1-based) and TOTAL-MODULES provide context for
+progress display; both default to 1.
+Syncs the source file list with disk (detects added/removed files),
+strips `-experimental-emit-module-separately' so the module is
+emitted inline, and removes duplicate-filename source files that
+would cause Swift to error.  Calls CALLBACK on success."
+  (let ((module-index (or module-index 1))
+        (total-modules (or total-modules 1)))
+    ;; Sync source files before compiling — detects added/removed .swift files
+    (swift-incremental-build--sync-module-sources module-name)
+    (let* ((module-data (gethash module-name swift-incremental-build--module-commands))
+           (compile-cmd (plist-get module-data :compile-command))
+           ;; Remove -experimental-emit-module-separately so .swiftmodule
+           ;; is emitted inline rather than as a separate driver job.
+           (compile-cmd (and compile-cmd
+                             (replace-regexp-in-string
+                              " -experimental-emit-module-separately\\b" ""
+                              compile-cmd)))
+           ;; Remove source files with duplicate basenames (e.g.
+           ;; GeneratedAssetSymbols.swift from multiple asset catalogs)
+           (compile-cmd (and compile-cmd
+                             (swift-incremental-build--deduplicate-filenames-in-command
+                              compile-cmd module-name))))
+      (unless compile-cmd
+        (error "No cached compile command for module %s. Run extract-commands first" module-name))
+      (let ((module-prefix (if (> total-modules 1)
+                               (format "[%d/%d] %s" module-index total-modules module-name)
+                             module-name)))
+        (when (fboundp 'swift-notification-progress-update)
+          (swift-notification-progress-update 'swift-incremental
+                                              :percent (round (+ 5 (* 70.0 (/ (1- (float module-index))
+                                                                               total-modules))))
+                                              :title "Compiling"
+                                              :message module-prefix))
+        (swift-incremental-build--run-step
+         (format "compile-%s" module-name)
+         compile-cmd
+         callback
+         (swift-incremental-build--module-working-dir module-name)
+         (swift-incremental-build--make-compile-filter
+          module-name module-index total-modules))))))
 
 (defun swift-incremental-build--step-link-module (module-name callback)
   "Link MODULE-NAME relocatable .o using cached clang -r command.
@@ -965,13 +1329,14 @@ Calls CALLBACK on success."
       (error "No cached link command for module %s. Run extract-commands first" module-name))
     (when (fboundp 'swift-notification-progress-update)
       (swift-notification-progress-update 'swift-incremental
-                                           :percent 35
+                                           :percent 76
                                            :title "Linking"
-                                           :message (format "%s.o" module-name)))
+                                           :message (format "%s" module-name)))
     (swift-incremental-build--run-step
      (format "link-%s" module-name)
      link-cmd
-     callback)))
+     callback
+     (swift-incremental-build--module-working-dir module-name))))
 
 (defun swift-incremental-build--step-link-dylib (callback)
   "Link the debug dylib using cached clang -dynamiclib command.
@@ -980,7 +1345,7 @@ Calls CALLBACK on success."
     (error "No cached dylib link command. Run extract-commands first"))
   (when (fboundp 'swift-notification-progress-update)
     (swift-notification-progress-update 'swift-incremental
-                                         :percent 50
+                                         :percent 78
                                          :title "Linking"
                                          :message "debug.dylib"))
   (swift-incremental-build--run-step
@@ -1003,7 +1368,7 @@ Derives the dylib filename dynamically from the link command's
 -o output path so it works for any project, not just a hardcoded name."
   (when (fboundp 'swift-notification-progress-update)
     (swift-notification-progress-update 'swift-incremental
-                                         :percent 65
+                                         :percent 83
                                          :title "Patching"
                                          :message "app bundle"))
   (let* ((app-bundle (swift-incremental-build--app-bundle))
@@ -1034,7 +1399,7 @@ Derives the dylib filename dynamically from the link command's
   "Re-sign the .app bundle and call CALLBACK on success."
   (when (fboundp 'swift-notification-progress-update)
     (swift-notification-progress-update 'swift-incremental
-                                         :percent 75
+                                         :percent 88
                                          :title "Signing"
                                          :message "app bundle"))
   (let* ((app-bundle (swift-incremental-build--app-bundle))
@@ -1044,12 +1409,9 @@ Derives the dylib filename dynamically from the link command's
     (swift-incremental-build--run-step "codesign" sign-cmd callback)))
 
 (defun swift-incremental-build--step-install-and-launch ()
-  "Install the .app on simulator and launch it."
-  (when (fboundp 'swift-notification-progress-update)
-    (swift-notification-progress-update 'swift-incremental
-                                         :percent 85
-                                         :title "Installing"
-                                         :message "simulator"))
+  "Install the .app on simulator and launch it.
+Finishes the incremental progress bar before handing off to the
+simulator installer (which manages its own progress via `swift-build')."
   ;; Kill stale simulator buffer to avoid read-only errors
   (when (fboundp 'ios-simulator-kill-buffer)
     (ios-simulator-kill-buffer))
@@ -1059,17 +1421,18 @@ Derives the dylib filename dynamically from the link command's
          (app-id (ignore-errors (xcode-project-fetch-or-load-app-identifier)))
          (elapsed (swift-incremental-build--elapsed-time)))
     (swift-incremental-build--log "Installing and launching (total so far: %s)" elapsed)
+    ;; Finish incremental progress bar — build is done, install is a separate phase
+    (when (fboundp 'swift-notification-progress-finish)
+      (swift-notification-progress-finish
+       'swift-incremental
+       (format "Built (%s) - installing..." elapsed)))
+    ;; Hand off to simulator installer (has its own 'swift-build progress)
     (ios-simulator-install-and-run-app
      :rootfolder project-root
      :build-folder (concat products-dir "/")
      :simulatorId sim-id
      :appIdentifier app-id
-     :terminate-first t)
-    ;; Finish progress bar
-    (when (fboundp 'swift-notification-progress-finish)
-      (swift-notification-progress-finish
-       'swift-incremental
-       (format "Incremental build complete (%s)" elapsed)))))
+     :terminate-first t)))
 
 ;;; Pipeline orchestration
 
@@ -1235,59 +1598,71 @@ downstream modules to the remaining list (deduplicating)."
     (let* ((module-name (car modules))
            (rest (cdr modules))
            (module-data (gethash module-name swift-incremental-build--module-commands))
-           (has-link-cmd (and module-data (plist-get module-data :link-command))))
-      ;; Update progress
-      (when (fboundp 'swift-notification-progress-update)
-        (swift-notification-progress-update
-         'swift-incremental
-         :percent (+ 5 (* 70 (/ (float current) total)))
-         :title "Compiling"
-         :message (format "[%d/%d] %s" current total module-name)))
-      ;; Compile the module
-      (swift-incremental-build--step-compile-module
-       module-name
-       (lambda (_)
-         ;; Check API change after compile
-         (let ((api-changed (swift-incremental-build--check-api-changed module-name))
-               (downstream nil)
-               (expanded-rest rest)
-               (new-total total))
-           (when api-changed
-             ;; Copy updated .swiftmodule so downstream sees new interface
-             (swift-incremental-build--copy-swiftmodule-to-products module-name)
-             ;; Find downstream modules and add them to the queue
-             (setq downstream (swift-incremental-build--downstream-modules (list module-name)))
-             (when downstream
-               (swift-incremental-build--log
-                "API change in %s: adding %d downstream modules"
-                module-name (length downstream))
-               ;; Add downstream modules not already in the queue
-               (dolist (dm downstream)
-                 (unless (or (string= dm module-name)
-                             (member dm expanded-rest))
-                   (setq expanded-rest (append expanded-rest (list dm)))
-                   (cl-incf new-total)))
-               ;; Snapshot hashes for newly added modules
-               (swift-incremental-build--snapshot-swiftmodule-hashes downstream)))
-           ;; Link the module (if it has a link command), then continue chain
-           (if has-link-cmd
-               (swift-incremental-build--step-link-module
-                module-name
-                (lambda (_)
+           (has-link-cmd (and module-data (plist-get module-data :link-command)))
+           (after-compile
+            (lambda (_)
+              ;; Check API change after compile
+              (let ((api-changed (swift-incremental-build--check-api-changed module-name))
+                    (downstream nil)
+                    (expanded-rest rest)
+                    (new-total total))
+                (when api-changed
+                  ;; Copy updated .swiftmodule so downstream sees new interface
+                  (swift-incremental-build--copy-swiftmodule-to-products module-name)
+                  ;; Find downstream modules and add them to the queue
+                  (setq downstream (swift-incremental-build--downstream-modules (list module-name)))
+                  (when downstream
+                    (swift-incremental-build--log
+                     "API change in %s: adding %d downstream modules"
+                     module-name (length downstream))
+                    ;; Add downstream modules not already in the queue
+                    (dolist (dm downstream)
+                      (unless (or (string= dm module-name)
+                                  (member dm expanded-rest))
+                        (setq expanded-rest (append expanded-rest (list dm)))
+                        (cl-incf new-total)))
+                    ;; Snapshot hashes for newly added modules
+                    (swift-incremental-build--snapshot-swiftmodule-hashes downstream)))
+                ;; Link the module (if it has a link command), then continue chain
+                (if has-link-cmd
+                    (swift-incremental-build--step-link-module
+                     module-name
+                     (lambda (_)
+                       (swift-incremental-build--compile-modules-chain
+                        expanded-rest (1+ current) new-total callback)))
+                  (swift-incremental-build--log "No module link for %s, skipping" module-name)
                   (swift-incremental-build--compile-modules-chain
-                   expanded-rest (1+ current) new-total callback)))
-             (swift-incremental-build--log "No module link for %s, skipping" module-name)
-             (swift-incremental-build--compile-modules-chain
-              expanded-rest (1+ current) new-total callback))))))))
+                   expanded-rest (1+ current) new-total callback))))))
+      ;; Compile the module (progress handled by compile filter)
+      (swift-incremental-build--step-compile-module
+       module-name after-compile current total))))
 
 ;;; Smart build routing
+
+(defun swift-incremental-build--build-artifacts-exist-p ()
+  "Return non-nil if essential build artifacts still exist on disk.
+Checks that the Intermediates.noindex directory and the app bundle
+are present.  After a clean/reset these will be gone, meaning
+cached swiftc commands would reference missing files (e.g.
+OutputFileMap.json) and fail."
+  (let* ((intermediates (swift-incremental-build--intermediates-dir))
+         (app-bundle (swift-incremental-build--app-bundle))
+         (ok (and intermediates (file-directory-p intermediates)
+                  app-bundle (file-directory-p app-bundle))))
+    (unless ok
+      (swift-incremental-build--log
+       "build-artifacts-exist-p: intermediates=%s app-bundle=%s => MISSING"
+       (or intermediates "nil") (or app-bundle "nil")))
+    ok))
 
 (defun swift-incremental-build-ready-p ()
   "Return non-nil if incremental build is available for all changed modules.
 Checks `swift-incremental-build-enabled' first.  Then verifies
+that build artifacts exist on disk (Intermediates, app bundle),
 that we have cached commands (in memory or on disk) for every
 module with changed files.  Falls back to xcodebuild if any
-module lacks commands or if too many modules changed."
+module lacks commands, if too many modules changed, or if a
+clean/reset removed the build directory."
   (if (not swift-incremental-build-enabled)
       (progn
         (swift-incremental-build--log "ready-p: incremental builds disabled")
@@ -1295,7 +1670,9 @@ module lacks commands or if too many modules changed."
     (let* ((file (buffer-file-name))
            (loaded (when file (swift-incremental-build--ensure-commands-loaded)))
            (has-dylib swift-incremental-build--dylib-link-command)
-           (changed-modules (when (and loaded has-dylib)
+           (artifacts-ok (when (and loaded has-dylib)
+                           (swift-incremental-build--build-artifacts-exist-p)))
+           (changed-modules (when (and loaded has-dylib artifacts-ok)
                               (swift-incremental-build--changed-modules)))
            (too-many (and changed-modules
                           (> (length changed-modules)
@@ -1304,11 +1681,17 @@ module lacks commands or if too many modules changed."
                                (not too-many)
                                (swift-incremental-build--all-modules-have-commands-p
                                 changed-modules)))
-           (ready (and file loaded has-dylib changed-modules
+           (ready (and file loaded has-dylib artifacts-ok changed-modules
                        (not too-many) all-have-cmds t)))
+      ;; If artifacts are gone, proactively clear stale cache so next
+      ;; full xcodebuild can re-populate it cleanly.
+      (when (and loaded has-dylib (not artifacts-ok))
+        (swift-incremental-build--log "ready-p: build artifacts missing, clearing stale cache")
+        (swift-incremental-build-clear-cache))
       (swift-incremental-build--log
-       "ready-p: file=%s modules=%s count=%d too-many=%s all-cmds=%s dylib=%s => %s"
+       "ready-p: file=%s artifacts=%s modules=%s count=%d too-many=%s all-cmds=%s dylib=%s => %s"
        (if file "yes" "NO")
+       (if artifacts-ok "yes" "NO")
        (or (and changed-modules (mapconcat #'identity changed-modules ",")) "NONE")
        (length (or changed-modules '()))
        (if too-many "YES" "no")
@@ -1927,10 +2310,11 @@ Returns non-nil if at least compile-commands were loaded."
                                     (string-match-p "-suppress-warnings" command))))
           (when is-third-party (cl-incf third-party-count))
           (puthash name
-                   (list :compile-command command
-                         :compile-order (plist-get data :compile-order)
-                         :file-lists (plist-get data :file-lists)
-                         :third-party is-third-party)
+                    (list :compile-command command
+                          :compile-order (plist-get data :compile-order)
+                          :file-lists (plist-get data :file-lists)
+                          :directory (plist-get data :directory)
+                          :third-party is-third-party)
                    swift-incremental-build--module-commands)))
       (swift-incremental-build--log
        "Classified modules: %d internal, %d third-party"

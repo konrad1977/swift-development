@@ -617,8 +617,8 @@ Call CALLBACK when done.  RETRY-COUNT tracks auto-retry attempts (internal)."
                           (propertize appname 'face 'error))
          :seconds 5
          :reset t))
-      (when (fboundp 'swift-notification-progress-cancel)
-        (swift-notification-progress-cancel 'swift-build))
+      (when (fboundp 'swift-notification-progress-finish)
+        (swift-notification-progress-finish 'swift-build "Install failed"))
       (cl-return-from ios-simulator-install-app))
 
     ;; Check fingerprint cache — skip install if app hasn't changed since last install
@@ -733,10 +733,10 @@ Call CALLBACK when done.  RETRY-COUNT tracks auto-retry attempts (internal)."
                                   :message "Install failed: invalid .app bundle"
                                   :seconds 5
                                   :reset t))
-                               (when (fboundp 'swift-notification-progress-cancel)
-                                 (swift-notification-progress-cancel 'swift-build))))
-                            (message "App installation failed (exit 2): .app bundle invalid or corrupt at %s"
-                                     app-path))
+                                (when (fboundp 'swift-notification-progress-finish)
+                                  (swift-notification-progress-finish 'swift-build "Install failed: invalid .app"))))
+                             (message "App installation failed (exit 2): .app bundle invalid or corrupt at %s"
+                                      app-path))
 
                            ;; Any other exit code
                            (t
@@ -750,9 +750,10 @@ Call CALLBACK when done.  RETRY-COUNT tracks auto-retry attempts (internal)."
                                                    exit-code)
                                   :seconds 3
                                   :reset t))
-                               (when (fboundp 'swift-notification-progress-cancel)
-                                 (swift-notification-progress-cancel 'swift-build))))
-                            (message "App installation failed with exit code: %d" exit-code))))))
+                                (when (fboundp 'swift-notification-progress-finish)
+                                  (swift-notification-progress-finish 'swift-build
+                                                                      (format "Install failed (exit %d)" exit-code)))))
+                             (message "App installation failed with exit code: %d" exit-code))))))
                   (error
                    (message "Error in installation sentinel: %s"
                             (error-message-string install-err))))))
@@ -1322,9 +1323,15 @@ If TERMINATE-RUNNING is non-nil, terminate any running instance before launching
        :delay 2.0
        :reset t)))
 
-  ;; Finish progress bar - app is launching
+  ;; Finish progress bar - app is launching (include build time if available)
   (when (fboundp 'swift-notification-progress-finish)
-    (swift-notification-progress-finish 'swift-build "Running!"))
+    (let ((build-time (and (boundp 'swift-development--last-build-time)
+                           swift-development--last-build-time)))
+      (swift-notification-progress-finish
+       'swift-build
+       (if build-time
+           (format "Running! (%ss)" build-time)
+         "Running!"))))
 
   (let ((command (append (list "xcrun" "simctl" "launch" "--console-pty"
                                (or simulatorID "booted")

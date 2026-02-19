@@ -97,8 +97,13 @@ This is a compatibility wrapper - prefer using `xcode-project-notify' directly."
   "Buffer-local flag indicating if current project is an Xcode project.")
 (defvar-local xcode-project--current-errors-or-warnings nil
   "Buffer-local errors or warnings from last build.")
+(defvar-local xcode-project--diagnostic-lines nil
+  "Buffer-local list of diagnostic lines collected during build.
+Used instead of string concatenation for O(1) append per line.")
 (defvar-local xcode-project--seen-diagnostics nil
   "Hash table for deduplicating diagnostic lines during builds.")
+(defvar-local xcode-project--diagnostics-flushed nil
+  "Non-nil when diagnostics have been flushed to periphery at least once.")
 (defvar-local xcode-project--last-device-type nil
   "Buffer-local last device type used (:simulator or :device).")
 ;; Note: swift-development--device-choice is now defined in swift-development.el
@@ -1460,7 +1465,9 @@ Does NOT prompt the user or clear persisted settings."
         xcode-project--current-xcode-scheme nil
         xcode-project--current-buildconfiguration-json-data nil
         xcode-project--current-errors-or-warnings nil
+        xcode-project--diagnostic-lines nil
         xcode-project--seen-diagnostics nil
+        xcode-project--diagnostics-flushed nil
         xcode-project--current-is-xcode-project nil
         xcode-project--last-device-type nil
         xcode-project--workspace-or-project-cache nil)
@@ -2158,25 +2165,37 @@ Handles escaped parentheses like \\( and \\), quotes, and other escaped characte
         ;; Only accumulate if we haven't seen this exact line before
         (unless (gethash line xcode-project--seen-diagnostics)
           (puthash line t xcode-project--seen-diagnostics)
-          (setq xcode-project--current-errors-or-warnings
-                (concat line "\n" xcode-project--current-errors-or-warnings))
-          ;; Debounce error parsing to avoid blocking UI
+          ;; Collect into a list (O(1) push) instead of O(n) string concat
+          (push line xcode-project--diagnostic-lines)
+          ;; Debounce error parsing to avoid blocking UI.
+          ;; Build the string lazily only when the timer fires, not per-line.
           (when xcode-project--periphery-debounce-timer
             (cancel-timer xcode-project--periphery-debounce-timer))
-          (let ((errors-snapshot xcode-project--current-errors-or-warnings)
-                (ctx error-context)
+          (let ((ctx error-context)
                 (buf (current-buffer)))
             (setq xcode-project--periphery-debounce-timer
                   (run-with-idle-timer
-                   0.2 nil
-                   (lambda (errors context source-buf)
+                   0.5 nil
+                   (lambda (context source-buf)
                      (when (fboundp 'swift-error-proxy-parse-output)
-                       ;; Run in source buffer context so default-directory is correct
-                       (if (buffer-live-p source-buf)
+                       (let* ((diag-lines (if (buffer-live-p source-buf)
+                                              (buffer-local-value 'xcode-project--diagnostic-lines source-buf)
+                                            xcode-project--diagnostic-lines))
+                              (errors-string (mapconcat #'identity
+                                                        (nreverse (copy-sequence diag-lines))
+                                                        "\n")))
+                         ;; Also cache the built string for the sentinel
+                         (when (buffer-live-p source-buf)
                            (with-current-buffer source-buf
-                             (swift-error-proxy-parse-output errors nil context))
-                         (swift-error-proxy-parse-output errors nil context))))
-                   errors-snapshot ctx buf)))))))))
+                             (setq xcode-project--current-errors-or-warnings errors-string)
+                             (setq xcode-project--diagnostics-flushed t)))
+                         (if (buffer-live-p source-buf)
+                             (with-current-buffer source-buf
+                               (swift-error-proxy-parse-output errors-string nil context))
+                           (swift-error-proxy-parse-output errors-string nil context)))))
+                    ctx buf)))))))))
+
+
 
 (defun xcode-project-derived-data-path ()
   "Get the actual DerivedData path by running xcodebuild -showBuildSettings.
