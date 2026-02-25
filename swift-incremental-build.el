@@ -2234,6 +2234,136 @@ incremental -> cascade downstream -> full xcodebuild."
       (when (file-exists-p path)
         path))))
 
+(defun swift-incremental-build--shell-quote (arg)
+  "Shell-quote ARG if it contains spaces, parens, or other special chars.
+Returns the argument unchanged if no quoting is needed."
+  (if (string-match-p "[ ()]" arg)
+      (concat "'" (replace-regexp-in-string "'" "'\\\\''" arg) "'")
+    arg))
+
+(cl-defun swift-incremental-build--args-to-driver-command (args module-name)
+  "Convert swift-frontend ARGS list to a swiftc driver command string.
+ARGS is the `command_arguments' array from the .compile database.
+MODULE-NAME is used for logging.
+
+The .compile database contains per-file swift-frontend commands with
+`-primary-file' flags and references to temp files.  The incremental
+build system expects a single swiftc driver command for the module.
+
+This function:
+ - Derives the swiftc path from the swift-frontend executable
+ - Collects all .swift source files, removing -primary-file markers
+ - Strips per-file output flags (-o, -emit-dependencies-path, etc.)
+ - Strips -explicit-swift-module-map-file (temp /var/folders path)
+ - Strips explicit-module flags that fail without the temp map
+ - Strips -frontend-parseable-output (frontend-only flag)
+ - Prepends -incremental, -c, -emit-module
+Returns a shell command string, or nil if conversion fails."
+   (unless (and args (listp args))
+    (cl-return-from swift-incremental-build--args-to-driver-command nil))
+  (let* (;; Flags whose NEXT argument should also be skipped
+         (skip-with-arg '("-primary-file"
+                          "-emit-dependencies-path"
+                          "-emit-const-values-path"
+                          "-emit-reference-dependencies-path"
+                          "-serialize-diagnostics-path"
+                          "-index-unit-output-path"
+                          "-emit-abi-descriptor-path"
+                          "-emit-module-doc-path"
+                          "-emit-module-source-info-path"
+                          "-emit-objc-header-path"
+                          "-explicit-swift-module-map-file"
+                          "-new-driver-path"
+                          "-o"))
+         ;; Flags to drop (standalone, no argument)
+         (skip-standalone '("-c"
+                            "-disable-implicit-swift-modules"
+                            "-frontend-parseable-output"
+                            "-experimental-skip-non-inlinable-function-bodies-without-types"
+                            "-emit-module"))
+         (source-files '())
+         (filtered-args '())
+         (remaining (copy-sequence args))
+         (skip-next nil))
+    ;; Process argument list
+    (while remaining
+      (let ((arg (pop remaining)))
+        (cond
+         ;; Skip this arg + its value
+         (skip-next
+          (setq skip-next nil))
+         ;; -Xcc flags that need removal
+         ((and (equal arg "-Xcc")
+               remaining
+               (or (equal (car remaining) "-fno-implicit-modules")
+                   (equal (car remaining) "-fno-implicit-module-maps")))
+          (pop remaining))  ;; skip the -Xcc and its argument
+         ;; Flags that take an argument to skip
+         ((member arg skip-with-arg)
+          ;; If this is -primary-file, the next arg is a .swift file — keep it as source
+          (when (equal arg "-primary-file")
+            (when-let* ((next (car remaining)))
+              (when (string-suffix-p ".swift" next)
+                (unless (member next source-files)
+                  (push next source-files)))))
+          (setq skip-next t))
+         ;; Standalone flags to drop
+         ((member arg skip-standalone)
+          nil)
+         ;; .swift source files — collect separately
+         ((string-suffix-p ".swift" arg)
+          (unless (member arg source-files)
+            (push arg source-files)))
+         ;; Keep everything else
+         (t
+          (push arg filtered-args)))))
+    (setq source-files (nreverse source-files))
+    (setq filtered-args (nreverse filtered-args))
+    ;; Remove -module-name and its argument from filtered (we'll add it ourselves)
+    (let ((cleaned '())
+          (skip nil))
+      (dolist (arg filtered-args)
+        (cond
+         (skip (setq skip nil))
+         ((equal arg "-module-name") (setq skip t))
+         ((equal arg "-package-name") (setq skip t))
+         (t (push arg cleaned))))
+      (setq filtered-args (nreverse cleaned)))
+    ;; Derive swiftc path — look for the toolchain bin directory
+    ;; Args may contain -new-driver-path /path/to/swift-driver
+    (let ((driver-path nil))
+      (let ((rest (copy-sequence args)))
+        (while rest
+          (let ((a (pop rest)))
+            (when (equal a "-new-driver-path")
+              (when-let* ((p (pop rest)))
+                ;; swift-driver is in the same dir as swiftc
+                (setq driver-path
+                      (expand-file-name "swiftc"
+                                        (file-name-directory p))))))))
+      (unless driver-path
+        ;; Fallback: use xcrun
+        (setq driver-path "xcrun swiftc"))
+      ;; Build the shell command
+      (let* ((quoted-sources (mapcar #'swift-incremental-build--shell-quote source-files))
+             (quoted-args (mapcar #'swift-incremental-build--shell-quote filtered-args))
+             (result (mapconcat
+                      #'identity
+                      (append
+                       (list (swift-incremental-build--shell-quote driver-path)
+                             "-module-name" module-name
+                             "-package-name" (downcase module-name)
+                             "-incremental"
+                             "-c"
+                             "-emit-module")
+                       quoted-sources
+                       quoted-args)
+                      " ")))
+        (swift-incremental-build--log
+         "Converted frontend->driver for %s (%d sources, %d flags)"
+         module-name (length source-files) (length filtered-args))
+        result))))
+
 (defun swift-incremental-build--parse-compile-database (file)
   "Parse .compile JSON FILE and return an alist of (module-name . plist).
 Each plist has :command, :directory, :file-lists, and :compile-order.
@@ -2259,6 +2389,8 @@ Entries without a module_name (C/ObjC commands) are skipped."
           (when (= idx (gethash name seen))
             (push (cons name
                         (list :command (alist-get 'command entry)
+                              :command-args (alist-get 'command_arguments entry)
+                              :command-executable (alist-get 'command_executable entry)
                               :directory (alist-get 'directory entry)
                               :file-lists (alist-get 'fileLists entry)
                               :compile-order (gethash name seen)))
@@ -2305,7 +2437,20 @@ Returns non-nil if at least compile-commands were loaded."
       (dolist (entry db-modules)
         (let* ((name (car entry))
                (data (cdr entry))
-               (command (plist-get data :command))
+               (raw-command (plist-get data :command))
+               (cmd-args (plist-get data :command-args))
+               (cmd-exec (plist-get data :command-executable))
+               ;; Convert swift-frontend per-file commands to swiftc driver commands.
+               ;; Prefer command_arguments array (proper arg splitting) over command string.
+               (command (cond
+                         ;; Has structured args from a swift-frontend command
+                         ((and cmd-args
+                               cmd-exec
+                               (string-match-p "swift-frontend" cmd-exec))
+                          (swift-incremental-build--args-to-driver-command
+                           cmd-args name))
+                         ;; Raw command string (legacy / non-frontend)
+                         (t raw-command)))
                (is-third-party (and command
                                     (string-match-p "-suppress-warnings" command))))
           (when is-third-party (cl-incf third-party-count))

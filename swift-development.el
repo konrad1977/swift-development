@@ -2181,27 +2181,42 @@ commands reference artifacts inside the build directory."
     (setq swift-development--force-full-build t)
 
     ;; First clear project-specific build folder
-    (when (file-directory-p project-build-path)
-      (message "Clearing project build folder at %s..." project-build-path)
-      (dolist (file (directory-files project-build-path t "^[^.]"))
-        (condition-case err
-            (if (file-directory-p file)
-                (delete-directory file t)
-              (delete-file file))
-          (file-error (message "Could not delete %s: %s" file (error-message-string err))))))
+    (let ((cleaned-build nil)
+          (cleaned-derived nil))
+      (when (file-directory-p project-build-path)
+        (message "Clearing project build folder at %s..." project-build-path)
+        (dolist (file (directory-files project-build-path t "^[^.]"))
+          (condition-case err
+              (if (file-directory-p file)
+                  (delete-directory file t)
+                (delete-file file))
+            (file-error (message "Could not delete %s: %s" file (error-message-string err)))))
+        (setq cleaned-build t))
 
-    ;; Then ask about clearing all derived data
-    (when (file-directory-p derived-data-path)
-      (when (yes-or-no-p "Clear all Xcode derived data. This will force a full rebuild?")
-        (message "Clearing derived data...")
-        (dolist (file (directory-files derived-data-path t "^[^.]"))
-          (unless (string-match-p "ModuleCache$" file)
-            (condition-case err
-                (if (file-directory-p file)
-                    (delete-directory file t)
-                  (delete-file file))
-              (file-error (message "Could not delete %s: %s" file (error-message-string err))))))))))
+      ;; Then ask about clearing all derived data
+      (when (file-directory-p derived-data-path)
+        (when (yes-or-no-p "Clear all Xcode derived data. This will force a full rebuild?")
+          (message "Clearing derived data...")
+          (dolist (file (directory-files derived-data-path t "^[^.]"))
+            (unless (string-match-p "ModuleCache$" file)
+              (condition-case err
+                  (if (file-directory-p file)
+                      (delete-directory file t)
+                    (delete-file file))
+                (file-error (message "Could not delete %s: %s" file (error-message-string err))))))
+          (setq cleaned-derived t)))
 
+      ;; Notify what was cleaned
+      (let ((summary (cond
+                      ((and cleaned-build cleaned-derived)
+                       "Clean successful (.build + DerivedData)")
+                      (cleaned-build
+                       "Clean successful (.build)")
+                      (cleaned-derived
+                       "Clean successful (DerivedData)")
+                      (t nil))))
+        (when summary
+          (swift-notification-send :message summary :seconds 3))))))
 ;;;###autoload
 (defun swift-development-optimize-build-system ()
   "Perform various optimizations to speed up the build system."

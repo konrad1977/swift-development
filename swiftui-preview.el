@@ -293,7 +293,7 @@ Automatically detects project type and uses:
 - SPM project creation for Swift packages
 - Standalone build for single Swift files
 
-This is the new zero-config approach that doesn't require
+W5QJB7LB-003This is the new zero-config approach that doesn't require
 any setup or additional packages in your project."
   (interactive)
   ;; Check dependencies

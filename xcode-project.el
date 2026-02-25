@@ -552,6 +552,32 @@ Results are cached for 30 minutes."
      ;; Ultimate fallback
      "Unknown")))
 
+(defun xcode-project-product-name-fast ()
+  "Get product name without blocking.
+Uses cached build settings, scheme name, or project directory.
+Unlike `xcode-project-product-name', this never triggers a
+synchronous xcodebuild call."
+  (or
+   ;; First try: cached build settings (only if already in cache)
+   (when (fboundp 'swift-cache-get)
+     (let* ((config (or xcode-project--current-build-configuration "Debug"))
+            (cache-key (xcode-project--build-settings-cache-key config nil))
+            (json (swift-cache-get cache-key)))
+       (when (and json (> (length json) 0))
+         (let-alist (seq-elt json 0)
+           (xcode-project--clean-display-name .buildSettings.PRODUCT_NAME)))))
+   ;; Second try: derive from scheme name (always available after setup)
+   (when xcode-project--current-xcode-scheme
+     (let ((scheme-name (replace-regexp-in-string "^['\"]\\|['\"]$" "" xcode-project--current-xcode-scheme)))
+       (if (string-match "^\\([^(]+\\)\\s-*(.*)" scheme-name)
+           (string-trim (match-string 1 scheme-name))
+         scheme-name)))
+   ;; Third try: project directory name
+   (when-let* ((project-root (xcode-project-project-root)))
+     (file-name-nondirectory (directory-file-name project-root)))
+   ;; Ultimate fallback
+   "Unknown"))
+
 (defun xcode-project--extract-bundle-id-from-json (json)
   "Extract bundle identifier from build settings JSON."
   (when (and json (> (length json) 0))
@@ -805,10 +831,31 @@ Sets `xcode-project--current-xcode-scheme' and loads settings."
          :reset t))
       selected))))
 
+(defun xcode-project--try-restore-scheme-from-settings ()
+  "Try to restore scheme from persisted settings on disk.
+Returns the scheme name if restored, nil otherwise.
+This is a silent operation that never prompts the user."
+  (when (and (not xcode-project--current-xcode-scheme)
+             (fboundp 'swift-project-settings-load))
+    (let* ((project-root (xcode-project-project-root))
+           (base-settings (when project-root
+                            (swift-project-settings-load project-root nil)))
+           (last-scheme (when base-settings
+                          (plist-get base-settings :last-scheme))))
+      (when last-scheme
+        (when xcode-project-debug
+          (message "xcode-project--try-restore-scheme-from-settings: Restored '%s' from disk" last-scheme))
+        (setq xcode-project--current-xcode-scheme last-scheme)
+        last-scheme))))
+
 (defun xcode-project-scheme ()
   "Get the xcode scheme if set otherwise prompt user.
-This uses fast file-based detection. If no schemes found via files,
-automatically falls back to `xcodebuild -list` to find auto-generated schemes."
+First tries to restore from persisted settings on disk.
+Then uses fast file-based detection.  If no schemes found via files,
+automatically falls back to `xcodebuild -list' to find auto-generated schemes."
+  (unless xcode-project--current-xcode-scheme
+    ;; First try to silently restore from disk settings
+    (xcode-project--try-restore-scheme-from-settings))
   (unless xcode-project--current-xcode-scheme
     (when xcode-project-debug
       (message "xcode-project-scheme - Starting scheme detection..."))
@@ -1835,29 +1882,38 @@ LLDB-PATH is path to LLDB framework (unused for device, kept for signature)."
 (defun xcode-project-clean-build-folder ()
   "Clean app build folder, Swift package caches, and optionally Xcode derived data."
   (interactive)
-  (let ((root (xcode-project-project-root)))
+  (let* ((root (xcode-project-project-root))
+         (project-name (xcode-project-product-name-fast)))
     (unless root
       (error "Not in an Xcode project"))
 
     ;; Show initial notification
     (swift-notification-send
      :message (format "Cleaning build folder for %s..."
-                      (or (xcode-project-product-name) "project"))
+                      (or project-name "project"))
      :seconds 2)
 
     ;; Clean .build folder
     (xcode-project-clean-build-folder-with
      :root root
      :build-folder (expand-file-name ".build" root)
-     :project-name (xcode-project-product-name)
+     :project-name project-name
      :ignore-list xcode-project-clean-build-ignore-list)
-    
+
     ;; Clean Swift package caches
     (xcode-project-clean-swift-package-caches)
-    
+
     ;; Optionally clean derived data for this project
-    (when (yes-or-no-p "Also clean Xcode derived data for this project?")
-      (xcode-project-clean-project-derived-data))))
+    (let ((cleaned-derived nil))
+      (when (yes-or-no-p "Also clean Xcode derived data for this project?")
+        (xcode-project-clean-project-derived-data)
+        (setq cleaned-derived t))
+
+      (swift-notification-send
+       :message (format "Clean successful%s for %s"
+                        (if cleaned-derived " (.build + DerivedData)" " (.build)")
+                        (or project-name "project"))
+       :seconds 3))))
 
 (defun xcode-project-clean-swift-package-caches ()
   "Clean Swift package manager caches."
@@ -1874,33 +1930,41 @@ LLDB-PATH is path to LLDB framework (unused for device, kept for signature)."
 
 (defun xcode-project-clean-project-derived-data ()
   "Clean Xcode derived data for the current project."
-  (let* ((project-name (xcode-project-product-name))
+  (let* ((project-name (xcode-project-product-name-fast))
          (derived-data-dir (expand-file-name "~/Library/Developer/Xcode/DerivedData"))
          (project-pattern (concat project-name "-")))
 
     (message "Cleaning derived data for %s..." project-name)
-    (start-process "clean-derived-data" nil "sh" "-c"
-                   (format "rm -rf %s/%s*" derived-data-dir project-pattern))))
+    (let ((proc (start-process "clean-derived-data" nil "sh" "-c"
+                               (format "rm -rf %s/%s*" derived-data-dir project-pattern))))
+      (set-process-sentinel
+       proc
+       (lambda (_process event)
+         (when (string-match-p "finished" event)
+           (swift-notification-send
+            :message (format "Clean successful (DerivedData for %s)" project-name)
+            :seconds 3)))))))
 
 (defun xcode-project-deep-clean ()
   "Perform a deep clean: build folder, Swift package caches, and all derived data."
   (interactive)
-  (let ((root (xcode-project-project-root)))
+  (let* ((root (xcode-project-project-root))
+         (project-name (xcode-project-product-name-fast)))
     (unless root
       (error "Not in an Xcode project"))
-    
+
     (when (yes-or-no-p "Perform deep clean? This will delete .build, Swift caches, and ALL derived data.")
       ;; Show initial notification
       (swift-notification-send
        :message (format "Deep cleaning %s..."
-                        (or (xcode-project-product-name) "project"))
+                        (or project-name "project"))
        :seconds 2)
 
       ;; Clean .build folder
       (xcode-project-clean-build-folder-with
        :root root
        :build-folder (expand-file-name ".build" root)
-       :project-name (xcode-project-product-name)
+       :project-name project-name
        :ignore-list xcode-project-clean-build-ignore-list)
       
       ;; Clean Swift package caches
@@ -1911,7 +1975,12 @@ LLDB-PATH is path to LLDB framework (unused for device, kept for signature)."
         (when (file-exists-p derived-data-dir)
           (message "Cleaning all derived data...")
           (start-process "clean-all-derived-data" nil "sh" "-c"
-                         (format "find %s -mindepth 1 -maxdepth 1 ! -name 'ModuleCache' -exec rm -rf {} +" derived-data-dir)))))))
+                         (format "find %s -mindepth 1 -maxdepth 1 ! -name 'ModuleCache' -exec rm -rf {} +" derived-data-dir))))
+
+      (swift-notification-send
+       :message (format "Deep clean successful for %s"
+                        (or project-name "project"))
+       :seconds 3))))
 
 (cl-defun xcode-project-clean-build-folder-with (&key root build-folder project-name ignore-list)
   "Clean build folder with ROOT, BUILD-FOLDER, PROJECT-NAME asynchronously.

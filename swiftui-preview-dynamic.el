@@ -35,6 +35,8 @@
 (require 'swift-project-settings nil t)
 (require 'swiftui-preview-spm nil t)
 (require 'swiftui-preview-standalone nil t)
+(require 'swift-incremental-build nil t)
+(require 'swift-file-watcher nil t)
 
 ;; Forward declarations
 (declare-function swiftui-preview--get-first-preview-body "swiftui-preview")
@@ -60,11 +62,22 @@
 (declare-function xcode-project-project-root "xcode-project")
 (declare-function swift-error-proxy-parse-output "swift-error-proxy")
 
+;; Incremental build integration
+(declare-function swift-incremental-build--ensure-commands-loaded "swift-incremental-build")
+(declare-function swift-incremental-build--detect-module "swift-incremental-build")
+(declare-function swift-incremental-build--detect-module-from-build-target "swift-incremental-build")
+(declare-function swift-incremental-build--module-source-directory "swift-incremental-build")
+(declare-function swift-incremental-build--sync-module-sources "swift-incremental-build")
+(declare-function swift-file-watcher-active-p "swift-file-watcher")
+(declare-function swift-file-watcher-changed-files "swift-file-watcher")
+
 ;; External variables
 (defvar xcode-build-config-enable-testability)
 (defvar xcode-build-config-xcode-cache-dir)
 (defvar xcode-project--current-xcode-scheme)
 (defvar swiftui-preview-show-notifications)
+(defvar swift-incremental-build--module-commands)
+(defvar swift-incremental-build-enabled)
 (defvar swift-error-proxy-backend)
 
 ;;; Notification helpers (respects swiftui-preview-show-notifications)
@@ -628,21 +641,192 @@ Returns a list of directory paths for mixed-language module dependencies."
           (push inc-dir dirs))))
     (nreverse dirs)))
 
+;;; Incremental build integration
+;;
+;; When the incremental build system has cached compile commands for a
+;; module, we can use them instead of constructing our own WMO
+;; compile from scratch.  The cached commands use `swiftc -incremental'
+;; which only recompiles changed files -- significantly faster for
+;; large modules.
+;;
+;; Additionally, when the file-watcher confirms that the current
+;; module has NOT changed since the last successful build, we can skip
+;; recompilation entirely and use the existing .o files as-is.
+
+(defcustom swiftui-preview-dynamic-use-incremental t
+  "Use incremental build commands for preview recompilation when available.
+When non-nil and the incremental build system has cached commands,
+previews use `swiftc -incremental' (only changed files) instead of
+`swift-frontend -whole-module-optimization' (all files).  This is
+significantly faster for large modules.  Falls back to WMO when
+incremental commands are not available."
+  :type 'boolean
+  :group 'swiftui-preview-dynamic)
+
+(defun swiftui-preview-dynamic--incremental-available-p ()
+  "Return non-nil if the incremental build system has cached commands.
+Checks that the system is loaded, enabled, and has module commands."
+  (and swiftui-preview-dynamic-use-incremental
+       (bound-and-true-p swift-incremental-build-enabled)
+       (fboundp 'swift-incremental-build--ensure-commands-loaded)
+       (swift-incremental-build--ensure-commands-loaded)
+       (boundp 'swift-incremental-build--module-commands)
+       (> (hash-table-count swift-incremental-build--module-commands) 0)))
+
+(defun swiftui-preview-dynamic--incremental-detect-module (source-file)
+  "Detect which module SOURCE-FILE belongs to using the incremental system.
+Returns the module name as a string, or nil."
+  (when (fboundp 'swift-incremental-build--detect-module)
+    (or (swift-incremental-build--detect-module source-file)
+        (when (fboundp 'swift-incremental-build--detect-module-from-build-target)
+          (swift-incremental-build--detect-module-from-build-target source-file)))))
+
+(defun swiftui-preview-dynamic--incremental-module-unchanged-p (source-file)
+  "Return non-nil if the module containing SOURCE-FILE has not changed.
+Uses the file-watcher to check whether any file in the module has been
+modified since the last successful build.  When true, the existing .o
+files in DerivedData are already up-to-date and recompilation can be
+skipped entirely."
+  (when (and (fboundp 'swift-file-watcher-active-p)
+             (fboundp 'swift-file-watcher-changed-files)
+             (swift-file-watcher-active-p))
+    (let* ((changed-files (swift-file-watcher-changed-files))
+           (module-name (swiftui-preview-dynamic--incremental-detect-module source-file))
+           (module-src-dir
+            (when (and module-name
+                       (fboundp 'swift-incremental-build--module-source-directory))
+              (swift-incremental-build--module-source-directory module-name))))
+      (if (not module-src-dir)
+          ;; Can't determine module boundaries, assume changed
+          nil
+        ;; Check if any changed file belongs to this module
+        (not (cl-some
+              (lambda (f)
+                (string-prefix-p module-src-dir f))
+              changed-files))))))
+
+(defun swiftui-preview-dynamic--incremental-recompile-spec
+    (source-file module-name object-files _products-dir _derived-data _ios-version)
+  "Build a recompile-spec using cached incremental build commands.
+SOURCE-FILE is the current preview file.  MODULE-NAME is the detected
+module.  OBJECT-FILES is the list of .o files from DerivedData.
+_PRODUCTS-DIR, _DERIVED-DATA and _IOS-VERSION are unused but kept for
+call-site compatibility with `--recompile-stale-sources'.
+
+Returns a recompile-spec plist compatible with `--recompile-async', or
+nil if incremental commands are not available for this module."
+  (when-let*
+      ((module-data (gethash module-name swift-incremental-build--module-commands))
+       (compile-cmd (plist-get module-data :compile-command)))
+    ;; The cached command must produce a single module-level .o.
+    ;; Commands with `-incremental' + `-output-file-map' produce per-file
+    ;; .o files scattered across Intermediates and cannot directly replace
+    ;; the module .o used by the preview linker.  Only WMO commands (or
+    ;; simple -c commands without per-file dispatch) are safe to redirect.
+    (unless (or (string-match-p "-output-file-map " compile-cmd)
+                (string-match-p "-primary-file " compile-cmd))
+      ;; Sync source files (handles added/removed .swift files)
+      (when (fboundp 'swift-incremental-build--sync-module-sources)
+        (swift-incremental-build--sync-module-sources module-name))
+      ;; Re-read compile-cmd after sync (may have been patched)
+      (setq module-data (gethash module-name swift-incremental-build--module-commands))
+      (setq compile-cmd (plist-get module-data :compile-command))
+      (let* (;; Output fresh .o to our temp dir
+             (fresh-o (expand-file-name
+                       (concat module-name ".o")
+                       swiftui-preview-dynamic--temp-dir))
+             (fresh-swiftmodule (expand-file-name
+                                 (concat module-name ".swiftmodule")
+                                 swiftui-preview-dynamic--temp-dir))
+             ;; Find the existing module .o in object-files
+             (module-o (cl-find-if
+                        (lambda (f)
+                          (string= (file-name-sans-extension
+                                    (file-name-nondirectory f))
+                                   module-name))
+                        object-files))
+             ;; Working directory from the incremental system
+             (working-dir
+              (when (fboundp 'swift-incremental-build--module-working-dir)
+                (swift-incremental-build--module-working-dir module-name)))
+             ;; Modify the cached compile command to output to our temp dir.
+             ;; We must replace exactly the -o <path> and -emit-module-path.
+             ;; Paths may contain spaces (e.g. "Debug (Staging)-iphonesimulator")
+             ;; so we parse the command into a list, patch the list, and rejoin.
+             (cmd-parts (split-string-shell-command compile-cmd))
+             (patched-parts
+              (let ((result '())
+                    (parts cmd-parts)
+                    (o-replaced nil)
+                    (emp-replaced nil))
+                (while parts
+                  (let ((arg (car parts)))
+                    (cond
+                     ;; Replace the first -o <path>
+                     ((and (not o-replaced) (string= arg "-o") (cdr parts))
+                      (push "-o" result)
+                      (push fresh-o result)
+                      (setq parts (cdr parts))  ; skip original path
+                      (setq o-replaced t))
+                     ;; Replace -emit-module-path <path>
+                     ((and (string= arg "-emit-module-path") (cdr parts))
+                      (push "-emit-module-path" result)
+                      (push fresh-swiftmodule result)
+                      (setq parts (cdr parts))  ; skip original path
+                      (setq emp-replaced t))
+                     (t (push arg result))))
+                  (setq parts (cdr parts)))
+                ;; Add -emit-module -emit-module-path if not present
+                (unless emp-replaced
+                  (push "-emit-module" result)
+                  (push "-emit-module-path" result)
+                  (push fresh-swiftmodule result))
+                (nreverse result))))
+        (when swiftui-preview-dynamic-verbose
+          (message "[Preview] Incremental recompile: module=%s args=%d"
+                   module-name (length patched-parts))
+          (message "[Preview] Incremental working-dir: %s" working-dir))
+
+        (list :compile-args patched-parts
+              :fresh-o fresh-o
+              :fresh-swiftmodule fresh-swiftmodule
+              :module-o module-o
+              :per-file-match nil
+              :object-files object-files
+              :source-base (file-name-sans-extension
+                            (file-name-nondirectory source-file))
+              :module-name module-name
+              :working-dir working-dir)))))
+
 (defun swiftui-preview-dynamic--recompile-stale-sources (object-files source-file products-dir derived-data ios-version)
-  "Recompile the module containing SOURCE-FILE with whole-module optimization.
+  "Recompile the module containing SOURCE-FILE to produce a fresh .o.
 Always recompiles to ensure the preview reflects the latest saved code.
 
-Uses swift-frontend with -whole-module-optimization to compile all source
-files in the module into a single fresh .o that directly replaces the stale
-module-level .o in OBJECT-FILES.  This correctly handles intra-module type
-references and avoids duplicate symbol issues.
-
-For per-file .o matches (non-WMO builds), falls back to single-file
-recompilation with -primary-file for type context.
+When the incremental build system has cached commands for the module,
+uses `swiftc -incremental' (only recompiles changed files).  Otherwise
+falls back to `swift-frontend -whole-module-optimization' which compiles
+all source files in the module.
 
 PRODUCTS-DIR is the Build/Products directory.
 DERIVED-DATA is the DerivedData root.
 IOS-VERSION is the deployment target (e.g., \"17.0\")."
+  ;; Try incremental build system first (much faster for large modules)
+  (let ((incremental-spec
+         (when (swiftui-preview-dynamic--incremental-available-p)
+           (when-let* ((module-name
+                        (swiftui-preview-dynamic--incremental-detect-module source-file)))
+             (when swiftui-preview-dynamic-verbose
+               (message "[Preview] Trying incremental recompile for module: %s" module-name))
+             (swiftui-preview-dynamic--incremental-recompile-spec
+              source-file module-name object-files products-dir derived-data ios-version)))))
+    (if incremental-spec
+        (progn
+          (when swiftui-preview-dynamic-verbose
+            (message "[Preview] Using incremental build commands (swiftc -incremental)"))
+          incremental-spec)
+      ;; Fall back to WMO recompilation
+      (when swiftui-preview-dynamic-verbose
+        (message "[Preview] Falling back to WMO recompile"))
   (let* ((source-base (file-name-sans-extension
                        (file-name-nondirectory source-file)))
          (target-triple (format "arm64-apple-ios%s-simulator" ios-version))
@@ -789,7 +973,7 @@ IOS-VERSION is the deployment target (e.g., \"17.0\")."
           :per-file-match per-file-match
           :object-files object-files
           :source-base source-base
-          :module-name module-name)))
+          :module-name module-name))))) ;; close WMO let*, if, outer let
 
 (defun swiftui-preview-dynamic--recompile-async (recompile-spec callback)
   "Run the recompilation described by RECOMPILE-SPEC asynchronously.
@@ -802,16 +986,20 @@ CALLBACK is called with the updated object-files list."
          (object-files (plist-get recompile-spec :object-files))
          (source-base (plist-get recompile-spec :source-base))
          (module-name (plist-get recompile-spec :module-name))
+         (working-dir (plist-get recompile-spec :working-dir))
          (recompile-buf (get-buffer-create "*SwiftUI Preview Recompile*")))
     (with-current-buffer recompile-buf
       (let ((inhibit-read-only t)) (erase-buffer)))
     (when swiftui-preview-dynamic-verbose
-      (message "[Preview] Recompile async: %s" (string-join compile-args " ")))
-    (make-process
-     :name "swiftui-preview-recompile"
-     :buffer recompile-buf
-     :command compile-args
-     :sentinel
+      (message "[Preview] Recompile async: %s" (string-join compile-args " "))
+      (when working-dir
+        (message "[Preview] Recompile working-dir: %s" working-dir)))
+    (let ((default-directory (or working-dir default-directory)))
+      (make-process
+       :name "swiftui-preview-recompile"
+       :buffer recompile-buf
+       :command compile-args
+       :sentinel
      (lambda (process _event)
        (when (memq (process-status process) '(exit signal))
          (let ((exit-code (process-exit-status process)))
@@ -852,7 +1040,7 @@ CALLBACK is called with the updated object-files list."
                  (when swiftui-preview-dynamic-verbose
                    (message "[Preview] Recompiled %s.o - no matching .o found, adding to list"
                             source-base))
-                 (cons fresh-o object-files)))))))))))
+                 (cons fresh-o object-files))))))))))))
 
 
 (defun swiftui-preview-dynamic--ensure-testability-build (callback)
@@ -1130,6 +1318,11 @@ receives (app-path nil) or (nil error-msg)."
       (let* ((raw-object-files (swiftui-preview-dynamic--collect-object-files products-dir derived-data))
              ;; Detect iOS version from built modules (needed for recompilation)
              (ios-version (swiftui-preview-dynamic--detect-ios-version products-dir))
+             ;; Check if the module is unchanged since last build (skip recompile)
+             (module-unchanged
+              (when swiftui-preview-dynamic--current-source-file
+                (swiftui-preview-dynamic--incremental-module-unchanged-p
+                 swiftui-preview-dynamic--current-source-file)))
              ;; Check recompile cache -- if same source file was already
              ;; recompiled in this generate-all session, reuse the .o
              (cached (and swiftui-preview-dynamic--recompile-cache
@@ -1138,10 +1331,11 @@ receives (app-path nil) or (nil error-msg)."
                                 swiftui-preview-dynamic--current-source-file)
                          (file-exists-p (plist-get swiftui-preview-dynamic--recompile-cache :fresh-o))))
              ;; Prepare recompilation spec (does NOT run the compiler yet)
-             ;; Skip if we have a valid cache hit
+             ;; Skip if we have a valid cache hit or if module is unchanged
              (recompile-spec
               (when (and swiftui-preview-dynamic--current-source-file
-                         (not cached))
+                         (not cached)
+                         (not module-unchanged))
                 (swiftui-preview-dynamic--recompile-stale-sources
                  raw-object-files
                  swiftui-preview-dynamic--current-source-file
@@ -1257,6 +1451,13 @@ receives (app-path nil) or (nil error-msg)."
 
         ;; Kick off: recompile async if needed, then continue to build
         (cond
+         ;; Module unchanged: skip recompilation entirely, use existing .o files
+         (module-unchanged
+          (when swiftui-preview-dynamic-verbose
+            (message "[Preview] Module unchanged since last build — skipping recompile"))
+          (swiftui-preview-dynamic--notify-update 'swiftui-preview
+           :percent 20 :message "Module up-to-date, skipping recompile...")
+          (funcall continue-build raw-object-files))
          ;; Cache hit: reuse previously recompiled .o and .swiftmodule
          ;; Copy into the current temp-dir so they survive cleanup
          (cached
