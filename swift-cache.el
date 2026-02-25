@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026 Mikael Konradsson
 ;; Author: Mikael Konradsson
-;; Version: 0.6.1
+;; Version: 0.7.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: swift, cache
 

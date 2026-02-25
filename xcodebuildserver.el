@@ -1,6 +1,6 @@
 ;;; xcodebuildserver.el --- Automated xcode-build-server setup -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 Mikael Konradsson
+;; Copyright (C) 2026 Mikael Konradsson
 ;; Author: Mikael Konradsson
 ;; Version: 0.7.0
 ;; Package-Requires: ((emacs "28.1"))
